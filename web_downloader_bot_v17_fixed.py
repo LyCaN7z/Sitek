@@ -149,6 +149,45 @@ _BLOCKED_NETS = [
     ip_network("fe80::/10"),
 ]
 
+# ══════════════════════════════════════════════════
+# 🛡️  MARKDOWN SAFETY HELPERS
+# ══════════════════════════════════════════════════
+
+def escape_md(text: str) -> str:
+    """
+    Telegram Markdown V1 special characters တွေကို escape လုပ်တယ်။
+    Dynamic content (URLs, scan results, user input) ကို
+    parse_mode='Markdown' နဲ့ send မလုပ်ခင် ဒါကို သုံးပါ။
+    """
+    # Markdown V1 special chars: _ * ` [
+    for ch in ('\\', '_', '*', '`', '['):
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
+async def safe_md_send(send_coro_factory, text: str, **kwargs):
+    """
+    Markdown parse_mode နဲ့ send လုပ်ကြည့်တယ်။
+    BadRequest (entity parse error) ဖြစ်ရင် parse_mode မပါဘဲ
+    plain text နဲ့ retry လုပ်တယ်။
+
+    Usage:
+        await safe_md_send(
+            lambda t, **kw: message.reply_text(t, **kw),
+            report[:4000],
+            parse_mode='Markdown'
+        )
+    """
+    try:
+        return await send_coro_factory(text, **kwargs)
+    except BadRequest as e:
+        if "can't parse entities" in str(e).lower() or "can't find end of the entity" in str(e).lower():
+            # Markdown parsing ကို ဖြုတ်ပြီး retry
+            kwargs.pop('parse_mode', None)
+            return await send_coro_factory(text, **kwargs)
+        raise
+
+
 def _is_safe_ip(ip_str: str) -> bool:
     try:
         ip_obj = ip_address(ip_str)
@@ -2268,12 +2307,12 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = _format_vuln_report(results)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode='Markdown')
+            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode=None)
             await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
 
 # ══════════════════════════════════════════════════
@@ -2457,14 +2496,14 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
+            await msg.edit_text(report_text, parse_mode=None)
         else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
+            await msg.edit_text(report_text[:4000], parse_mode=None)
             await update.effective_message.reply_text(
-                report_text[4000:8000], parse_mode='Markdown')
+                report_text[4000:8000], parse_mode=None)
     except Exception:
         await update.effective_message.reply_text(
-            report_text[:4000], parse_mode='Markdown')
+            report_text[:4000], parse_mode=None)
 
     # ── Export full JSON report + send as file ────
     if endpoints or all_mined:
@@ -3335,9 +3374,9 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
+            await msg.edit_text(tg_text[:4000], parse_mode=None)
         else:
-            await msg.edit_text(tg_text, parse_mode='Markdown')
+            await msg.edit_text(tg_text, parse_mode=None)
     except Exception:
         pass
 
@@ -4211,7 +4250,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_text = "\n".join(lines)
     try:
-        await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
+        await msg.edit_text(tg_text[:4000], parse_mode=None)
     except Exception:
         pass
 
@@ -5131,11 +5170,11 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
+            await msg.edit_text(report[:4000], parse_mode=None)
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
     # ── Export wordlist + results as ZIP ─────────
     import io, zipfile as _zf
@@ -5485,11 +5524,11 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
+            await msg.edit_text(report[:4000], parse_mode=None)
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
     # Export full JSON report
     import io
@@ -5521,79 +5560,176 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     Extracts: site_key, page_url, action, captcha_type
 # ══════════════════════════════════════════════════
 
-# ── Regex patterns per captcha type ─────────────
+# ── Regex patterns per captcha type ──────────────────────────────
+# Supports: reCAPTCHA v2/v3/Enterprise, hCaptcha, Cloudflare Turnstile,
+#           FunCaptcha/Arkose, GeeTest v3/v4, AWS WAF, DataDome,
+#           PerimeterX/Human, MTCaptcha, KeyCAPTCHA, Lemin, Friendly Captcha
 _CAPTCHA_PATTERNS = {
 
-    # ─── reCAPTCHA v2 ────────────────────────────
+    # ─── reCAPTCHA v2 ─────────────────────────────────────────────
     "reCAPTCHA v2": [
-        # data-sitekey attribute
         re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # grecaptcha.render
         re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # siteKey / site_key object key
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
         re.compile(r'["\']site_key["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
         re.compile(r'siteKey\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        # g-recaptcha widget
+        re.compile(r'<div[^>]+class=["\'][^"\']*g-recaptcha[^"\']*["\'][^>]*data-sitekey=["\']([^"\']{20,60})["\']', re.I | re.S),
+        # recaptcha/api.js?render=KEY (v3 loaded as script)
+        re.compile(r'recaptcha/(?:api|enterprise)\.js[^"\']*[?&]render=([0-9A-Za-z_\-]{20,60})', re.I),
+        # window.rcv2SiteKey or similar global vars
+        re.compile(r'(?:rcv2|recaptchav2|captchaKey|recaptchaKey|RECAPTCHA_SITE_KEY|recaptchaSiteKey)\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
     ],
 
-    # ─── reCAPTCHA v3 ────────────────────────────
+    # ─── reCAPTCHA v3 ─────────────────────────────────────────────
     "reCAPTCHA v3": [
-        # grecaptcha.execute(key, {action:...})
         re.compile(r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # grecaptcha.ready + execute in same script
         re.compile(r'execute\(["\']([6][A-Za-z0-9_\-]{39})["\']', re.I),
+        re.compile(r'grecaptcha\.ready[^;]{0,200}execute\(["\']([0-9A-Za-z_\-]{20,60})["\']', re.I | re.S),
+        re.compile(r'["\']recaptchaV3SiteKey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        re.compile(r'(?:v3SiteKey|recaptcha_v3_key|RECAPTCHA_V3_KEY)\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
     ],
 
-    # ─── hCaptcha ────────────────────────────────
+    # ─── reCAPTCHA Enterprise ──────────────────────────────────────
+    "reCAPTCHA Enterprise": [
+        re.compile(r'recaptchaenterprise\.js[^"\']*[?&]render=([0-9A-Za-z_\-]{20,60})', re.I),
+        re.compile(r'grecaptcha\.enterprise\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        re.compile(r'enterprise\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        re.compile(r'["\'](?:enterpriseSiteKey|enterprise_site_key|ENTERPRISE_KEY)\s*["\']\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+    ],
+
+    # ─── hCaptcha ─────────────────────────────────────────────────
     "hCaptcha": [
         re.compile(r'data-sitekey=["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
         re.compile(r'hcaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9a-f\-]{36})["\']', re.I),
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
+        re.compile(r'hcaptcha\.com.*?sitekey=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I),
+        re.compile(r'(?:hcaptchaSiteKey|HCAPTCHA_SITE_KEY|hcaptcha_sitekey)\s*[=:]\s*["\']([0-9a-f\-]{36})["\']', re.I),
     ],
 
-    # ─── Cloudflare Turnstile ─────────────────────
+    # ─── Cloudflare Turnstile ──────────────────────────────────────
     "Cloudflare Turnstile": [
-        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\'].*?turnstile|turnstile.*?data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I | re.S),
-        re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # Turnstile keys start with 0x4A or 1x00
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
         re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
+        re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
+        re.compile(r'<div[^>]+class=["\'][^"\']*cf-turnstile[^"\']*["\'][^>]*data-sitekey=["\']([^"\']{10,60})["\']', re.I | re.S),
+        re.compile(r'challenges\.cloudflare\.com/turnstile[^"\']*[?&](?:sitekey|k)=([0-9A-Za-z_\-]{20,60})', re.I),
+        re.compile(r'(?:turnstileSiteKey|TURNSTILE_SITE_KEY|CF_TURNSTILE_KEY)\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
     ],
 
-    # ─── FunCaptcha (Arkose Labs) ─────────────────
+    # ─── FunCaptcha / Arkose Labs ──────────────────────────────────
     "FunCaptcha": [
-        re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
+        re.compile(r'(?:public_key|data-pkey|pk)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
         re.compile(r'ArkoseEnforcement\s*\([^)]*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
+        re.compile(r'arkoselabs\.com[^"\']*pk=([0-9A-Fa-f\-]{36})', re.I),
+        re.compile(r'funcaptcha\.com[^"\']*pk=([0-9A-Fa-f\-]{36})', re.I),
+        re.compile(r'(?:arkoselabsKey|ARKOSE_KEY|FUNCAPTCHA_KEY)\s*[=:]\s*["\']([0-9A-Fa-f\-]{36})["\']', re.I),
     ],
 
-    # ─── GeeTest ─────────────────────────────────
-    "GeeTest": [
+    # ─── GeeTest v3 ───────────────────────────────────────────────
+    "GeeTest v3": [
         re.compile(r'gt\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
         re.compile(r'["\']gt["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'initGeetest\s*\(\s*\{[^}]*gt\s*:\s*["\']([0-9a-f]{32})["\']', re.I | re.S),
+        re.compile(r'geetest_id\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
     ],
 
-    # ─── AWS WAF Captcha ──────────────────────────
+    # ─── GeeTest v4 ───────────────────────────────────────────────
+    "GeeTest v4": [
+        re.compile(r'captchaId\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'["\']captchaId["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'initGeetest4\s*\(\s*\{[^}]*captchaId\s*:\s*["\']([0-9a-f]{32})["\']', re.I | re.S),
+    ],
+
+    # ─── AWS WAF Captcha ──────────────────────────────────────────
     "AWS WAF Captcha": [
         re.compile(r'AwsWafIntegration\.getToken\s*\(\s*["\']([^"\']{10,200})["\']', re.I),
         re.compile(r'jsapi\.token\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
+        re.compile(r'aws-waf-token["\'\s]*[=:]["\'\s]*([A-Za-z0-9+/=\-_]{20,200})', re.I),
+        re.compile(r'wafCaptchaSiteKey\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
+    ],
+
+    # ─── DataDome ─────────────────────────────────────────────────
+    "DataDome": [
+        re.compile(r'datadome["\']?\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
+        re.compile(r'dd_app_id\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I),
+        re.compile(r'DataDomeObject\s*=\s*["\']([^"\']{10,60})["\']', re.I),
+    ],
+
+    # ─── PerimeterX / Human ───────────────────────────────────────
+    "PerimeterX": [
+        re.compile(r'window\._pxAppId\s*=\s*["\']([^"\']{5,30})["\']', re.I),
+        re.compile(r'PX["\']?\s*[=:]\s*\{[^}]*appId\s*:\s*["\']([^"\']{5,30})["\']', re.I | re.S),
+        re.compile(r'_pxParam1\s*=\s*["\']([^"\']{10,100})["\']', re.I),
+    ],
+
+    # ─── MTCaptcha ────────────────────────────────────────────────
+    "MTCaptcha": [
+        re.compile(r'mt-captcha[^"\']*sitekey=([A-Za-z0-9\-_]{10,80})', re.I),
+        re.compile(r'mtcaptcha\.(?:load|render)\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([^"\']{10,60})["\']', re.I),
+        re.compile(r'mt-sitekey\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,60})["\']', re.I),
+    ],
+
+    # ─── Lemin Cropped Captcha ────────────────────────────────────
+    "Lemin Captcha": [
+        re.compile(r'lemin-cropped-captcha[^>]*captcha_id=["\']([^"\']{10,60})["\']', re.I),
+        re.compile(r'leminCaptchaId\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I),
+    ],
+
+    # ─── Friendly Captcha ─────────────────────────────────────────
+    "Friendly Captcha": [
+        re.compile(r'frc-captcha[^>]*data-sitekey=["\']([^"\']{10,60})["\']', re.I | re.S),
+        re.compile(r'WidgetInstance[^"\']*sitekey\s*:\s*["\']([^"\']{10,60})["\']', re.I),
+    ],
+
+    # ─── KeyCAPTCHA ───────────────────────────────────────────────
+    "KeyCAPTCHA": [
+        re.compile(r's_s_c_user_id\s*=\s*["\']?(\d{3,20})["\']?', re.I),
+        re.compile(r'keycaptcha_task\s*=\s*["\']([^"\']{10,200})["\']', re.I),
     ],
 }
 
-# ─── reCAPTCHA action pattern ────────────────────
+# ─── reCAPTCHA action pattern ────────────────────────────────────
 _ACTION_PATTERNS = [
     re.compile(r'action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
     re.compile(r'["\']action["\']\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
     re.compile(r'grecaptcha\.execute\s*\([^,]+,\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
 ]
 
-# ─── Script src patterns (detect captcha from includes) ─
+# ─── Script src signatures (detect captcha from <script src=...>) ─
 _CAPTCHA_SCRIPT_SIGS = {
-    "reCAPTCHA": ["google.com/recaptcha", "recaptcha/api.js", "recaptcha/enterprise.js"],
-    "hCaptcha":  ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
-    "Turnstile": ["challenges.cloudflare.com/turnstile"],
-    "FunCaptcha": ["funcaptcha.com", "arkoselabs.com"],
-    "GeeTest":   ["gt.captcha.com", "static.geetest.com"],
+    "reCAPTCHA":       ["google.com/recaptcha", "recaptcha/api.js", "recaptcha/enterprise.js"],
+    "hCaptcha":        ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
+    "Turnstile":       ["challenges.cloudflare.com/turnstile"],
+    "FunCaptcha":      ["funcaptcha.com", "arkoselabs.com"],
+    "GeeTest":         ["gt.captcha.com", "static.geetest.com", "gcaptcha4.geetest.com"],
+    "DataDome":        ["js.datadome.co", "interstitial.datadome.co"],
+    "PerimeterX":      ["client.px-cdn.net", "captcha.px-cdn.net"],
+    "MTCaptcha":       ["mt-captcha.com/MTCaptcha"],
+    "AWS WAF Captcha": ["captcha.us-east-1.amazonaws.com", "aws-waf-captcha.js"],
+    "Friendly Captcha":["cdn.friendlycaptcha.com"],
 }
+
+# ─── Known TEST keys (warn user) ────────────────────────────────
+_TEST_KEYS = {
+    "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI": "reCAPTCHA v2 TEST KEY (Google official)",
+    "6LebCcoUAAAAABhm4GuYBMmMlHPO6nGVgXRbHRxD": "reCAPTCHA v3 TEST KEY",
+    "10000000-ffff-ffff-ffff-000000000001": "hCaptcha TEST KEY",
+    "1x00000000000000000000AA": "Cloudflare Turnstile TEST KEY (always passes)",
+    "2x00000000000000000000AB": "Cloudflare Turnstile TEST KEY (always blocks)",
+    "3x00000000000000000000FF": "Cloudflare Turnstile TEST KEY (forces challenge)",
+}
+
+# ─── Common captcha-hosting subpaths to deep-scan ───────────────
+_CAPTCHA_PAGES = [
+    "/login", "/signin", "/sign-in", "/log-in",
+    "/register", "/signup", "/sign-up", "/join",
+    "/contact", "/contact-us", "/feedback",
+    "/forgot-password", "/reset-password", "/password-reset",
+    "/checkout", "/cart", "/subscribe", "/newsletter",
+    "/verify", "/confirm", "/2fa", "/otp",
+    "/submit", "/apply",
+]
 
 
 def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> list:
@@ -6083,27 +6219,43 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         "error":       None,
     }
 
-def _sitekey_sync(url: str, progress_cb=None) -> dict:
+def _sitekey_sync(url: str, progress_cb=None, deep: bool = False) -> dict:
     """
-    Try Playwright (DevTools-style) first.
+    Try Playwright first (full JS execution + network intercept).
     Falls back to requests-based static scan if Playwright not available.
+    deep=True: also scan /login /register /contact /signup pages.
     """
-    # ── Try Playwright ─────────────────────────────
     result = _sitekey_playwright(url, progress_cb)
     if result.get("error") == "playwright_not_installed":
-        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan သို့ fallback...")
-        return _sitekey_static(url, progress_cb)
+        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan fallback...")
+        return _sitekey_static(url, progress_cb, deep=deep)
+    # Deep mode: run static on sub-pages even after playwright succeeded
+    if deep and not result.get("error"):
+        if progress_cb: progress_cb("🔍 Deep: scanning common captcha pages...")
+        static = _sitekey_static(url, progress_cb=None, deep=True)
+        # Merge findings from static deep-scan
+        seen = {f["type"]+":"+f["site_key"] for f in result["findings"]}
+        for f in static.get("findings", []):
+            dk = f["type"]+":"+f["site_key"]
+            if dk not in seen:
+                seen.add(dk)
+                result["findings"].append(f)
+        result["pages_scanned"] = static.get("pages_scanned", 1)
     return result
 
 
-def _sitekey_static(url: str, progress_cb=None) -> dict:
-    """Fallback: requests-based static HTML + JS scan (no browser)."""
+def _sitekey_static(url: str, progress_cb=None, deep: bool = False) -> dict:
+    """
+    Fallback requests-based scanner.
+    - Fetches HTML + up to 20 JS files
+    - deep=True: also scans common captcha pages (/login, /register, etc.)
+    """
     session = requests.Session()
     session.headers.update(_get_headers())
 
-    if progress_cb: progress_cb("⬇️ Fetching page HTML (static)...")
+    if progress_cb: progress_cb("⬇️ Fetching page HTML...")
     try:
-        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
+        resp     = session.get(url, timeout=15, verify=False, allow_redirects=True)
         resp.raise_for_status()
         html     = resp.text
         page_url = resp.url
@@ -6113,24 +6265,23 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
     final_parsed = urlparse(page_url)
     base_origin  = f"{final_parsed.scheme}://{final_parsed.netloc}"
 
-    def _resolve(src):
-        if not src: return None
-        src = src.strip()
-        if src.startswith('//'): return final_parsed.scheme + ':' + src
-        if src.startswith('http'): return src
-        if src.startswith('/'): return base_origin + src
+    def _resolve(src_url):
+        if not src_url: return None
+        src_url = src_url.strip()
+        if src_url.startswith('//'): return final_parsed.scheme + ':' + src_url
+        if src_url.startswith('http'): return src_url
+        if src_url.startswith('/'): return base_origin + src_url
         base_path = final_parsed.path.rsplit('/', 1)[0]
-        return f"{base_origin}{base_path}/{src}"
+        return f"{base_origin}{base_path}/{src_url}"
 
-    soup = BeautifulSoup(html, 'html.parser')
-    js_seen, js_ordered = set(), []
-
-    def _add_js(u):
-        if u and u.startswith('http') and u not in js_seen:
-            js_seen.add(u); js_ordered.append(u)
-
-    for tag in soup.find_all('script', src=True):
-        _add_js(_resolve(tag['src']))
+    def _collect_js(html_text):
+        soup2 = BeautifulSoup(html_text, 'html.parser')
+        seen, ordered = set(), []
+        for tag in soup2.find_all('script', src=True):
+            u = _resolve(tag['src'])
+            if u and u.startswith('http') and u not in seen:
+                seen.add(u); ordered.append(u)
+        return ordered
 
     captcha_sigs_flat = [s for sigs in _CAPTCHA_SCRIPT_SIGS.values() for s in sigs]
     def _prio(u):
@@ -6139,46 +6290,92 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
         if any(k in n for k in ('main','app','index','chunk','bundle','vendor','runtime')): return 1
         return 2
 
-    fetch_list = sorted(js_ordered, key=_prio)[:15]
+    all_html   = {"main": html}
+    all_js_srcs = {u: "" for u in sorted(_collect_js(html), key=_prio)[:20]}
 
+    # ── Deep mode: scan /login /register /contact etc. ─────────────
+    if deep:
+        if progress_cb: progress_cb(f"🔍 Deep scan: checking {len(_CAPTCHA_PAGES)} common captcha pages...")
+        for subpath in _CAPTCHA_PAGES[:12]:
+            try:
+                sub_url = base_origin.rstrip('/') + subpath
+                sr = session.get(sub_url, timeout=8, verify=False, allow_redirects=True)
+                if sr.status_code == 200 and len(sr.text) > 200:
+                    all_html[subpath] = sr.text
+                    for u in sorted(_collect_js(sr.text), key=_prio)[:5]:
+                        if u not in all_js_srcs:
+                            all_js_srcs[u] = ""
+            except Exception:
+                pass
+
+    # ── Fetch JS files ──────────────────────────────────────────────
+    fetch_list = list(all_js_srcs.keys())[:20]
     if progress_cb: progress_cb(f"📦 Fetching {len(fetch_list)} JS files...")
     js_sources = {}
     for js_url in fetch_list:
         try:
             r = session.get(js_url, timeout=10, verify=False)
             if r.status_code == 200 and len(r.text) > 50:
-                js_sources[js_url] = r.text[:800_000]
+                js_sources[js_url] = r.text[:1_000_000]
         except Exception:
             pass
 
-    if progress_cb: progress_cb(f"🔍 Scanning {len(js_sources)} JS files...")
-    findings = _extract_captcha_info(html, page_url, js_sources)
-    return {"findings": findings, "page_url": page_url, "js_fetched": len(js_sources), "error": None}
+    if progress_cb: progress_cb(f"🔍 Scanning {len(all_html)} pages + {len(js_sources)} JS files...")
+    all_findings = []
+    seen_dedup   = set()
+    for label, html_text in all_html.items():
+        for f in _extract_captcha_info(html_text, page_url, js_sources):
+            dedup = f["type"] + ":" + f["site_key"]
+            if dedup not in seen_dedup:
+                seen_dedup.add(dedup)
+                if label != "main":
+                    f["source"] += f" [page: {label}]"
+                all_findings.append(f)
+
+    return {
+        "findings":   all_findings,
+        "page_url":   page_url,
+        "js_fetched": len(js_sources),
+        "pages_scanned": len(all_html),
+        "error":      None,
+    }
 
 
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
+    """
+    /sitekey <url> [deep] — Extract captcha site keys
+    Modes:
+      /sitekey https://example.com        — Standard scan
+      /sitekey https://example.com deep   — Deep scan (checks /login, /register, /contact etc.)
+    """
     if not await check_force_join(update, context):
         return
 
     if not context.args:
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/sitekey https://example.com`\n\n"
-            "🔑 *Extracts:*\n"
+            "🔑 *Site Key Extractor*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:*\n"
+            "  `/sitekey <url>` — Standard scan\n"
+            "  `/sitekey <url> deep` — Deep scan\n\n"
+            "*Extracts:*\n"
             "  • `site_key` — Captcha public key\n"
-            "  • `page_url` — Final URL (after redirects)\n"
+            "  • `page_url` — Final URL after redirects\n"
             "  • `action`   — reCAPTCHA v3 action name\n\n"
-            "🛡️ *Supported Captcha Types:*\n"
-            "  • reCAPTCHA v2 _(data-sitekey / grecaptcha.render)_\n"
-            "  • reCAPTCHA v3 _(grecaptcha.execute + action)_\n"
-            "  • reCAPTCHA Enterprise\n"
-            "  • hCaptcha _(UUID format key)_\n"
-            "  • Cloudflare Turnstile _(0x4A... / 1x00...)_\n"
-            "  • FunCaptcha / Arkose Labs\n"
-            "  • GeeTest\n"
-            "  • AWS WAF Captcha\n\n"
-            "📦 HTML source + JS bundles ကို scan မည်\n"
-            "⚠️ _Authorized testing only_",
+            "*Supported Captcha Types:*\n"
+            "  🔵 reCAPTCHA v2\n"
+            "  🟣 reCAPTCHA v3\n"
+            "  🟤 reCAPTCHA Enterprise\n"
+            "  🟡 hCaptcha\n"
+            "  🟠 Cloudflare Turnstile\n"
+            "  🔴 FunCaptcha / Arkose Labs\n"
+            "  🟢 GeeTest v3 / v4\n"
+            "  ⚪ AWS WAF Captcha\n"
+            "  🔷 DataDome\n"
+            "  🔶 PerimeterX / Human\n"
+            "  ⬛ MTCaptcha / Lemin / Friendly Captcha\n\n"
+            "*Deep mode* (`deep`) scans `/login`, `/register`, `/contact`, `/checkout` pages too\n\n"
+            "_HTML + JS bundles + network requests all scanned_",
             parse_mode='Markdown'
         )
         return
@@ -6189,7 +6386,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
-    url = context.args[0].strip()
+    url  = context.args[0].strip()
+    deep = len(context.args) > 1 and context.args[1].lower() == "deep"
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -6199,32 +6397,35 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
+    mode_label = "🔍 Deep Scan" if deep else "Standard Scan"
     msg = await update.effective_message.reply_text(
-        f"🔑 *Site Key Extractor*\n🌐 `{domain}`\n\n"
-        "🌐 Launching headless browser...\n"
-        "📡 Intercepting network requests...\n"
-        "🔍 Scanning DOM + console logs...\n⏳",
+        f"🔑 *Site Key Extractor*\n"
+        f"🌐 `{domain}`\n"
+        f"⚙️ Mode: {mode_label}\n\n"
+        f"⏳ Scanning...",
         parse_mode='Markdown'
     )
 
     progress_q = []
-
     async def _prog():
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(2.5)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(
-                        f"🔑 *Scanning `{domain}`*\n\n{txt}",
-                        parse_mode='Markdown')
+                        f"🔑 *Site Key Extractor*\n"
+                        f"🌐 `{domain}` — {mode_label}\n\n"
+                        f"{txt}",
+                        parse_mode='Markdown'
+                    )
                 except BadRequest:
                     pass
 
     prog = asyncio.create_task(_prog())
     try:
         result = await asyncio.to_thread(
-            _sitekey_sync, url, lambda t: progress_q.append(t)
+            _sitekey_sync, url, lambda t: progress_q.append(t), deep
         )
     except Exception as e:
         prog.cancel()
@@ -6235,40 +6436,32 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.get("error"):
         await msg.edit_text(
-            f"❌ *Fetch error*\n`{result['error']}`",
+            f"❌ *Fetch Error*\n`{result['error']}`",
             parse_mode='Markdown'
         )
         return
 
-    findings  = result["findings"]
-    page_url  = result["page_url"]
-    js_count  = result["js_fetched"]
+    findings      = result["findings"]
+    page_url      = result["page_url"]
+    js_count      = result["js_fetched"]
+    pages_scanned = result.get("pages_scanned", 1)
 
-    # ─── No captcha found ───────────────────────
+    # ─── No captcha found ────────────────────────────────────────
     if not findings:
+        tip = "\n_Deep mode: tried /login, /register, /contact pages too_" if deep else "\n_Tip: Add `deep` for deeper scan → `/sitekey <url> deep`_"
         await msg.edit_text(
-            f"🔑 *Site Key Extractor — `{domain}`*\n"
+            f"🔑 *Site Key Extractor*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 *Captcha မတွေ့ပါ*\n\n"
-            f"🌐 Page URL: `{page_url}`\n"
-            f"📡 Requests intercepted: `{js_count}`\n\n"
-            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
-            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
+            f"🌐 Page URL  : `{page_url}`\n"
+            f"📦 JS scanned: `{js_count}`\n"
+            f"📄 Pages     : `{pages_scanned}`\n"
+            f"{tip}",
             parse_mode='Markdown'
         )
         return
 
-    # ─── Build report ────────────────────────────
-    lines = [
-        f"🔑 *Site Key Extractor — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 Page URL: `{page_url}`",
-        f"📡 Requests intercepted: `{js_count}`",
-        f"✅ Found: `{len(findings)}` captcha instance(s)",
-        "",
-    ]
-
-    # Type icons
+    # ─── Build Telegram report ────────────────────────────────────
     _TYPE_ICON = {
         "reCAPTCHA v2":          "🔵",
         "reCAPTCHA v3":          "🟣",
@@ -6276,22 +6469,40 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "hCaptcha":              "🟡",
         "Cloudflare Turnstile":  "🟠",
         "FunCaptcha":            "🔴",
-        "GeeTest":               "🟢",
+        "GeeTest v3":            "🟢",
+        "GeeTest v4":            "🟢",
         "AWS WAF Captcha":       "⚪",
+        "DataDome":              "🔷",
+        "PerimeterX":            "🔶",
+        "MTCaptcha":             "⬛",
+        "Lemin Captcha":         "⬛",
+        "Friendly Captcha":      "⬛",
+        "KeyCAPTCHA":            "⬛",
     }
+
+    lines = [
+        f"🔑 *Site Key Extractor — `{domain}`*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{page_url}`",
+        f"📦 JS: `{js_count}` | Pages: `{pages_scanned}` | Found: `{len(findings)}`",
+        "",
+    ]
 
     for i, f in enumerate(findings, 1):
         icon = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
-        lines.append(f"*{icon} [{i}] {f['type']}*")
-        lines.append(f"  🔑 `site_key` : `{f['site_key'] or 'N/A'}`")
-        lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
-        if f["action"]:
-            lines.append(f"  ⚡ `action`    : `{f['action']}`")
-        lines.append(f"  📂 Source     : _{f['source'][:70]}_")
+
+        # Test key warning
+        is_test = f["site_key"] in _TEST_KEYS
+        test_warn = f"\n  ⚠️ _TEST KEY: {_TEST_KEYS[f['site_key']]}_" if is_test else ""
+
+        lines.append(f"*{icon} [{i}] {f['type']}*{test_warn}")
+        lines.append(f"  🔑 `{f['site_key'] or 'N/A'}`")
+        if f.get("action"):
+            lines.append(f"  ⚡ action: `{f['action']}`")
+        lines.append(f"  📂 _{f['source'][:65]}_")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized testing only_")
 
     report = "\n".join(lines)
 
@@ -6300,26 +6511,33 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(report, parse_mode='Markdown')
         else:
             await msg.edit_text(report[:4000], parse_mode='Markdown')
-            await update.effective_message.reply_text(report[4000:8000], parse_mode='Markdown')
+            await update.effective_message.reply_text(report[4000:8000])
     except BadRequest:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        try:
+            await msg.edit_text(report[:4000])
+        except Exception:
+            await update.effective_message.reply_text(report[:4000])
 
-    # ─── Export JSON ─────────────────────────────
+    # ─── Export JSON ───────────────────────────────────────────────
     import io as _io
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d    = re.sub(r'[^\w\-]', '_', domain)
-    export    = {
-        "domain":      domain,
-        "page_url":    page_url,
-        "scanned_at":  datetime.now().isoformat(),
-        "js_scanned":  js_count,
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    export = {
+        "domain":        domain,
+        "page_url":      page_url,
+        "scanned_at":    datetime.now().isoformat(),
+        "mode":          "deep" if deep else "standard",
+        "js_scanned":    js_count,
+        "pages_scanned": pages_scanned,
         "findings": [
             {
                 "type":     f["type"],
                 "site_key": f["site_key"],
                 "page_url": f["page_url"],
-                "action":   f["action"],
+                "action":   f.get("action", ""),
                 "source":   f["source"],
+                "is_test_key": f["site_key"] in _TEST_KEYS,
+                "test_key_note": _TEST_KEYS.get(f["site_key"], ""),
             }
             for f in findings
         ],
@@ -6332,7 +6550,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=f"sitekey_{safe_d}_{ts}.json",
             caption=(
                 f"🔑 *Site Key Report — `{domain}`*\n"
-                f"Found: `{len(findings)}` | JS: `{js_count}`"
+                f"Found: `{len(findings)}` | JS: `{js_count}` | Pages: `{pages_scanned}`"
             ),
             parse_mode='Markdown'
         )
@@ -6619,12 +6837,12 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
+            await msg.edit_text(report_text, parse_mode=None)
         else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
-            await update.message.reply_text(report_text[4000:8000], parse_mode='Markdown')
+            await msg.edit_text(report_text[:4000], parse_mode=None)
+            await update.message.reply_text(report_text[4000:8000], parse_mode=None)
     except Exception:
-        await update.message.reply_text(report_text[:4000], parse_mode='Markdown')
+        await update.message.reply_text(report_text[:4000], parse_mode=None)
 
     # ── Export full JSON report ───────────────────
     try:
@@ -6687,32 +6905,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 *Website Downloader Bot v17.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📥 *Download Commands:*\n"
-        f"  `/download <url>` — Single page\n"
-        f"  `/fullsite <url>` — Full website\n"
+        f"  `/download <url>` — Single page HTML + assets\n"
+        f"  `/fullsite <url>` — Full website crawl\n"
         f"  `/jsdownload <url>` — JS/React site _{js_status}_\n"
+        f"  `/jsfullsite <url>` — JS + Full crawl\n"
         f"  `/resume <url>` — Download ဆက်လုပ်ရန်\n"
         f"  `/stop` — Download ရပ်ရန်\n\n"
-        f"🔍 *Tools:*\n"
-        f"  `/vuln <url>` — Security scan\n"
-        f"  `/api <url>` — API discovery\n"
-        f"  `/tech <url>` — Tech stack fingerprint\n"
-        f"  `/extract <url>` — Secret/key scanner\n"
-        f"  `/subdomains <domain>` — Subdomain enumeration\n"
-        f"  `/bypass403 <url>` — 403 bypass tester\n"
-        f"  `/fuzz <url>` — Path & param fuzzer\n"
-        f"  `/monitor` — Change alert monitor\n"
-        f"  `/smartfuzz <url>` — 🗂️ Context-aware smart fuzzer\n"
-        f"  `/antibot <url>` — 🤖 Anti-bot / Captcha bypass\n"
-        f"  `/jwtattack <token>` — 🎟️ JWT decode & crack\n"
-        f"  `/sitekey <url>` — 🔑 reCAPTCHA/hCaptcha/Turnstile key extractor\n\n"
+        f"🔑 *Site Key:*\n"
+        f"  `/sitekey <url>` — reCAPTCHA / hCaptcha / Turnstile key extractor\n\n"
         f"📱 *App Analyzer:*\n"
-        f"  APK / IPA / ZIP / JAR upload လုပ်ပါ\n"
+        f"  APK / IPA / ZIP / JAR file upload ပါ\n"
         f"  → Auto API + Secret extraction\n\n"
         f"📊 *Account:*\n"
         f"  `/status` — Usage ကြည့်ရန်\n"
         f"  `/history` — Download history\n"
         f"  `/mystats` — Detailed stats\n\n"
-        f"🔒 SSRF Protected{adm_line}\n\n"
+        f"🔒 SSRF Protected{adm_line}\n"
         f"❓ /help — Commands အကူအညီ",
         parse_mode='Markdown'
     )
@@ -6726,43 +6934,37 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Commands Guide — v17.0*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "📥 *Website Download*\n"
+        "📥 *Download Commands*\n"
         "  `/download <url>`\n"
-        "   └ Single page HTML + assets\n\n"
+        "   └ Single page HTML + assets download\n\n"
         "  `/fullsite <url>`\n"
-        "   └ Website အပြည့် (sitemap scan ပါ)\n\n"
+        "   └ Website အပြည့် (sitemap + crawl)\n\n"
         "  `/jsdownload <url>`\n"
-        "   └ React/Vue/Angular JS sites\n"
+        "   └ React / Vue / Angular JS sites\n"
         "   └ Status: " + js_st + "\n\n"
         "  `/jsfullsite <url>`\n"
         "   └ JS + Full crawl ပေါင်းစပ်\n\n"
         "  `/resume <url>`\n"
         "   └ ကျသွားလျှင် ဆက်လုပ်ရန်\n\n"
+        "  `/stop` — လက်ရှိ download ရပ်ရန်\n\n"
+
+        "🔑 *Site Key Extractor*\n"
+        "  `/sitekey <url>`\n"
+        "   └ reCAPTCHA / hCaptcha / Turnstile key ဆွဲထုတ်\n"
+        "   └ Site key + widget config တွေ report ထုတ်\n\n"
 
         "📱 *App Analyzer (Upload File):*\n"
-        "  APK / IPA / ZIP / JAR / AAB / JAR\n"
+        "  APK / IPA / ZIP / JAR / AAB\n"
         "   └ Chat ထဲ file drop ရုံသာ\n"
         "   └ API endpoints + Secrets + Hosts\n"
         "   └ AndroidManifest / Info.plist parse\n"
         "   └ JSON report auto-export\n"
         f"   └ Max size: `{APP_MAX_MB}MB`\n\n"
-        "🔍 *Scan & Discovery*\n"
-        "  `/vuln <url>` — Security vulnerability scan\n"
-        "  `/api <url>` — API endpoint discovery\n"
-        "  `/tech <url>` — Tech stack fingerprinter\n"
-        "  `/extract <url>` — Secret/API key scanner (JS bundles)\n\n"
-        "🔓 *Advanced Recon*\n"
-        "  `/subdomains <domain>` — Subdomain enum (crt.sh + brute-force)\n"
-        "  `/bypass403 <url>` — 403 bypass (50+ techniques)\n"
-        "  `/fuzz <url> [paths|params]` — HTTP path & param fuzzer\n\n"
-        "🔔 *Monitoring*\n"
-        "  `/monitor add <url> [min] [label]` — Alert on page change\n"
-        "  `/monitor list|del|clear` — Manage monitors\n\n"
 
         "📊 *My Account*\n"
         "  `/status` — Daily limit + usage\n"
         "  `/history` — Download log (last 10)\n"
-        "  `/mystats` — Total stats\n\n"
+        "  `/mystats` — Detailed stats\n\n"
 
         "💡 *Tips:*\n"
         "  • 50MB+ ဆိုရင် auto split လုပ်ပြီး ပို့ပေးမယ်\n"
@@ -6773,10 +6975,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_section = (
         "\n\n👑 *Admin Commands:*\n"
-        "  `/admin` — Admin panel\n"
-        "  `/ban` `/unban` `/setlimit` `/userinfo`\n"
-        "  `/broadcast` `/allusers` `/setpages` `/setassets`\n\n"
-            )
+        "  `/admin` — Admin panel (full control)\n"
+        "  `/ban <id>` `/unban <id>` — User ban management\n"
+        "  `/setlimit global <n>` — Daily download limit\n"
+        "  `/userinfo <id>` — User details\n"
+        "  `/broadcast <msg>` — All users ကို message ပို့\n"
+        "  `/allusers` — User list\n"
+        "  `/setpages <n>` `/setassets <n>` — Crawler limits\n"
+        "  `/proxy` — Proxy management\n\n"
+    )
 
     await update.effective_message.reply_text(
         base + (admin_section if is_adm else ""),
@@ -7071,28 +7278,51 @@ async def _send_admin_panel(target, db: dict):
     tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
     banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
     today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
+    lim       = db["settings"].get("global_daily_limit", 0)
+    max_pg    = db["settings"].get("max_pages", MAX_PAGES)
+    max_as    = db["settings"].get("max_assets", MAX_ASSETS)
+
+    bot_btn_label = "🔴 Turn OFF" if bot_on else "🟢 Turn ON"
+    bot_status    = "🟢 ONLINE" if bot_on else "🔴 OFFLINE"
+    proxy_st      = proxy_manager.stats()
+    proxy_live    = proxy_st.get("live", 0)
+    proxy_total   = proxy_st.get("total", 0)
+
     kb = [
         [
-            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
+            InlineKeyboardButton("📊 Statistics", callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
+            InlineKeyboardButton("📜 DL Log",      callback_data="adm_log"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Banned List", callback_data="adm_banned"),
+            InlineKeyboardButton("🌐 Proxy Status", callback_data="adm_proxy"),
+        ],
+        [
             InlineKeyboardButton(
-                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
+                bot_btn_label,
                 callback_data="adm_toggle_bot"
             ),
+            InlineKeyboardButton("🔄 Refresh",    callback_data="adm_back"),
         ],
-        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
     text = (
-        f"👑 *Admin Panel v17.0*\n\n"
-        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
-        f"📦 Total: `{tdl}` | Today: `{today_dl}`\n"
-        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
-        f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
-        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PUPPETEER_OK else '❌'}"
+        f"👑 *Admin Panel v17.0*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 Bot Status : {bot_status}\n"
+        f"👥 Total Users : `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total DL    : `{tdl}` | Today: `{today_dl}`\n\n"
+        f"⚙️ *Config*\n"
+        f"  Daily Limit : `{'∞' if lim == 0 else lim}`\n"
+        f"  Max Pages   : `{max_pg}` | Assets: `{max_as}`\n"
+        f"  Concurrent  : `{MAX_WORKERS}` | Rate: `{RATE_LIMIT_SEC}s`\n"
+        f"  Split Size  : `{SPLIT_MB}MB`\n\n"
+        f"🌐 *Proxy* : `{proxy_live}/{proxy_total}` live\n"
+        f"⚡ JS (Puppeteer): {'✅' if PUPPETEER_OK else '❌'}\n"
+        f"🔒 SSRF / Traversal / RateLimit : ✅"
     )
     markup = InlineKeyboardMarkup(kb)
     try:
@@ -7100,7 +7330,16 @@ async def _send_admin_panel(target, db: dict):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest: pass
+    except BadRequest as _e:
+        # fallback without markdown
+        try:
+            plain = text.replace("*","").replace("`","")
+            if hasattr(target, 'edit_message_text'):
+                await target.edit_message_text(plain, reply_markup=markup)
+            else:
+                await target.reply_text(plain, reply_markup=markup)
+        except Exception:
+            pass
 
 @admin_only
 
@@ -8961,12 +9200,12 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = _format_vuln_report(results)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode='Markdown')
+            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode=None)
             await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
 
 # ══════════════════════════════════════════════════
@@ -9150,14 +9389,14 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
+            await msg.edit_text(report_text, parse_mode=None)
         else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
+            await msg.edit_text(report_text[:4000], parse_mode=None)
             await update.effective_message.reply_text(
-                report_text[4000:8000], parse_mode='Markdown')
+                report_text[4000:8000], parse_mode=None)
     except Exception:
         await update.effective_message.reply_text(
-            report_text[:4000], parse_mode='Markdown')
+            report_text[:4000], parse_mode=None)
 
     # ── Export full JSON report + send as file ────
     if endpoints or all_mined:
@@ -10028,9 +10267,9 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
+            await msg.edit_text(tg_text[:4000], parse_mode=None)
         else:
-            await msg.edit_text(tg_text, parse_mode='Markdown')
+            await msg.edit_text(tg_text, parse_mode=None)
     except Exception:
         pass
 
@@ -10904,7 +11143,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_text = "\n".join(lines)
     try:
-        await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
+        await msg.edit_text(tg_text[:4000], parse_mode=None)
     except Exception:
         pass
 
@@ -11824,11 +12063,11 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
+            await msg.edit_text(report[:4000], parse_mode=None)
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
     # ── Export wordlist + results as ZIP ─────────
     import io, zipfile as _zf
@@ -12178,11 +12417,11 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
+            await msg.edit_text(report[:4000], parse_mode=None)
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
     # Export full JSON report
     import io
@@ -12494,12 +12733,12 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
+            await msg.edit_text(report_text, parse_mode=None)
         else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
-            await update.message.reply_text(report_text[4000:8000], parse_mode='Markdown')
+            await msg.edit_text(report_text[:4000], parse_mode=None)
+            await update.message.reply_text(report_text[4000:8000], parse_mode=None)
     except Exception:
-        await update.message.reply_text(report_text[:4000], parse_mode='Markdown')
+        await update.message.reply_text(report_text[:4000], parse_mode=None)
 
     # ── Export full JSON report ───────────────────
     try:
@@ -12562,32 +12801,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 *Website Downloader Bot v17.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📥 *Download Commands:*\n"
-        f"  `/download <url>` — Single page\n"
-        f"  `/fullsite <url>` — Full website\n"
+        f"  `/download <url>` — Single page HTML + assets\n"
+        f"  `/fullsite <url>` — Full website crawl\n"
         f"  `/jsdownload <url>` — JS/React site _{js_status}_\n"
+        f"  `/jsfullsite <url>` — JS + Full crawl\n"
         f"  `/resume <url>` — Download ဆက်လုပ်ရန်\n"
         f"  `/stop` — Download ရပ်ရန်\n\n"
-        f"🔍 *Tools:*\n"
-        f"  `/vuln <url>` — Security scan\n"
-        f"  `/api <url>` — API discovery\n"
-        f"  `/tech <url>` — Tech stack fingerprint\n"
-        f"  `/extract <url>` — Secret/key scanner\n"
-        f"  `/subdomains <domain>` — Subdomain enumeration\n"
-        f"  `/bypass403 <url>` — 403 bypass tester\n"
-        f"  `/fuzz <url>` — Path & param fuzzer\n"
-        f"  `/monitor` — Change alert monitor\n"
-        f"  `/smartfuzz <url>` — 🗂️ Context-aware smart fuzzer\n"
-        f"  `/antibot <url>` — 🤖 Anti-bot / Captcha bypass\n"
-        f"  `/jwtattack <token>` — 🎟️ JWT decode & crack\n"
-        f"  `/sitekey <url>` — 🔑 reCAPTCHA/hCaptcha/Turnstile key extractor\n\n"
+        f"🔑 *Site Key:*\n"
+        f"  `/sitekey <url>` — reCAPTCHA / hCaptcha / Turnstile key extractor\n\n"
         f"📱 *App Analyzer:*\n"
-        f"  APK / IPA / ZIP / JAR upload လုပ်ပါ\n"
+        f"  APK / IPA / ZIP / JAR file upload ပါ\n"
         f"  → Auto API + Secret extraction\n\n"
         f"📊 *Account:*\n"
         f"  `/status` — Usage ကြည့်ရန်\n"
         f"  `/history` — Download history\n"
         f"  `/mystats` — Detailed stats\n\n"
-        f"🔒 SSRF Protected{adm_line}\n\n"
+        f"🔒 SSRF Protected{adm_line}\n"
         f"❓ /help — Commands အကူအညီ",
         parse_mode='Markdown'
     )
@@ -12601,43 +12830,37 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Commands Guide — v17.0*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "📥 *Website Download*\n"
+        "📥 *Download Commands*\n"
         "  `/download <url>`\n"
-        "   └ Single page HTML + assets\n\n"
+        "   └ Single page HTML + assets download\n\n"
         "  `/fullsite <url>`\n"
-        "   └ Website အပြည့် (sitemap scan ပါ)\n\n"
+        "   └ Website အပြည့် (sitemap + crawl)\n\n"
         "  `/jsdownload <url>`\n"
-        "   └ React/Vue/Angular JS sites\n"
+        "   └ React / Vue / Angular JS sites\n"
         "   └ Status: " + js_st + "\n\n"
         "  `/jsfullsite <url>`\n"
         "   └ JS + Full crawl ပေါင်းစပ်\n\n"
         "  `/resume <url>`\n"
         "   └ ကျသွားလျှင် ဆက်လုပ်ရန်\n\n"
+        "  `/stop` — လက်ရှိ download ရပ်ရန်\n\n"
+
+        "🔑 *Site Key Extractor*\n"
+        "  `/sitekey <url>`\n"
+        "   └ reCAPTCHA / hCaptcha / Turnstile key ဆွဲထုတ်\n"
+        "   └ Site key + widget config တွေ report ထုတ်\n\n"
 
         "📱 *App Analyzer (Upload File):*\n"
-        "  APK / IPA / ZIP / JAR / AAB / JAR\n"
+        "  APK / IPA / ZIP / JAR / AAB\n"
         "   └ Chat ထဲ file drop ရုံသာ\n"
         "   └ API endpoints + Secrets + Hosts\n"
         "   └ AndroidManifest / Info.plist parse\n"
         "   └ JSON report auto-export\n"
         f"   └ Max size: `{APP_MAX_MB}MB`\n\n"
-        "🔍 *Scan & Discovery*\n"
-        "  `/vuln <url>` — Security vulnerability scan\n"
-        "  `/api <url>` — API endpoint discovery\n"
-        "  `/tech <url>` — Tech stack fingerprinter\n"
-        "  `/extract <url>` — Secret/API key scanner (JS bundles)\n\n"
-        "🔓 *Advanced Recon*\n"
-        "  `/subdomains <domain>` — Subdomain enum (crt.sh + brute-force)\n"
-        "  `/bypass403 <url>` — 403 bypass (50+ techniques)\n"
-        "  `/fuzz <url> [paths|params]` — HTTP path & param fuzzer\n\n"
-        "🔔 *Monitoring*\n"
-        "  `/monitor add <url> [min] [label]` — Alert on page change\n"
-        "  `/monitor list|del|clear` — Manage monitors\n\n"
 
         "📊 *My Account*\n"
         "  `/status` — Daily limit + usage\n"
         "  `/history` — Download log (last 10)\n"
-        "  `/mystats` — Total stats\n\n"
+        "  `/mystats` — Detailed stats\n\n"
 
         "💡 *Tips:*\n"
         "  • 50MB+ ဆိုရင် auto split လုပ်ပြီး ပို့ပေးမယ်\n"
@@ -12648,10 +12871,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_section = (
         "\n\n👑 *Admin Commands:*\n"
-        "  `/admin` — Admin panel\n"
-        "  `/ban` `/unban` `/setlimit` `/userinfo`\n"
-        "  `/broadcast` `/allusers` `/setpages` `/setassets`\n\n"
-            )
+        "  `/admin` — Admin panel (full control)\n"
+        "  `/ban <id>` `/unban <id>` — User ban management\n"
+        "  `/setlimit global <n>` — Daily download limit\n"
+        "  `/userinfo <id>` — User details\n"
+        "  `/broadcast <msg>` — All users ကို message ပို့\n"
+        "  `/allusers` — User list\n"
+        "  `/setpages <n>` `/setassets <n>` — Crawler limits\n"
+        "  `/proxy` — Proxy management\n\n"
+    )
 
     await update.effective_message.reply_text(
         base + (admin_section if is_adm else ""),
@@ -12946,28 +13174,51 @@ async def _send_admin_panel(target, db: dict):
     tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
     banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
     today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
+    lim       = db["settings"].get("global_daily_limit", 0)
+    max_pg    = db["settings"].get("max_pages", MAX_PAGES)
+    max_as    = db["settings"].get("max_assets", MAX_ASSETS)
+
+    bot_btn_label = "🔴 Turn OFF" if bot_on else "🟢 Turn ON"
+    bot_status    = "🟢 ONLINE" if bot_on else "🔴 OFFLINE"
+    proxy_st      = proxy_manager.stats()
+    proxy_live    = proxy_st.get("live", 0)
+    proxy_total   = proxy_st.get("total", 0)
+
     kb = [
         [
-            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
+            InlineKeyboardButton("📊 Statistics", callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
+            InlineKeyboardButton("📜 DL Log",      callback_data="adm_log"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Banned List", callback_data="adm_banned"),
+            InlineKeyboardButton("🌐 Proxy Status", callback_data="adm_proxy"),
+        ],
+        [
             InlineKeyboardButton(
-                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
+                bot_btn_label,
                 callback_data="adm_toggle_bot"
             ),
+            InlineKeyboardButton("🔄 Refresh",    callback_data="adm_back"),
         ],
-        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
     text = (
-        f"👑 *Admin Panel v17.0*\n\n"
-        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
-        f"📦 Total: `{tdl}` | Today: `{today_dl}`\n"
-        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
-        f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
-        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PUPPETEER_OK else '❌'}"
+        f"👑 *Admin Panel v17.0*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 Bot Status : {bot_status}\n"
+        f"👥 Total Users : `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total DL    : `{tdl}` | Today: `{today_dl}`\n\n"
+        f"⚙️ *Config*\n"
+        f"  Daily Limit : `{'∞' if lim == 0 else lim}`\n"
+        f"  Max Pages   : `{max_pg}` | Assets: `{max_as}`\n"
+        f"  Concurrent  : `{MAX_WORKERS}` | Rate: `{RATE_LIMIT_SEC}s`\n"
+        f"  Split Size  : `{SPLIT_MB}MB`\n\n"
+        f"🌐 *Proxy* : `{proxy_live}/{proxy_total}` live\n"
+        f"⚡ JS (Puppeteer): {'✅' if PUPPETEER_OK else '❌'}\n"
+        f"🔒 SSRF / Traversal / RateLimit : ✅"
     )
     markup = InlineKeyboardMarkup(kb)
     try:
@@ -12975,7 +13226,16 @@ async def _send_admin_panel(target, db: dict):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest: pass
+    except BadRequest as _e:
+        # fallback without markdown
+        try:
+            plain = text.replace("*","").replace("`","")
+            if hasattr(target, 'edit_message_text'):
+                await target.edit_message_text(plain, reply_markup=markup)
+            else:
+                await target.reply_text(plain, reply_markup=markup)
+        except Exception:
+            pass
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13436,7 +13696,8 @@ def analyze_app_file(filepath: str, progress_cb=None) -> dict:
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    # NOTE: query.answer() ကို branch တစ်ခုချင်းမှာ တစ်ကြိမ်သာ call ရမယ်
+    # top-level မှာ call မလုပ်ရင် double-answer bug ကင်းမယ်
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("🚫 Admin only", show_alert=True); return
     if update.effective_chat.type != "private":
@@ -13447,15 +13708,21 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "adm_users":
+        await query.answer()
         lines = ["👥 *Users*\n"]
         for uid, u in list(db["users"].items())[:20]:
             icon = "🚫" if u["banned"] else "✅"
             lines.append(f"{icon} `{uid}` — {u['name']} | {u['total_downloads']} DL")
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
-        try: await query.edit_message_text("\n".join(lines) or "Empty", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        try:
+            await query.edit_message_text(
+                "\n".join(lines) or "Empty",
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+            )
         except BadRequest: pass
 
     elif data == "adm_stats":
+        await query.answer()
         today   = str(date.today())
         tdl     = sum(u.get("total_downloads",0) for u in db["users"].values())
         tdl_day = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
@@ -13463,53 +13730,102 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_txt = "\n".join(f"  {i+1}. {u['name']} ({u['total_downloads']})" for i,(_,u) in enumerate(top)) or "None"
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
-            f"📊 *Stats*\n\nTotal: `{tdl}` | Today: `{tdl_day}`\n\n🏆 Top:\n{top_txt}",
+            f"📊 *Statistics*\n\nTotal Downloads: `{tdl}` | Today: `{tdl_day}`\n\n🏆 Top Users:\n{top_txt}",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
     elif data == "adm_settings":
+        await query.answer()
         s  = db["settings"]
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        lim = s.get("global_daily_limit", 0)
+        kb = [
+            [InlineKeyboardButton("🔙 Back", callback_data="adm_back")]
+        ]
         await query.edit_message_text(
-            f"⚙️ *Settings*\n\n"
-            f"Daily Limit: `{s['global_daily_limit']}` (`/setlimit global <n>`)\n"
-            f"Max Pages: `{s['max_pages']}` (`/setpages <n>`)\n"
-            f"Max Assets: `{s['max_assets']}` (`/setassets <n>`)\n"
-            f"Bot: `{'ON' if s['bot_enabled'] else 'OFF'}`\n"
-            f"Rate Limit: `{RATE_LIMIT_SEC}s` per request\n"
-            f"Max Asset Size: `{MAX_ASSET_MB}MB`\n"
-            f"Split: `{SPLIT_MB}MB`",
+            f"⚙️ *Settings*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Daily Limit  : `{'∞' if lim==0 else lim}` — `/setlimit global <n>`\n"
+            f"Max Pages    : `{s['max_pages']}` — `/setpages <n>`\n"
+            f"Max Assets   : `{s['max_assets']}` — `/setassets <n>`\n"
+            f"Bot Status   : `{'ON' if s['bot_enabled'] else 'OFF'}`\n"
+            f"Rate Limit   : `{RATE_LIMIT_SEC}s` per request\n"
+            f"Max Asset MB : `{MAX_ASSET_MB}MB`\n"
+            f"Split Size   : `{SPLIT_MB}MB`\n"
+            f"File Expiry  : `{FILE_EXPIRY_HOURS}h`",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
     elif data == "adm_toggle_bot":
+        # Fix: save ပြီးမှ answer ခေါ်ရမယ်၊ double-answer မဖြစ်ရဲ
         async with db_lock:
             db2 = _load_db_sync()
             db2["settings"]["bot_enabled"] = not db2["settings"]["bot_enabled"]
             _save_db_sync(db2)
             new_state = db2["settings"]["bot_enabled"]
-        await query.answer(f"Bot is now {'🟢 ON' if new_state else '🔴 OFF'}", show_alert=True)
+        status_txt = "🟢 Bot is now ONLINE" if new_state else "🔴 Bot is now OFFLINE"
+        await query.answer(status_txt, show_alert=True)
         async with db_lock:
             db3 = _load_db_sync()
         await _send_admin_panel(query, db3)
 
+    elif data == "adm_banned":
+        await query.answer()
+        banned = [(uid, u) for uid, u in db["users"].items() if u.get("banned")]
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        if not banned:
+            await query.edit_message_text(
+                "🚫 *Banned Users*\n\nBanned user မရှိပါ။",
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+            )
+        else:
+            lines = ["🚫 *Banned Users*\n"]
+            for uid, u in banned[:20]:
+                lines.append(f"  `{uid}` — {u['name']}")
+            lines.append(f"\nTotal: `{len(banned)}`")
+            await query.edit_message_text(
+                "\n".join(lines),
+                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+            )
+
+    elif data == "adm_proxy":
+        await query.answer()
+        st = proxy_manager.stats()
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        en_icon = "🟢" if st["enabled"] else "🔴"
+        await query.edit_message_text(
+            f"🌐 *Proxy Status*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{en_icon} Status    : `{'ENABLED' if st['enabled'] else 'DISABLED'}`\n"
+            f"📋 Total     : `{st['total']}`\n"
+            f"✅ Live      : `{st['live']}`\n"
+            f"⏳ Cooldown  : `{st['in_cooldown']}`\n"
+            f"🚀 Available : `{st['available']}`\n"
+            f"🕐 Last Load : `{st['last_load']}`\n\n"
+            f"Use `/proxy reload` to refresh.",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
     elif data == "adm_log":
+        await query.answer()
         all_logs = []
         for uid, u in db["users"].items():
             for d in u.get("downloads",[]): all_logs.append((u["name"], d))
         all_logs.sort(key=lambda x: x[1]["time"], reverse=True)
-        lines = ["📜 *Recent 15*\n"]
+        lines = ["📜 *Recent 15 Downloads*\n"]
         for name, d in all_logs[:15]:
             icon = "✅" if d["status"]=="success" else "❌"
-            lines.append(f"{icon} *{name}* `{d['url'][:35]}` {d['time']}")
+            lines.append(f"{icon} {name} — `{d['url'][:30]}` {d['time']}")
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
-            "\n".join(lines) if len(lines)>1 else "Empty",
+            "\n".join(lines) if len(lines)>1 else "📭 Log မရှိသေးပါ",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
     elif data == "adm_back":
-        await _send_admin_panel(query, db)
+        await query.answer()
+        async with db_lock:
+            db_fresh = _load_db_sync()
+        await _send_admin_panel(query, db_fresh)
 
 
 # ══════════════════════════════════════════════════
