@@ -4610,7 +4610,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
-        await msg.edit_text(f"❌ `{'\\n'.join(result['errors'][:3])}`", parse_mode='Markdown')
+        _err_txt = '\n'.join(result['errors'][:3])
+        await msg.edit_text(f"❌ `{_err_txt}`", parse_mode='Markdown')
         return
 
     stats = result["stats"]
@@ -11134,7 +11135,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
-        await msg.edit_text(f"❌ `{'\\n'.join(result['errors'][:3])}`", parse_mode='Markdown')
+        _err_txt = '\n'.join(result['errors'][:3])
+        await msg.edit_text(f"❌ `{_err_txt}`", parse_mode='Markdown')
         return
 
     stats = result["stats"]
