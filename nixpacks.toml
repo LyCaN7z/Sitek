@@ -1,0 +1,42 @@
+[phases.setup]
+nixPkgs = [
+  "python312",
+  "chromium",
+  "nss",
+  "nspr",
+  "dbus",
+  "atk",
+  "at-spi2-atk",
+  "cups",
+  "libdrm",
+  "libxkbcommon",
+  "xorg.libX11",
+  "xorg.libXcomposite",
+  "xorg.libXdamage",
+  "xorg.libXext",
+  "xorg.libXfixes",
+  "xorg.libXrandr",
+  "xorg.libxcb",
+  "mesa",
+  "pango",
+  "cairo",
+  "alsa-lib",
+  "at-spi2-core",
+  "glib",
+  "gtk3",
+  "gdk-pixbuf",
+  "libxshmfence",
+  "expat",
+]
+
+[phases.install]
+cmds = [
+  "pip install -r requirements.txt",
+  "playwright install chromium --with-deps",
+]
+
+[phases.build]
+cmds = []
+
+[start]
+cmd = "python web_downloader_bot_v17_fixed.py"

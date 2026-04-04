@@ -1,0 +1,8 @@
+python-telegram-bot[http2]==21.6
+requests==2.31.0
+urllib3==2.2.1
+beautifulsoup4==4.12.3
+python-dotenv==1.0.1
+httpx[http2]==0.27.0
+playwright==1.44.0
+PySocks==1.7.1
