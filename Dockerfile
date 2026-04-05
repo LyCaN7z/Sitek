@@ -43,4 +43,4 @@ RUN mkdir -p /root/downloads/web_sources \
              /root/downloads/resume_states \
              /root/downloads/app_analysis
 
-CMD ["python", "web_downv19_full.py"]
+CMD ["python", "web_downloader_bot_v17_fixed.py"]
