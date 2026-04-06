@@ -16215,8 +16215,6 @@ def _keydump_keyboard(uid: int) -> InlineKeyboardMarkup:
 # Global keydump result cache (per uid)
 _kd_cache: dict = {}   # {uid: result_dict}
 
-
-@user_guard
 async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/keydump <url> — Comprehensive key/token extractor (HTML + JS + Dynamic)"""
     if not context.args:
@@ -16403,7 +16401,6 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /kdexport shortcut ────────────────────────────────────────
-@user_guard
 async def cmd_kdexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/kdexport — Export last keydump result as JSON"""
     uid    = update.effective_user.id
