@@ -2712,65 +2712,218 @@ def download_website(
 # ══════════════════════════════════════════════════
 
 _TECH_SIGNATURES = {
-    # CMS
-    "WordPress":        [r'wp-content/', r'wp-includes/', r'wordpress'],
-    "Drupal":           [r'Drupal\.settings', r'/sites/default/files/'],
-    "Joomla":           [r'/media/joomla_', r'Joomla!'],
-    "Ghost CMS":        [r'ghost\.io', r'/ghost/api/'],
-    "Shopify":          [r'cdn\.shopify\.com', r'Shopify\.theme'],
-    # JS Frameworks
-    "Next.js":          [r'__NEXT_DATA__', r'/_next/static/'],
-    "Nuxt.js":          [r'__NUXT__', r'/_nuxt/'],
-    "React":            [r'__reactFiber', r'react-dom\.production'],
-    "Vue.js":           [r'__vue__', r'data-v-[a-f0-9]+'],
-    "Angular":          [r'ng-version=', r'angular\.min\.js'],
-    "Svelte":           [r'__svelte', r'svelte-'],
-    # Servers
-    "Nginx":            [r'server:\s*nginx'],
-    "Apache":           [r'server:\s*apache'],
-    "Caddy":            [r'server:\s*caddy'],
-    "LiteSpeed":        [r'server:\s*litespeed'],
-    "IIS":              [r'server:\s*microsoft-iis'],
-    # CDN / WAF
-    "Cloudflare":       [r'cf-ray', r'server:\s*cloudflare'],
-    "Akamai":           [r'x-akamai-request-id', r'akamai\.net'],
-    "Fastly":           [r'x-fastly-request-id', r'fastly\.net'],
-    "AWS CloudFront":   [r'x-amz-cf-id', r'cloudfront\.net'],
-    # Analytics / Tag
-    "Google Analytics": [r'google-analytics\.com/analytics\.js', r'gtag\('],
-    "Google Tag Manager":[r'googletagmanager\.com/gtm\.js', r'GTM-[A-Z0-9]+'],
-    "Hotjar":           [r'hotjar\.com', r'hj\(\'create\''],
-    # Libraries
-    "jQuery":           [r'jquery\.min\.js', r'jquery-[0-9]'],
-    "Bootstrap":        [r'bootstrap\.min\.css', r'bootstrap\.min\.js'],
-    "Tailwind":         [r'tailwindcss', r'class="[^"]*(?:flex|grid|text-[a-z]+-[0-9])'],
-    # Backend
-    "PHP":              [r'x-powered-by:\s*php', r'\.php'],
-    "Laravel":          [r'laravel_session', r'x-powered-by:\s*php.*laravel'],
-    "Django":           [r'csrfmiddlewaretoken', r'django'],
-    "Rails":            [r'x-powered-by:\s*phusion passenger', r'_rails_'],
-    "ASP.NET":          [r'x-powered-by:\s*asp\.net', r'__viewstate'],
-    # DB / Backend hints
-    "WordPress (WooCommerce)": [r'woocommerce', r'wc-api/'],
-    "Stripe":           [r'stripe\.com/v3', r'Stripe\('],
-    "Firebase":         [r'firebaseapp\.com', r'firebase\.initializeApp'],
-    "Supabase":         [r'supabase\.co', r'supabaseClient'],
+    # ── CMS ──────────────────────────────────────────
+    "WordPress":             [r'wp-content/', r'wp-includes/', r'wordpress', r'wp-json/'],
+    "WordPress+WooCommerce": [r'woocommerce', r'wc-api/', r'wc/v3/'],
+    "Drupal":                [r'Drupal\.settings', r'/sites/default/files/', r'drupal\.js'],
+    "Joomla":                [r'/media/joomla_', r'Joomla!', r'/components/com_'],
+    "Ghost CMS":             [r'ghost\.io', r'/ghost/api/', r'content-api\.ghost\.org'],
+    "Shopify":               [r'cdn\.shopify\.com', r'Shopify\.theme', r'myshopify\.com'],
+    "Magento":               [r'Mage\.', r'/skin/frontend/', r'mage/cookies'],
+    "Prestashop":            [r'prestashop', r'/modules/blockcart/'],
+    "OpenCart":              [r'route=common/home', r'openCart'],
+    "TYPO3":                 [r'typo3/', r'typo3conf/'],
+    "Wix":                   [r'wix\.com', r'static\.parastorage\.com', r'wixstatic\.com'],
+    "Squarespace":           [r'squarespace\.com', r'static1\.squarespace'],
+    "Webflow":               [r'webflow\.com', r'uploads-ssl\.webflow'],
+    "Contentful":            [r'contentful\.com', r'ctfassets\.net'],
+    "Strapi":                [r'strapi', r'/admin/strapi'],
+    "Craft CMS":             [r'craft-csrf-token', r'/cpresources/'],
+    "HubSpot CMS":           [r'hubspot\.com/hs/', r'js\.hs-scripts'],
+    "Sitecore":              [r'sitecore', r'/sitecore/shell/'],
+    "Umbraco":               [r'umbraco', r'/umbraco/api/'],
+    # ── JS Frameworks ────────────────────────────────
+    "Next.js":               [r'__NEXT_DATA__', r'/_next/static/', r'next/dist/'],
+    "Nuxt.js":               [r'__NUXT__', r'/_nuxt/', r'nuxt\.min\.js'],
+    "React":                 [r'__reactFiber', r'react-dom\.production', r'react\.development'],
+    "Vue.js":                [r'__vue__', r'data-v-[a-f0-9]+', r'vue\.runtime'],
+    "Angular":               [r'ng-version=', r'angular\.min\.js', r'ng-app='],
+    "Svelte":                [r'__svelte', r'svelte-', r'svelte/internal'],
+    "Gatsby":                [r'___gatsby', r'/gatsby-', r'gatsby-config'],
+    "Remix":                 [r'__remixContext', r'@remix-run'],
+    "Astro":                 [r'astro-island', r'astro:page-load'],
+    "SvelteKit":             [r'__sveltekit_', r'_app/immutable/'],
+    "Ember.js":              [r'ember-application', r'Ember\.VERSION'],
+    "Alpine.js":             [r'x-data=', r'alpinejs'],
+    "HTMX":                  [r'hx-get=', r'hx-post=', r'htmx\.org'],
+    "Stimulus":              [r'stimulus', r'data-controller='],
+    "Inertia.js":            [r'inertia', r'@inertiajs/'],
+    # ── JS Libraries ─────────────────────────────────
+    "jQuery":                [r'jquery\.min\.js', r'jquery-[0-9]'],
+    "Bootstrap":             [r'bootstrap\.min\.css', r'bootstrap\.min\.js'],
+    "Tailwind CSS":          [r'tailwindcss', r'cdn\.tailwindcss\.com'],
+    "Lodash":                [r'lodash\.min\.js', r'_\.chunk\('],
+    "Axios":                 [r'axios\.min\.js', r'axios\.create\('],
+    "D3.js":                 [r'd3\.min\.js', r'd3-selection'],
+    "Chart.js":              [r'chart\.min\.js', r'Chart\.register'],
+    # ── Servers ──────────────────────────────────────
+    "Nginx":                 [r'server:\s*nginx'],
+    "Apache":                [r'server:\s*apache'],
+    "Caddy":                 [r'server:\s*caddy'],
+    "LiteSpeed":             [r'server:\s*litespeed'],
+    "IIS (Microsoft)":       [r'server:\s*microsoft-iis'],
+    "OpenResty":             [r'server:\s*openresty'],
+    "Gunicorn":              [r'server:\s*gunicorn'],
+    "uWSGI":                 [r'server:\s*uwsgi'],
+    "Kestrel (.NET)":        [r'server:\s*kestrel'],
+    "Tomcat":                [r'server:\s*apache-coyote', r'apache tomcat'],
+    # ── CDN / WAF ────────────────────────────────────
+    "Cloudflare":            [r'cf-ray', r'server:\s*cloudflare', r'__cf_bm'],
+    "Cloudflare WAF":        [r'cf-mitigated', r'cloudflare-nginx'],
+    "Akamai":                [r'x-akamai-request-id', r'akamai\.net'],
+    "Fastly":                [r'x-fastly-request-id', r'fastly\.net'],
+    "AWS CloudFront":        [r'x-amz-cf-id', r'cloudfront\.net'],
+    "AWS ALB":               [r'x-amzn-requestid', r'x-amzn-trace-id'],
+    "Vercel":                [r'x-vercel-id', r'vercel\.app'],
+    "Netlify":               [r'x-nf-request-id', r'netlify\.app'],
+    "Render":                [r'rndr-id', r'onrender\.com'],
+    "Railway":               [r'railway\.app'],
+    "Heroku":                [r'x-request-id.*heroku', r'herokuapp\.com'],
+    "Sucuri WAF":            [r'x-sucuri-id', r'sucuri\.net'],
+    "Imperva/Incapsula":     [r'x-iinfo', r'incapsula', r'visid_incap_'],
+    "Varnish":               [r'x-varnish', r'via.*varnish'],
+    "BunnyCDN":              [r'bunnycdn', r'b-cdn\.net'],
+    # ── Analytics / Marketing ────────────────────────
+    "Google Analytics 4":    [r'G-[A-Z0-9]{8,12}', r'gtag\('],
+    "Google Analytics UA":   [r'UA-\d{5,12}-\d', r'google-analytics\.com'],
+    "Google Tag Manager":    [r'GTM-[A-Z0-9]+', r'googletagmanager\.com/gtm\.js'],
+    "Google Ads":            [r'AW-\d{8,12}', r'googleadservices\.com'],
+    "Hotjar":                [r'hotjar\.com', r'hjid'],
+    "Mixpanel":              [r'mixpanel\.init', r'mixpanel\.com/lib'],
+    "Amplitude":             [r'amplitude\.getInstance', r'cdn\.amplitude\.com'],
+    "Heap":                  [r'heap\.load', r'heapanalytics\.com'],
+    "Segment":               [r'analytics\.load', r'cdn\.segment\.com'],
+    "Facebook Pixel":        [r'fbq\(', r'connect\.facebook\.net/en_US/fbevents'],
+    "TikTok Pixel":          [r'analytics\.tiktok\.com', r'ttq\.load\('],
+    "LinkedIn Insight":      [r'snap\.licdn\.com', r'_linkedin_partner_id'],
+    "Clarity (Microsoft)":   [r'clarity\.ms', r'clarity\('],
+    "FullStory":             [r'fullstory\.com/s/fs\.js'],
+    # ── Live Chat ────────────────────────────────────
+    "Intercom":              [r'intercom\.io', r'widget\.intercom\.io'],
+    "HubSpot Chat":          [r'js\.hs-scripts\.com', r'hubspot\.com/hs/'],
+    "Drift":                 [r'js\.drift\.com', r'driftt\.com'],
+    "Zendesk":               [r'zopim', r'zendesk\.com/embeddable'],
+    "Crisp":                 [r'crisp\.chat', r'client\.crisp\.chat'],
+    "Tawk.to":               [r'tawk\.to', r'embed\.tawk\.to'],
+    "Freshchat":             [r'wchat\.freshchat\.com'],
+    # ── Backend / Language ───────────────────────────
+    "PHP":                   [r'x-powered-by:\s*php', r'\.php\b', r'PHPSESSID'],
+    "Laravel":               [r'laravel_session', r'laravel_token', r'XSRF-TOKEN'],
+    "Symfony":               [r'symfony', r'_symfony_'],
+    "CakePHP":               [r'cakephp', r'CAKEPHP'],
+    "CodeIgniter":           [r'ci_session', r'codeigniter'],
+    "Django":                [r'csrfmiddlewaretoken', r'django'],
+    "Flask":                 [r'werkzeug', r'flask-session'],
+    "FastAPI":               [r'fastapi'],
+    "Rails":                 [r'_rails_', r'authenticity_token', r'rails-ujs'],
+    "ASP.NET":               [r'x-powered-by:\s*asp\.net', r'__viewstate', r'__eventvalidation'],
+    "ASP.NET Core":          [r'x-powered-by:\s*asp\.net core', r'\.blazor'],
+    "Spring (Java)":         [r'x-application-context', r'spring'],
+    "Go (Gin/Echo)":         [r'server:\s*gin', r'server:\s*echo'],
+    "Node.js":               [r'x-powered-by:\s*node', r'connect\.sid'],
+    "Express.js":            [r'x-powered-by:\s*express'],
+    "NestJS":                [r'nestjs'],
+    ".NET Blazor":           [r'_blazor', r'blazor\.webassembly'],
+    # ── Auth / Identity ──────────────────────────────
+    "Auth0":                 [r'auth0\.com', r'auth0\.js'],
+    "Okta":                  [r'okta\.com', r'okta-signin'],
+    "Firebase Auth":         [r'firebase\.auth\(\)', r'firebaseapp\.com'],
+    "Keycloak":              [r'keycloak\.js', r'/auth/realms/'],
+    "Clerk":                 [r'clerk\.dev', r'clerk\.browser\.js'],
+    "Supabase":              [r'supabase\.co', r'supabaseClient'],
+    # ── Payment ──────────────────────────────────────
+    "Stripe":                [r'stripe\.com/v3', r'Stripe\(', r'js\.stripe\.com'],
+    "PayPal":                [r'paypal\.com/sdk', r'paypalobjects\.com'],
+    "Braintree":             [r'braintreegateway\.com', r'Braintree\.setup'],
+    "Square":                [r'squareup\.com', r'Square\.paymentForm'],
+    "Razorpay":              [r'razorpay\.com', r'Razorpay\('],
+    # ── Captcha ──────────────────────────────────────
+    "reCAPTCHA":             [r'recaptcha/api\.js', r'g-recaptcha'],
+    "hCaptcha":              [r'hcaptcha\.com/1/api\.js', r'h-captcha'],
+    "Cloudflare Turnstile":  [r'challenges\.cloudflare\.com', r'cf-turnstile'],
+    # ── Monitoring ───────────────────────────────────
+    "Sentry":                [r'sentry\.io', r'sentry\.min\.js', r'Sentry\.init'],
+    "Datadog RUM":           [r'datadoghq\.com', r'datadog-rum'],
+    "New Relic":             [r'newrelic\.com', r'nr-data\.net'],
+    # ── Services / APIs ──────────────────────────────
+    "GraphQL":               [r'/graphql', r'__typename', r'IntrospectionQuery'],
+    "Apollo GraphQL":        [r'apollo-client', r'ApolloClient'],
+    "Prisma":                [r'prisma\.io', r'@prisma/client'],
+    "Socket.io":             [r'socket\.io/socket\.io\.js'],
+    "Firebase":              [r'firebaseapp\.com', r'firebase\.initializeApp'],
+    "Supabase DB":           [r'supabase\.co', r'supabaseClient'],
+    "Elasticsearch":         [r'x-elastic-product', r'elastic\.co'],
+    "Pusher":                [r'pusher\.com', r'pusherapp\.com'],
+    "Twilio":                [r'twilio\.com', r'twilio\.js'],
+    "Cloudinary":            [r'res\.cloudinary\.com', r'cloudinary\.com/video'],
+    "Swagger UI":            [r'swagger-ui', r'swaggerUi'],
+    # ── Build Tools ──────────────────────────────────
+    "Webpack":               [r'webpackChunk', r'__webpack_require__'],
+    "Vite":                  [r'/@vite/', r'vite/client'],
+    "PWA":                   [r'serviceWorker\.register', r'workbox-'],
+    "tRPC":                  [r'trpc\.io', r'@trpc/'],
+}
+
+_TECH_CATEGORY = {
+    "CMS":              ["WordPress","WordPress+WooCommerce","Drupal","Joomla","Ghost CMS",
+                         "Shopify","Magento","Prestashop","OpenCart","TYPO3","Wix",
+                         "Squarespace","Webflow","Contentful","Strapi","Craft CMS",
+                         "HubSpot CMS","Sitecore","Umbraco"],
+    "JS Frameworks":    ["Next.js","Nuxt.js","React","Vue.js","Angular","Svelte","Gatsby",
+                         "Remix","Astro","SvelteKit","Ember.js","Alpine.js","HTMX",
+                         "Stimulus","Inertia.js"],
+    "JS Libraries":     ["jQuery","Bootstrap","Tailwind CSS","Lodash","Axios","D3.js","Chart.js"],
+    "Backend":          ["PHP","Laravel","Symfony","CakePHP","CodeIgniter","Django","Flask",
+                         "FastAPI","Rails","ASP.NET","ASP.NET Core","Spring (Java)","Go (Gin/Echo)",
+                         "Node.js","Express.js","NestJS",".NET Blazor"],
+    "Web Server":       ["Nginx","Apache","Caddy","LiteSpeed","IIS (Microsoft)","OpenResty",
+                         "Gunicorn","uWSGI","Kestrel (.NET)","Tomcat"],
+    "CDN / WAF":        ["Cloudflare","Cloudflare WAF","Akamai","Fastly","AWS CloudFront",
+                         "AWS ALB","Vercel","Netlify","Render","Railway","Heroku",
+                         "Sucuri WAF","Imperva/Incapsula","Varnish","BunnyCDN"],
+    "Analytics":        ["Google Analytics 4","Google Analytics UA","Google Tag Manager",
+                         "Google Ads","Hotjar","Mixpanel","Amplitude","Heap","Segment",
+                         "Facebook Pixel","TikTok Pixel","LinkedIn Insight",
+                         "Clarity (Microsoft)","FullStory"],
+    "Live Chat":        ["Intercom","HubSpot Chat","Drift","Zendesk","Crisp","Tawk.to","Freshchat"],
+    "Auth":             ["Auth0","Okta","Firebase Auth","Keycloak","Clerk","Supabase"],
+    "Payment":          ["Stripe","PayPal","Braintree","Square","Razorpay"],
+    "Captcha":          ["reCAPTCHA","hCaptcha","Cloudflare Turnstile"],
+    "Monitoring":       ["Sentry","Datadog RUM","New Relic"],
+    "Services / APIs":  ["GraphQL","Apollo GraphQL","Prisma","Socket.io","Firebase","Supabase DB",
+                         "Elasticsearch","Pusher","Twilio","Cloudinary","Swagger UI","tRPC"],
+    "Build Tools":      ["Webpack","Vite","PWA"],
 }
 
 _NOTABLE_HEADERS = [
     'server', 'x-powered-by', 'x-generator', 'x-framework',
-    'cf-ray', 'via', 'x-drupal-cache', 'x-varnish',
-    'x-shopify-stage', 'x-wix-request-id',
+    'cf-ray', 'cf-cache-status', 'via', 'x-drupal-cache', 'x-varnish',
+    'x-shopify-stage', 'x-wix-request-id', 'x-vercel-id', 'x-nf-request-id',
+    'x-amzn-requestid', 'x-amz-cf-id', 'x-request-id', 'x-correlation-id',
+    'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-frame-options',
+    'content-security-policy', 'strict-transport-security', 'x-content-type-options',
+    'permissions-policy', 'access-control-allow-origin', 'x-elastic-product',
+    'x-application-context', 'x-aspnet-version', 'x-iinfo', 'rndr-id',
 ]
 
 async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/tech <url> — Detect technology stack"""
+    """/tech <url> — Deep technology stack fingerprinting (130+ signatures)"""
     if not context.args:
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/tech https://example.com`\n\n"
-            "🔬 *Detects:*  CMS, JS frameworks, servers, CDN/WAF,\n"
-            "analytics, backend tech, JS libraries & more.\n\n"
-            f"Checks `{len(_TECH_SIGNATURES)}` known tech signatures.",
+            "🔬 *Tech Stack Fingerprinter v2*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:* `/tech https://example.com/any/path`\n\n"
+            f"*{len(_TECH_SIGNATURES)} signatures across:*\n"
+            "  🗂 CMS (WordPress, Shopify, Drupal, Magento...)\n"
+            "  ⚡ JS Frameworks (React, Next.js, Vue, Angular...)\n"
+            "  🖥 Servers (Nginx, Apache, Caddy, IIS...)\n"
+            "  ☁️ CDN/WAF (Cloudflare, Vercel, Akamai...)\n"
+            "  📊 Analytics (GA4, GTM, Mixpanel, Hotjar...)\n"
+            "  🔐 Auth (Auth0, Okta, Firebase, Clerk...)\n"
+            "  💳 Payment (Stripe, PayPal, Razorpay...)\n"
+            "  🔧 Backend (PHP, Django, Rails, Laravel...)\n"
+            "  🧩 Services (GraphQL, Socket.io, Sentry...)\n\n"
+            "📡 Also scans: HTTP headers, cookies, JS bundles",
             parse_mode='Markdown'
         )
         return
@@ -2790,80 +2943,152 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
         return
 
-    msg = await update.effective_message.reply_text("🔬 Tech stack fingerprinting...")
+    domain = urlparse(url).hostname
+    path   = urlparse(url).path or "/"
+    msg    = await update.effective_message.reply_text(
+        f"🔬 *Tech Fingerprinting...*\n🌐 `{domain}`\n📁 `{path}`\n\n⏳",
+        parse_mode='Markdown'
+    )
 
     def _do_tech_scan():
-        resp = requests.get(
-            url, headers=_get_headers(), timeout=TIMEOUT, verify=False,
-            proxies=proxy_manager.get_proxy(), allow_redirects=True
-        )
-        body         = resp.text[:80000]
-        headers_str  = "\n".join(f"{k}: {v}" for k, v in resp.headers.items()).lower()
-        combined     = (body + headers_str).lower()
+        sess = requests.Session()
+        sess.headers.update(_get_headers())
+        proxy = proxy_manager.get_proxy()
+
+        # Fetch main page
+        resp = sess.get(url, timeout=TIMEOUT, verify=False,
+                        proxies=proxy, allow_redirects=True)
+        html         = resp.text
+        body_low     = html.lower()[:120000]
+        hdrs         = dict(resp.headers)
+        hdrs_str     = "\n".join(f"{k}: {v}" for k, v in hdrs.items()).lower()
+        combined_low = body_low + "\n" + hdrs_str
+        cookies_str  = " ".join(f"{c.name}={c.value}" for c in sess.cookies)
+        combined_low += "\n" + cookies_str.lower()
+
+        # Also scan linked JS bundles (first 5)
+        js_corpus = ""
+        soup_tech = BeautifulSoup(html, "html.parser")
+        js_fetched = 0
+        for tag in soup_tech.find_all("script", src=True):
+            if js_fetched >= 5:
+                break
+            js_url = urljoin(url, tag["src"])
+            try:
+                jr = sess.get(js_url, timeout=8, verify=False, proxies=proxy)
+                if jr.status_code == 200:
+                    js_corpus += jr.text[:50000].lower()
+                    js_fetched += 1
+            except Exception:
+                pass
+        combined_low += "\n" + js_corpus
 
         detected = {}
         for tech, patterns in _TECH_SIGNATURES.items():
             for p in patterns:
-                if re.search(p, combined, re.I):
-                    detected[tech] = p
-                    break
+                try:
+                    if re.search(p, combined_low, re.I):
+                        detected[tech] = True
+                        break
+                except Exception:
+                    pass
 
-        notable = {
-            k: v for k, v in resp.headers.items()
-            if k.lower() in _NOTABLE_HEADERS
-        }
-        return detected, notable, resp.status_code
+        notable = {k: v for k, v in hdrs.items()
+                   if k.lower() in _NOTABLE_HEADERS}
+        return detected, notable, resp.status_code, resp.url, js_fetched
 
     try:
-        detected, notable, status = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status, final_url, js_cnt = await asyncio.to_thread(_do_tech_scan)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
+                            parse_mode='Markdown')
         return
 
-    domain = urlparse(url).hostname
-    lines  = [f"🔬 *Tech Stack — `{domain}`*", f"Status: `{status}`\n"]
+    # ── Build report ──────────────────────────────
+    redirect_note = ""
+    if str(final_url).rstrip("/") != url.rstrip("/"):
+        redirect_note = f"\n↪️ Redirected: `{str(final_url)[:60]}`"
 
-    # Group by category
-    _CAT = {
-        "CMS":        ["WordPress","Drupal","Joomla","Ghost CMS","Shopify","WordPress (WooCommerce)"],
-        "JS Frameworks":["Next.js","Nuxt.js","React","Vue.js","Angular","Svelte"],
-        "JS Libraries": ["jQuery","Bootstrap","Tailwind"],
-        "Server":     ["Nginx","Apache","Caddy","LiteSpeed","IIS"],
-        "CDN / WAF":  ["Cloudflare","Akamai","Fastly","AWS CloudFront"],
-        "Analytics":  ["Google Analytics","Google Tag Manager","Hotjar"],
-        "Backend":    ["PHP","Laravel","Django","Rails","ASP.NET"],
-        "Services":   ["Stripe","Firebase","Supabase"],
+    lines = [
+        f"🔬 *Tech Stack Report*",
+        f"🌐 `{domain}` | `{status}`{redirect_note}",
+        f"📦 Signatures: `{len(_TECH_SIGNATURES)}` | JS bundles: `{js_cnt}`",
+        f"✅ Detected: `{len(detected)}` technologies",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    cat_icons = {
+        "CMS": "🗂", "JS Frameworks": "⚡", "JS Libraries": "📚",
+        "Backend": "🔧", "Web Server": "🖥", "CDN / WAF": "☁️",
+        "Analytics": "📊", "Live Chat": "💬", "Auth": "🔐",
+        "Payment": "💳", "Captcha": "🛡", "Monitoring": "👁",
+        "Services / APIs": "🧩", "Build Tools": "⚙️",
     }
 
     any_found = False
-    for cat, techs in _CAT.items():
+    for cat, techs in _TECH_CATEGORY.items():
         hits = [t for t in techs if t in detected]
-        if hits:
-            lines.append(f"*{cat}:*")
-            for h in hits:
-                lines.append(f"  ✅ `{h}`")
-            lines.append("")
-            any_found = True
+        if not hits:
+            continue
+        icon = cat_icons.get(cat, "•")
+        lines.append(f"{icon} *{cat}* `({len(hits)})`")
+        for h in hits:
+            lines.append(f"  ✅ `{h}`")
+        lines.append("")
+        any_found = True
 
-    # Uncategorised
-    known_all = {t for ts in _CAT.values() for t in ts}
-    extras    = [t for t in detected if t not in known_all]
+    # Any detected not in category
+    all_categorised = {t for ts in _TECH_CATEGORY.values() for t in ts}
+    extras = [t for t in detected if t not in all_categorised]
     if extras:
-        lines.append("*Other:*")
+        lines.append("🔍 *Other*")
         for t in extras:
             lines.append(f"  ✅ `{t}`")
         lines.append("")
         any_found = True
 
     if not any_found:
-        lines.append("⚠️ No known tech signatures matched.")
+        lines += [
+            "⚠️ *No known signatures matched*",
+            "",
+            "_Site may use:_",
+            "  • Custom/obscure framework",
+            "  • Heavy minification/obfuscation",
+            "  • Server-side rendering only",
+        ]
 
+    # Security headers check
+    sec_hdrs = {
+        "Strict-Transport-Security": "HSTS",
+        "Content-Security-Policy": "CSP",
+        "X-Frame-Options": "XFO",
+        "X-Content-Type-Options": "XCTO",
+        "Permissions-Policy": "Perms",
+        "Referrer-Policy": "Referrer",
+    }
+    missing_sec = [short for full, short in sec_hdrs.items()
+                   if full.lower() not in {k.lower() for k in notable}
+                   and full not in notable]
+    if missing_sec:
+        lines.append(f"⚠️ *Missing Security Headers:* `{'  '.join(missing_sec)}`")
+        lines.append("")
+
+    # Notable headers
     if notable:
-        lines.append("*📋 Notable Headers:*")
-        for k, v in list(notable.items())[:8]:
-            lines.append(f"  `{k}: {v[:60]}`")
+        lines.append("*📋 Key Headers:*")
+        for k, v in list(notable.items())[:10]:
+            lines.append(f"  `{k}`: `{v[:55]}`")
 
-    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000:
+            await msg.edit_text(report, parse_mode='Markdown')
+        else:
+            await msg.edit_text(report[:4000] + "\n_...truncated_", parse_mode='Markdown')
+            await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
+    except Exception:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -4107,7 +4332,10 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain   = urlparse(url).hostname
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     wordlist = _FUZZ_PATHS if mode == 'paths' else _FUZZ_PARAMS
 
     msg = await update.effective_message.reply_text(
@@ -5039,7 +5267,10 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     msg = await update.effective_message.reply_text(
         f"🗂️ *Smart Fuzzer — `{domain}`*\n\n"
         "① Harvesting words from target...\n"
@@ -12791,7 +13022,10 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain   = urlparse(url).hostname
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     wordlist = _FUZZ_PATHS if mode == 'paths' else _FUZZ_PARAMS
 
     msg = await update.effective_message.reply_text(
@@ -13723,7 +13957,10 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     msg = await update.effective_message.reply_text(
         f"🗂️ *Smart Fuzzer — `{domain}`*\n\n"
         "① Harvesting words from target...\n"
@@ -15978,6 +16215,8 @@ def _keydump_keyboard(uid: int) -> InlineKeyboardMarkup:
 # Global keydump result cache (per uid)
 _kd_cache: dict = {}   # {uid: result_dict}
 
+
+@user_guard
 async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/keydump <url> — Comprehensive key/token extractor (HTML + JS + Dynamic)"""
     if not context.args:
@@ -16164,6 +16403,7 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /kdexport shortcut ────────────────────────────────────────
+@user_guard
 async def cmd_kdexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/kdexport — Export last keydump result as JSON"""
     uid    = update.effective_user.id
