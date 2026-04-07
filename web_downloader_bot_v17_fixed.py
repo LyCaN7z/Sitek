@@ -4612,7 +4612,6 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
     if result.get("errors") and result.get("extracted", 0) == 0:
         error_msg = '\n'.join(result['errors'][:3])
 await msg.edit_text(f"❌ `{error_msg}`", parse_mode='Markdown')
-        return
 
     stats = result["stats"]
     extracted = result.get("extracted", 0)
