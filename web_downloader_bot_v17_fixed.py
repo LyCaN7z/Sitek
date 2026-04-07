@@ -149,45 +149,6 @@ _BLOCKED_NETS = [
     ip_network("fe80::/10"),
 ]
 
-# ══════════════════════════════════════════════════
-# 🛡️  MARKDOWN SAFETY HELPERS
-# ══════════════════════════════════════════════════
-
-def escape_md(text: str) -> str:
-    """
-    Telegram Markdown V1 special characters တွေကို escape လုပ်တယ်။
-    Dynamic content (URLs, scan results, user input) ကို
-    parse_mode='Markdown' နဲ့ send မလုပ်ခင် ဒါကို သုံးပါ။
-    """
-    # Markdown V1 special chars: _ * ` [
-    for ch in ('\\', '_', '*', '`', '['):
-        text = text.replace(ch, '\\' + ch)
-    return text
-
-
-async def safe_md_send(send_coro_factory, text: str, **kwargs):
-    """
-    Markdown parse_mode နဲ့ send လုပ်ကြည့်တယ်။
-    BadRequest (entity parse error) ဖြစ်ရင် parse_mode မပါဘဲ
-    plain text နဲ့ retry လုပ်တယ်။
-
-    Usage:
-        await safe_md_send(
-            lambda t, **kw: message.reply_text(t, **kw),
-            report[:4000],
-            parse_mode='Markdown'
-        )
-    """
-    try:
-        return await send_coro_factory(text, **kwargs)
-    except BadRequest as e:
-        if "can't parse entities" in str(e).lower() or "can't find end of the entity" in str(e).lower():
-            # Markdown parsing ကို ဖြုတ်ပြီး retry
-            kwargs.pop('parse_mode', None)
-            return await send_coro_factory(text, **kwargs)
-        raise
-
-
 def _is_safe_ip(ip_str: str) -> bool:
     try:
         ip_obj = ip_address(ip_str)
@@ -2307,12 +2268,12 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = _format_vuln_report(results)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode=None)
+            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode='Markdown')
             await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -2496,14 +2457,14 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode=None)
+            await msg.edit_text(report_text, parse_mode='Markdown')
         else:
-            await msg.edit_text(report_text[:4000], parse_mode=None)
+            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
             await update.effective_message.reply_text(
-                report_text[4000:8000], parse_mode=None)
+                report_text[4000:8000], parse_mode='Markdown')
     except Exception:
         await update.effective_message.reply_text(
-            report_text[:4000], parse_mode=None)
+            report_text[:4000], parse_mode='Markdown')
 
     # ── Export full JSON report + send as file ────
     if endpoints or all_mined:
@@ -3374,9 +3335,9 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await msg.edit_text(tg_text[:4000], parse_mode=None)
+            await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
         else:
-            await msg.edit_text(tg_text, parse_mode=None)
+            await msg.edit_text(tg_text, parse_mode='Markdown')
     except Exception:
         pass
 
@@ -4250,7 +4211,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_text = "\n".join(lines)
     try:
-        await msg.edit_text(tg_text[:4000], parse_mode=None)
+        await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
     except Exception:
         pass
 
@@ -5170,11 +5131,11 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000], parse_mode=None)
+            await msg.edit_text(report[:4000], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
     # ── Export wordlist + results as ZIP ─────────
     import io, zipfile as _zf
@@ -5524,11 +5485,11 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000], parse_mode=None)
+            await msg.edit_text(report[:4000], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
     # Export full JSON report
     import io
@@ -5680,11 +5641,22 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                                 break
 
                     findings.append({
-                        "type":     cap_type,
-                        "site_key": key,
-                        "page_url": page_url,
-                        "action":   action,
-                        "source":   source_label,
+                        "type":       cap_type,
+                        "site_key":   key,
+                        "page_url":   page_url,
+                        "action":     action,
+                        "source":     source_label,
+                        "theme":      "",
+                        "size":       "",
+                        "invisible":  False,
+                        "badge":      "",
+                        "min_score":  "",
+                        "enterprise": False,
+                        "s_param":    "",
+                        "hl":         "",
+                        "co":         "",
+                        "callback":   "",
+                        "user_agent": "",
                     })
 
     # Scan main HTML
@@ -5786,13 +5758,30 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
             return "FunCaptcha"
         return "reCAPTCHA"
 
-    def _add(cap_type, key, source):
+    def _add(cap_type, key, source, extra=None):
         key = key.strip()
         dedup = cap_type + ":" + key
         if dedup not in seen_keys and len(key) >= 10:
             seen_keys.add(dedup)
-            findings.append({"type": cap_type, "site_key": key,
-                              "page_url": page_url_ref[0], "action": "", "source": source})
+            ex = extra or {}
+            findings.append({
+                "type":       cap_type,
+                "site_key":   key,
+                "page_url":   page_url_ref[0],
+                "action":     ex.get("action", ""),
+                "source":     source,
+                "theme":      ex.get("theme", ""),
+                "size":       ex.get("size", ""),
+                "invisible":  ex.get("invisible", False),
+                "badge":      ex.get("badge", ""),
+                "min_score":  ex.get("min_score", ""),
+                "enterprise": ex.get("enterprise", False),
+                "s_param":    ex.get("s_param", ""),
+                "hl":         ex.get("hl", ""),
+                "co":         ex.get("co", ""),
+                "callback":   ex.get("callback", ""),
+                "user_agent": "",   # filled later
+            })
 
     def _scan_url(req_url):
         for pat, cap_type in _NET_PATTERNS:
@@ -5960,18 +5949,43 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 const results = [];
                 const seen = new Set();
 
-                function add(key, source, type) {
+                function add(key, source, type, extra) {
                     if (!key || key.length < 10) return;
                     const dedup = type + ':' + key;
                     if (seen.has(dedup)) return;
                     seen.add(dedup);
-                    results.push({key, source, type: type || 'unknown'});
+                    results.push({key, source, type: type || 'unknown', extra: extra || {}});
                 }
 
-                // 1. data-sitekey on ALL elements including Shadow DOM
+                // ── 1. data-sitekey + ALL captcha widget attributes ──
+                function getWidgetAttrs(el) {
+                    return {
+                        theme:    el.getAttribute('data-theme') || '',
+                        size:     el.getAttribute('data-size') || '',
+                        callback: el.getAttribute('data-callback') || '',
+                        expired:  el.getAttribute('data-expired-callback') || '',
+                        tabindex: el.getAttribute('data-tabindex') || '',
+                        invisible: el.getAttribute('data-size') === 'invisible' ||
+                                   el.getAttribute('data-badge') != null,
+                        badge:    el.getAttribute('data-badge') || '',
+                        action:   el.getAttribute('data-action') || '',
+                    };
+                }
                 function scanDOM(root) {
                     root.querySelectorAll('[data-sitekey]').forEach(el => {
-                        add(el.getAttribute('data-sitekey'), 'DOM attr: ' + el.tagName, '');
+                        add(el.getAttribute('data-sitekey'),
+                            'DOM attr: ' + el.tagName,
+                            '',
+                            getWidgetAttrs(el));
+                    });
+                    // cf-turnstile specific
+                    root.querySelectorAll('.cf-turnstile').forEach(el => {
+                        const k = el.getAttribute('data-sitekey');
+                        if (k) add(k, 'cf-turnstile div', 'Cloudflare Turnstile', {
+                            theme:  el.getAttribute('data-theme') || '',
+                            action: el.getAttribute('data-action') || '',
+                            cData:  el.getAttribute('data-cdata') || '',
+                        });
                     });
                     // Shadow DOM
                     root.querySelectorAll('*').forEach(el => {
@@ -5980,88 +5994,136 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 }
                 scanDOM(document);
 
-                // 2. iframe srcs (captcha inside iframes)
+                // ── 2. iframe srcs ──
                 document.querySelectorAll('iframe').forEach(f => {
                     const src = f.src || '';
-                    const m = src.match(/[?&]k=([A-Za-z0-9_\\-]{20,60})/);
-                    if (m) add(m[1], 'iframe src: ' + src.substring(0, 80), 'reCAPTCHA');
-                    const m2 = src.match(/sitekey=([A-Za-z0-9_\\-]{20,60})/);
-                    if (m2) add(m2[1], 'iframe src: ' + src.substring(0, 80), '');
+                    // reCAPTCHA anchor
+                    let m = src.match(/[?&]k=([A-Za-z0-9_-]{20,60})/);
+                    if (m) {
+                        const co = src.match(/[?&]co=([A-Za-z0-9%]+)/);
+                        const hl = src.match(/[?&]hl=([a-z\-]+)/);
+                        const v  = src.match(/[?&]v=([A-Za-z0-9_\-]+)/);
+                        add(m[1], 'iframe src', 'reCAPTCHA v2', {
+                            co: co ? decodeURIComponent(co[1]) : '',
+                            hl: hl ? hl[1] : '',
+                            v:  v  ? v[1]  : '',
+                            invisible: src.includes('size=invisible'),
+                        });
+                    }
+                    // hCaptcha
+                    m = src.match(/sitekey=([0-9a-f\-]{36})/i);
+                    if (m) add(m[1], 'iframe src', 'hCaptcha', {});
                 });
 
-                // 3. window.grecaptcha config
+                // ── 3. window.___grecaptcha_cfg — full client details ──
                 try {
-                    if (window.___grecaptcha_cfg) {
-                        const cfg = window.___grecaptcha_cfg;
-                        if (cfg.clients) {
-                            Object.values(cfg.clients).forEach(c => {
-                                function findKeys(obj, depth) {
-                                    if (depth > 5 || !obj) return;
-                                    if (typeof obj === 'string' && obj.length >= 20 && /^[A-Za-z0-9_\\-]+$/.test(obj)) {
-                                        add(obj, 'grecaptcha_cfg client', 'reCAPTCHA');
-                                    }
-                                    if (typeof obj === 'object') {
-                                        Object.values(obj).forEach(v => findKeys(v, depth+1));
-                                    }
+                    if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+                        Object.entries(window.___grecaptcha_cfg.clients).forEach(([id, c]) => {
+                            function findSitekeys(obj, depth, path) {
+                                if (depth > 6 || !obj) return;
+                                if (typeof obj === 'object') {
+                                    // Look for sitekey/key fields directly
+                                    const skFields = ['sitekey','site_key','k','key'];
+                                    skFields.forEach(f => {
+                                        if (obj[f] && typeof obj[f] === 'string' && obj[f].length >= 20) {
+                                            const extra = {
+                                                action:    obj.action || obj.params?.action || '',
+                                                theme:     obj.theme || obj.params?.theme || '',
+                                                size:      obj.size || obj.params?.size || '',
+                                                invisible: !!(obj.size === 'invisible' || obj.badge),
+                                                badge:     obj.badge || '',
+                                                s_param:   obj.s || '',
+                                                enterprise: !!window.___grecaptcha_cfg.fns,
+                                                min_score:  obj.minScore || '',
+                                            };
+                                            add(obj[f], 'grecaptcha_cfg.clients[' + id + '].' + f, 'reCAPTCHA', extra);
+                                        }
+                                    });
+                                    Object.values(obj).forEach(v => findSitekeys(v, depth+1, path));
                                 }
-                                findKeys(c, 0);
-                            });
-                        }
-                    }
-                } catch(e) {}
-
-                // 4. window.hcaptcha config
-                try {
-                    if (window.hcaptcha && window.hcaptcha._config) {
-                        const k = window.hcaptcha._config.sitekey;
-                        if (k) add(k, 'window.hcaptcha._config', 'hCaptcha');
-                    }
-                } catch(e) {}
-
-                // 5. Cloudflare Turnstile
-                try {
-                    if (window.turnstile) {
-                        document.querySelectorAll('.cf-turnstile, [data-sitekey]').forEach(el => {
-                            const k = el.getAttribute('data-sitekey');
-                            if (k) add(k, 'cf-turnstile element', 'Cloudflare Turnstile');
+                            }
+                            findSitekeys(c, 0, '');
                         });
                     }
                 } catch(e) {}
 
-                // 6. Scan ALL inline scripts for sitekey patterns
-                document.querySelectorAll('script:not([src])').forEach((s, i) => {
-                    const t = s.textContent || '';
-                    const patterns = [
-                        /['"](6[A-Za-z0-9_\\-]{39})['"]/g,
-                        /sitekey['"\\s]*[:=]['"\\s]*([A-Za-z0-9_\\-]{20,60})/gi,
-                        /['"](0x[A-Fa-f0-9_\\-]{20,60})['"]/g,
-                        /['"](1x[A-Fa-f0-9_\\-]{20,60})['"]/g,
-                        /['"](\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b)['"]/gi,
-                    ];
-                    patterns.forEach(p => {
-                        let m;
-                        while ((m = p.exec(t)) !== null) {
-                            if (m[1] && m[1].length >= 10) {
-                                add(m[1], 'inline script #' + i, '');
+                // ── 4. hCaptcha widget config ──
+                try {
+                    if (window.hcaptcha) {
+                        // hcaptcha.getRespKey / internal state
+                        const hcIframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+                        hcIframes.forEach(f => {
+                            const src = f.src;
+                            const sk = src.match(/sitekey=([0-9a-f\-]{36})/i);
+                            const hl = src.match(/[?&]hl=([a-z\-]+)/i);
+                            const theme = src.match(/[?&]theme=([a-z]+)/i);
+                            if (sk) add(sk[1], 'hcaptcha iframe', 'hCaptcha', {
+                                hl:    hl ? hl[1] : '',
+                                theme: theme ? theme[1] : '',
+                            });
+                        });
+                    }
+                } catch(e) {}
+
+                // ── 5. reCAPTCHA v3 grecaptcha.execute calls ──
+                try {
+                    // Intercept grecaptcha.execute to grab key + action
+                    if (window.grecaptcha) {
+                        const origExec = window.grecaptcha.execute;
+                        if (typeof origExec === 'function') {
+                            // Try to extract from source text
+                            const scriptTexts = Array.from(document.querySelectorAll('script:not([src])'))
+                                .map(s => s.textContent).join('\n');
+                            const execMatches = scriptTexts.matchAll(
+                                /grecaptcha\.execute\s*\(\s*['"]([A-Za-z0-9_\-]{20,60})['"]\s*,\s*\{[^}]*action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/g
+                            );
+                            for (const m of execMatches) {
+                                add(m[1], 'grecaptcha.execute() call', 'reCAPTCHA v3', {action: m[2]});
                             }
                         }
+                    }
+                } catch(e) {}
+
+                // ── 6. Inline script full scan with extra fields ──
+                document.querySelectorAll('script:not([src])').forEach((s, i) => {
+                    const t = s.textContent || '';
+                    // v3 keys (start with 6)
+                    [...t.matchAll(/['"](6[A-Za-z0-9_\-]{39})['"]/g)].forEach(m => {
+                        // Look for nearby action
+                        const ctx = t.substring(Math.max(0, m.index-200), m.index+200);
+                        const act = ctx.match(/action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/);
+                        add(m[1], 'inline script #'+i, 'reCAPTCHA v3', {action: act ? act[1] : ''});
+                    });
+                    // hCaptcha UUIDs
+                    [...t.matchAll(/['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/gi)].forEach(m => {
+                        add(m[1], 'inline script #'+i+' (UUID)', 'hCaptcha', {});
+                    });
+                    // Turnstile 0x/1x keys
+                    [...t.matchAll(/['"]([01]x[A-Fa-f0-9_\-]{20,60})['"]/g)].forEach(m => {
+                        add(m[1], 'inline script #'+i, 'Cloudflare Turnstile', {});
+                    });
+                    // Generic sitekey= assignments
+                    [...t.matchAll(/sitekey\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,60})['"]/gi)].forEach(m => {
+                        add(m[1], 'inline script #'+i+' sitekey=', '', {});
                     });
                 });
 
-                // 7. Scan window globals for sitekey-like strings
-                const keywordsToSearch = ['sitekey', 'site_key', 'recaptcha', 'captcha', 'hcaptcha', 'turnstile'];
+                // ── 7. window globals ──
+                const kwds = ['sitekey','site_key','recaptcha','captcha','hcaptcha','turnstile','captchaKey'];
                 try {
                     Object.keys(window).forEach(k => {
-                        if (keywordsToSearch.some(kw => k.toLowerCase().includes(kw))) {
+                        if (kwds.some(kw => k.toLowerCase().includes(kw))) {
                             try {
                                 const v = window[k];
                                 if (typeof v === 'string' && v.length >= 10 && v.length <= 80) {
-                                    add(v, 'window.' + k, '');
+                                    add(v, 'window.' + k, '', {});
                                 } else if (typeof v === 'object' && v !== null) {
-                                    JSON.stringify(v).match(/['"]((?:6[A-Za-z0-9_\\-]{39}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|0x[A-Fa-f0-9_\\-]{20,60}))['"]/g)?.forEach(m => {
-                                        const key = m.replace(/['"]/g, '');
-                                        add(key, 'window.' + k + ' (object)', '');
-                                    });
+                                    const js = JSON.stringify(v);
+                                    [
+                                        ...js.matchAll(/"(?:sitekey|site_key|key)":"([A-Za-z0-9_\-]{20,60})"/g),
+                                        ...js.matchAll(/"(6[A-Za-z0-9_\-]{39})"/g),
+                                        ...js.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi),
+                                    ].forEach(m => add(m[1], 'window.'+k+' obj', '', {}));
                                 }
                             } catch(e) {}
                         }
@@ -6078,7 +6140,28 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 hint = item.get("type") or _classify_key(key)
                 if not hint or hint == "unknown":
                     hint = _classify_key(key)
-                _add(hint, key, item.get("source", "DOM"))
+                extra = item.get("extra") or {}
+                dedup = hint + ":" + key
+                if dedup not in seen_keys:
+                    seen_keys.add(dedup)
+                    findings.append({
+                        "type":     hint,
+                        "site_key": key,
+                        "page_url": page_url_ref[0],
+                        "action":   extra.get("action", ""),
+                        "source":   item.get("source", "DOM"),
+                        # ── Extra fields for captcha solvers ──
+                        "theme":      extra.get("theme", ""),
+                        "size":       extra.get("size", ""),
+                        "invisible":  extra.get("invisible", False),
+                        "badge":      extra.get("badge", ""),
+                        "min_score":  extra.get("min_score", ""),
+                        "enterprise": extra.get("enterprise", False),
+                        "s_param":    extra.get("s_param", ""),
+                        "hl":         extra.get("hl", ""),
+                        "co":         extra.get("co", ""),
+                        "callback":   extra.get("callback", ""),
+                    })
 
         except Exception as e:
             logger.debug("DOM eval error: %s", e)
@@ -6114,6 +6197,12 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
     # ── Console log scan ─────────────────────────────
     if console_log:
         _scan_text("\n".join(console_log), "Console log")
+
+    # ── Fill user_agent into all findings ────────────
+    ua = _get_headers().get("User-Agent", "")
+    for f in findings:
+        if not f.get("user_agent"):
+            f["user_agent"] = ua
 
     return {
         "findings":    findings,
@@ -6322,11 +6411,50 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, f in enumerate(findings, 1):
         icon = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
         lines.append(f"*{icon} [{i}] {f['type']}*")
-        lines.append(f"  🔑 `site_key` : `{f['site_key'] or 'N/A'}`")
+        lines.append(f"  🔑 `site_key`  : `{f['site_key'] or 'N/A'}`")
         lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
-        if f["action"]:
-            lines.append(f"  ⚡ `action`    : `{f['action']}`")
-        lines.append(f"  📂 Source     : _{f['source'][:70]}_")
+        if f.get("action"):
+            lines.append(f"  ⚡ `action`     : `{f['action']}`")
+        if f.get("invisible"):
+            lines.append(f"  👁️ `invisible`  : `true`")
+        if f.get("min_score"):
+            lines.append(f"  📊 `min_score` : `{f['min_score']}`")
+        if f.get("enterprise"):
+            lines.append(f"  🏢 `enterprise` : `true`")
+        if f.get("theme"):
+            lines.append(f"  🎨 `theme`      : `{f['theme']}`")
+        if f.get("size") and f["size"] != "normal":
+            lines.append(f"  📐 `size`       : `{f['size']}`")
+        if f.get("badge"):
+            lines.append(f"  🏷️ `badge`      : `{f['badge']}`")
+        if f.get("s_param"):
+            lines.append(f"  🔐 `s param`    : `{f['s_param'][:40]}`")
+        if f.get("hl"):
+            lines.append(f"  🌍 `hl`         : `{f['hl']}`")
+        if f.get("co"):
+            lines.append(f"  🏠 `co`         : `{f['co']}`")
+        if f.get("callback"):
+            lines.append(f"  📞 `callback`   : `{f['callback']}`")
+        if f.get("user_agent"):
+            lines.append(f"  🖥️ `user_agent` : `{f['user_agent'][:60]}`")
+        lines.append(f"  📂 Source      : _{f['source'][:70]}_")
+        lines.append("")
+
+        # ── Solver-ready block ─────────────────────────────
+        lines.append("  *📋 Solver params (copy-ready):*")
+        lines.append(f"  `type`      = `{f['type']}`")
+        lines.append(f"  `sitekey`   = `{f['site_key']}`")
+        lines.append(f"  `pageurl`   = `{f['page_url']}`")
+        if f.get("action"):
+            lines.append(f"  `action`    = `{f['action']}`")
+        if f.get("enterprise"):
+            lines.append(f"  `enterprise`= `1`")
+        if f.get("min_score"):
+            lines.append(f"  `min_score` = `{f['min_score']}`")
+        if f.get("invisible"):
+            lines.append(f"  `invisible` = `1`")
+        if f.get("s_param"):
+            lines.append(f"  `data-s`    = `{f['s_param'][:40]}`")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
@@ -6336,29 +6464,54 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000], parse_mode=None)
+            await msg.edit_text(report[:4000], parse_mode='Markdown')
             await update.effective_message.reply_text(report[4000:8000], parse_mode='Markdown')
     except BadRequest:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
     # ─── Export JSON ─────────────────────────────
     import io as _io
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d    = re.sub(r'[^\w\-]', '_', domain)
-    export    = {
-        "domain":      domain,
-        "page_url":    page_url,
-        "scanned_at":  datetime.now().isoformat(),
-        "js_scanned":  js_count,
+    export = {
+        "domain":     domain,
+        "page_url":   page_url,
+        "scanned_at": datetime.now().isoformat(),
+        "js_scanned": js_count,
         "findings": [
             {
-                "type":     f["type"],
-                "site_key": f["site_key"],
-                "page_url": f["page_url"],
-                "action":   f["action"],
-                "source":   f["source"],
+                "type":       f["type"],
+                "site_key":   f["site_key"],
+                "page_url":   f["page_url"],
+                "action":     f.get("action", ""),
+                "source":     f.get("source", ""),
+                "theme":      f.get("theme", ""),
+                "size":       f.get("size", ""),
+                "invisible":  f.get("invisible", False),
+                "badge":      f.get("badge", ""),
+                "min_score":  f.get("min_score", ""),
+                "enterprise": f.get("enterprise", False),
+                "s_param":    f.get("s_param", ""),
+                "hl":         f.get("hl", ""),
+                "co":         f.get("co", ""),
+                "callback":   f.get("callback", ""),
+                "user_agent": f.get("user_agent", ""),
+                # ── Solver-ready format ──
+                "solver_params": {
+                    k: v for k, v in {
+                        "type":       f["type"],
+                        "sitekey":    f["site_key"],
+                        "pageurl":    f["page_url"],
+                        "action":     f.get("action"),
+                        "enterprise": 1 if f.get("enterprise") else None,
+                        "min_score":  f.get("min_score") or None,
+                        "invisible":  1 if f.get("invisible") else None,
+                        "data-s":     f.get("s_param") or None,
+                        "useragent":  f.get("user_agent") or None,
+                    }.items() if v is not None and v != ""
+                },
             }
             for f in findings
         ],
@@ -6658,12 +6811,12 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode=None)
+            await msg.edit_text(report_text, parse_mode='Markdown')
         else:
-            await msg.edit_text(report_text[:4000], parse_mode=None)
-            await update.message.reply_text(report_text[4000:8000], parse_mode=None)
+            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
+            await update.message.reply_text(report_text[4000:8000], parse_mode='Markdown')
     except Exception:
-        await update.message.reply_text(report_text[:4000], parse_mode=None)
+        await update.message.reply_text(report_text[:4000], parse_mode='Markdown')
 
     # ── Export full JSON report ───────────────────
     try:
@@ -6726,22 +6879,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 *Website Downloader Bot v17.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📥 *Download Commands:*\n"
-        f"  `/download <url>` — Single page HTML + assets\n"
-        f"  `/fullsite <url>` — Full website crawl\n"
+        f"  `/download <url>` — Single page\n"
+        f"  `/fullsite <url>` — Full website\n"
         f"  `/jsdownload <url>` — JS/React site _{js_status}_\n"
-        f"  `/jsfullsite <url>` — JS + Full crawl\n"
         f"  `/resume <url>` — Download ဆက်လုပ်ရန်\n"
         f"  `/stop` — Download ရပ်ရန်\n\n"
-        f"🔑 *Site Key:*\n"
-        f"  `/sitekey <url>` — reCAPTCHA / hCaptcha / Turnstile key extractor\n\n"
+        f"🔍 *Tools:*\n"
+        f"  `/vuln <url>` — Security scan\n"
+        f"  `/api <url>` — API discovery\n"
+        f"  `/tech <url>` — Tech stack fingerprint\n"
+        f"  `/extract <url>` — Secret/key scanner\n"
+        f"  `/subdomains <domain>` — Subdomain enumeration\n"
+        f"  `/bypass403 <url>` — 403 bypass tester\n"
+        f"  `/fuzz <url>` — Path & param fuzzer\n"
+        f"  `/monitor` — Change alert monitor\n"
+        f"  `/smartfuzz <url>` — 🗂️ Context-aware smart fuzzer\n"
+        f"  `/antibot <url>` — 🤖 Anti-bot / Captcha bypass\n"
+        f"  `/jwtattack <token>` — 🎟️ JWT decode & crack\n"
+        f"  `/sitekey <url>` — 🔑 reCAPTCHA/hCaptcha/Turnstile key extractor\n\n"
         f"📱 *App Analyzer:*\n"
-        f"  APK / IPA / ZIP / JAR file upload ပါ\n"
+        f"  APK / IPA / ZIP / JAR upload လုပ်ပါ\n"
         f"  → Auto API + Secret extraction\n\n"
         f"📊 *Account:*\n"
         f"  `/status` — Usage ကြည့်ရန်\n"
         f"  `/history` — Download history\n"
         f"  `/mystats` — Detailed stats\n\n"
-        f"🔒 SSRF Protected{adm_line}\n"
+        f"🔒 SSRF Protected{adm_line}\n\n"
         f"❓ /help — Commands အကူအညီ",
         parse_mode='Markdown'
     )
@@ -6755,37 +6918,43 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Commands Guide — v17.0*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "📥 *Download Commands*\n"
+        "📥 *Website Download*\n"
         "  `/download <url>`\n"
-        "   └ Single page HTML + assets download\n\n"
+        "   └ Single page HTML + assets\n\n"
         "  `/fullsite <url>`\n"
-        "   └ Website အပြည့် (sitemap + crawl)\n\n"
+        "   └ Website အပြည့် (sitemap scan ပါ)\n\n"
         "  `/jsdownload <url>`\n"
-        "   └ React / Vue / Angular JS sites\n"
+        "   └ React/Vue/Angular JS sites\n"
         "   └ Status: " + js_st + "\n\n"
         "  `/jsfullsite <url>`\n"
         "   └ JS + Full crawl ပေါင်းစပ်\n\n"
         "  `/resume <url>`\n"
         "   └ ကျသွားလျှင် ဆက်လုပ်ရန်\n\n"
-        "  `/stop` — လက်ရှိ download ရပ်ရန်\n\n"
-
-        "🔑 *Site Key Extractor*\n"
-        "  `/sitekey <url>`\n"
-        "   └ reCAPTCHA / hCaptcha / Turnstile key ဆွဲထုတ်\n"
-        "   └ Site key + widget config တွေ report ထုတ်\n\n"
 
         "📱 *App Analyzer (Upload File):*\n"
-        "  APK / IPA / ZIP / JAR / AAB\n"
+        "  APK / IPA / ZIP / JAR / AAB / JAR\n"
         "   └ Chat ထဲ file drop ရုံသာ\n"
         "   └ API endpoints + Secrets + Hosts\n"
         "   └ AndroidManifest / Info.plist parse\n"
         "   └ JSON report auto-export\n"
         f"   └ Max size: `{APP_MAX_MB}MB`\n\n"
+        "🔍 *Scan & Discovery*\n"
+        "  `/vuln <url>` — Security vulnerability scan\n"
+        "  `/api <url>` — API endpoint discovery\n"
+        "  `/tech <url>` — Tech stack fingerprinter\n"
+        "  `/extract <url>` — Secret/API key scanner (JS bundles)\n\n"
+        "🔓 *Advanced Recon*\n"
+        "  `/subdomains <domain>` — Subdomain enum (crt.sh + brute-force)\n"
+        "  `/bypass403 <url>` — 403 bypass (50+ techniques)\n"
+        "  `/fuzz <url> [paths|params]` — HTTP path & param fuzzer\n\n"
+        "🔔 *Monitoring*\n"
+        "  `/monitor add <url> [min] [label]` — Alert on page change\n"
+        "  `/monitor list|del|clear` — Manage monitors\n\n"
 
         "📊 *My Account*\n"
         "  `/status` — Daily limit + usage\n"
         "  `/history` — Download log (last 10)\n"
-        "  `/mystats` — Detailed stats\n\n"
+        "  `/mystats` — Total stats\n\n"
 
         "💡 *Tips:*\n"
         "  • 50MB+ ဆိုရင် auto split လုပ်ပြီး ပို့ပေးမယ်\n"
@@ -6796,15 +6965,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_section = (
         "\n\n👑 *Admin Commands:*\n"
-        "  `/admin` — Admin panel (full control)\n"
-        "  `/ban <id>` `/unban <id>` — User ban management\n"
-        "  `/setlimit global <n>` — Daily download limit\n"
-        "  `/userinfo <id>` — User details\n"
-        "  `/broadcast <msg>` — All users ကို message ပို့\n"
-        "  `/allusers` — User list\n"
-        "  `/setpages <n>` `/setassets <n>` — Crawler limits\n"
-        "  `/proxy` — Proxy management\n\n"
-    )
+        "  `/admin` — Admin panel\n"
+        "  `/ban` `/unban` `/setlimit` `/userinfo`\n"
+        "  `/broadcast` `/allusers` `/setpages` `/setassets`\n\n"
+            )
 
     await update.effective_message.reply_text(
         base + (admin_section if is_adm else ""),
@@ -7099,51 +7263,28 @@ async def _send_admin_panel(target, db: dict):
     tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
     banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
     today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
-    lim       = db["settings"].get("global_daily_limit", 0)
-    max_pg    = db["settings"].get("max_pages", MAX_PAGES)
-    max_as    = db["settings"].get("max_assets", MAX_ASSETS)
-
-    bot_btn_label = "🔴 Turn OFF" if bot_on else "🟢 Turn ON"
-    bot_status    = "🟢 ONLINE" if bot_on else "🔴 OFFLINE"
-    proxy_st      = proxy_manager.stats()
-    proxy_live    = proxy_st.get("live", 0)
-    proxy_total   = proxy_st.get("total", 0)
-
     kb = [
         [
-            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
-            InlineKeyboardButton("📊 Statistics", callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
+            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
-            InlineKeyboardButton("📜 DL Log",      callback_data="adm_log"),
-        ],
-        [
-            InlineKeyboardButton("🚫 Banned List", callback_data="adm_banned"),
-            InlineKeyboardButton("🌐 Proxy Status", callback_data="adm_proxy"),
-        ],
-        [
+            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
             InlineKeyboardButton(
-                bot_btn_label,
+                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
                 callback_data="adm_toggle_bot"
             ),
-            InlineKeyboardButton("🔄 Refresh",    callback_data="adm_back"),
         ],
+        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
     text = (
-        f"👑 *Admin Panel v17.0*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🤖 Bot Status : {bot_status}\n"
-        f"👥 Total Users : `{tu}` | 🚫 Banned: `{banned_n}`\n"
-        f"📦 Total DL    : `{tdl}` | Today: `{today_dl}`\n\n"
-        f"⚙️ *Config*\n"
-        f"  Daily Limit : `{'∞' if lim == 0 else lim}`\n"
-        f"  Max Pages   : `{max_pg}` | Assets: `{max_as}`\n"
-        f"  Concurrent  : `{MAX_WORKERS}` | Rate: `{RATE_LIMIT_SEC}s`\n"
-        f"  Split Size  : `{SPLIT_MB}MB`\n\n"
-        f"🌐 *Proxy* : `{proxy_live}/{proxy_total}` live\n"
-        f"⚡ JS (Puppeteer): {'✅' if PUPPETEER_OK else '❌'}\n"
-        f"🔒 SSRF / Traversal / RateLimit : ✅"
+        f"👑 *Admin Panel v17.0*\n\n"
+        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total: `{tdl}` | Today: `{today_dl}`\n"
+        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
+        f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
+        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
+        f"JS: {'✅' if PUPPETEER_OK else '❌'}"
     )
     markup = InlineKeyboardMarkup(kb)
     try:
@@ -7151,16 +7292,7 @@ async def _send_admin_panel(target, db: dict):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest as _e:
-        # fallback without markdown
-        try:
-            plain = text.replace("*","").replace("`","")
-            if hasattr(target, 'edit_message_text'):
-                await target.edit_message_text(plain, reply_markup=markup)
-            else:
-                await target.reply_text(plain, reply_markup=markup)
-        except Exception:
-            pass
+    except BadRequest: pass
 
 @admin_only
 
@@ -9021,12 +9153,12 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = _format_vuln_report(results)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode=None)
+            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode='Markdown')
             await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -9210,14 +9342,14 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode=None)
+            await msg.edit_text(report_text, parse_mode='Markdown')
         else:
-            await msg.edit_text(report_text[:4000], parse_mode=None)
+            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
             await update.effective_message.reply_text(
-                report_text[4000:8000], parse_mode=None)
+                report_text[4000:8000], parse_mode='Markdown')
     except Exception:
         await update.effective_message.reply_text(
-            report_text[:4000], parse_mode=None)
+            report_text[:4000], parse_mode='Markdown')
 
     # ── Export full JSON report + send as file ────
     if endpoints or all_mined:
@@ -10088,9 +10220,9 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await msg.edit_text(tg_text[:4000], parse_mode=None)
+            await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
         else:
-            await msg.edit_text(tg_text, parse_mode=None)
+            await msg.edit_text(tg_text, parse_mode='Markdown')
     except Exception:
         pass
 
@@ -10964,7 +11096,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_text = "\n".join(lines)
     try:
-        await msg.edit_text(tg_text[:4000], parse_mode=None)
+        await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
     except Exception:
         pass
 
@@ -11884,11 +12016,11 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000], parse_mode=None)
+            await msg.edit_text(report[:4000], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
     # ── Export wordlist + results as ZIP ─────────
     import io, zipfile as _zf
@@ -12238,11 +12370,11 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode=None)
+            await msg.edit_text(report, parse_mode='Markdown')
         else:
-            await msg.edit_text(report[:4000], parse_mode=None)
+            await msg.edit_text(report[:4000], parse_mode='Markdown')
     except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode=None)
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
     # Export full JSON report
     import io
@@ -12554,12 +12686,12 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── Send text report ──────────────────────────
     try:
         if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode=None)
+            await msg.edit_text(report_text, parse_mode='Markdown')
         else:
-            await msg.edit_text(report_text[:4000], parse_mode=None)
-            await update.message.reply_text(report_text[4000:8000], parse_mode=None)
+            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
+            await update.message.reply_text(report_text[4000:8000], parse_mode='Markdown')
     except Exception:
-        await update.message.reply_text(report_text[:4000], parse_mode=None)
+        await update.message.reply_text(report_text[:4000], parse_mode='Markdown')
 
     # ── Export full JSON report ───────────────────
     try:
@@ -12622,22 +12754,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 *Website Downloader Bot v17.0*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📥 *Download Commands:*\n"
-        f"  `/download <url>` — Single page HTML + assets\n"
-        f"  `/fullsite <url>` — Full website crawl\n"
+        f"  `/download <url>` — Single page\n"
+        f"  `/fullsite <url>` — Full website\n"
         f"  `/jsdownload <url>` — JS/React site _{js_status}_\n"
-        f"  `/jsfullsite <url>` — JS + Full crawl\n"
         f"  `/resume <url>` — Download ဆက်လုပ်ရန်\n"
         f"  `/stop` — Download ရပ်ရန်\n\n"
-        f"🔑 *Site Key:*\n"
-        f"  `/sitekey <url>` — reCAPTCHA / hCaptcha / Turnstile key extractor\n\n"
+        f"🔍 *Tools:*\n"
+        f"  `/vuln <url>` — Security scan\n"
+        f"  `/api <url>` — API discovery\n"
+        f"  `/tech <url>` — Tech stack fingerprint\n"
+        f"  `/extract <url>` — Secret/key scanner\n"
+        f"  `/subdomains <domain>` — Subdomain enumeration\n"
+        f"  `/bypass403 <url>` — 403 bypass tester\n"
+        f"  `/fuzz <url>` — Path & param fuzzer\n"
+        f"  `/monitor` — Change alert monitor\n"
+        f"  `/smartfuzz <url>` — 🗂️ Context-aware smart fuzzer\n"
+        f"  `/antibot <url>` — 🤖 Anti-bot / Captcha bypass\n"
+        f"  `/jwtattack <token>` — 🎟️ JWT decode & crack\n"
+        f"  `/sitekey <url>` — 🔑 reCAPTCHA/hCaptcha/Turnstile key extractor\n\n"
         f"📱 *App Analyzer:*\n"
-        f"  APK / IPA / ZIP / JAR file upload ပါ\n"
+        f"  APK / IPA / ZIP / JAR upload လုပ်ပါ\n"
         f"  → Auto API + Secret extraction\n\n"
         f"📊 *Account:*\n"
         f"  `/status` — Usage ကြည့်ရန်\n"
         f"  `/history` — Download history\n"
         f"  `/mystats` — Detailed stats\n\n"
-        f"🔒 SSRF Protected{adm_line}\n"
+        f"🔒 SSRF Protected{adm_line}\n\n"
         f"❓ /help — Commands အကူအညီ",
         parse_mode='Markdown'
     )
@@ -12651,37 +12793,43 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Commands Guide — v17.0*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
 
-        "📥 *Download Commands*\n"
+        "📥 *Website Download*\n"
         "  `/download <url>`\n"
-        "   └ Single page HTML + assets download\n\n"
+        "   └ Single page HTML + assets\n\n"
         "  `/fullsite <url>`\n"
-        "   └ Website အပြည့် (sitemap + crawl)\n\n"
+        "   └ Website အပြည့် (sitemap scan ပါ)\n\n"
         "  `/jsdownload <url>`\n"
-        "   └ React / Vue / Angular JS sites\n"
+        "   └ React/Vue/Angular JS sites\n"
         "   └ Status: " + js_st + "\n\n"
         "  `/jsfullsite <url>`\n"
         "   └ JS + Full crawl ပေါင်းစပ်\n\n"
         "  `/resume <url>`\n"
         "   └ ကျသွားလျှင် ဆက်လုပ်ရန်\n\n"
-        "  `/stop` — လက်ရှိ download ရပ်ရန်\n\n"
-
-        "🔑 *Site Key Extractor*\n"
-        "  `/sitekey <url>`\n"
-        "   └ reCAPTCHA / hCaptcha / Turnstile key ဆွဲထုတ်\n"
-        "   └ Site key + widget config တွေ report ထုတ်\n\n"
 
         "📱 *App Analyzer (Upload File):*\n"
-        "  APK / IPA / ZIP / JAR / AAB\n"
+        "  APK / IPA / ZIP / JAR / AAB / JAR\n"
         "   └ Chat ထဲ file drop ရုံသာ\n"
         "   └ API endpoints + Secrets + Hosts\n"
         "   └ AndroidManifest / Info.plist parse\n"
         "   └ JSON report auto-export\n"
         f"   └ Max size: `{APP_MAX_MB}MB`\n\n"
+        "🔍 *Scan & Discovery*\n"
+        "  `/vuln <url>` — Security vulnerability scan\n"
+        "  `/api <url>` — API endpoint discovery\n"
+        "  `/tech <url>` — Tech stack fingerprinter\n"
+        "  `/extract <url>` — Secret/API key scanner (JS bundles)\n\n"
+        "🔓 *Advanced Recon*\n"
+        "  `/subdomains <domain>` — Subdomain enum (crt.sh + brute-force)\n"
+        "  `/bypass403 <url>` — 403 bypass (50+ techniques)\n"
+        "  `/fuzz <url> [paths|params]` — HTTP path & param fuzzer\n\n"
+        "🔔 *Monitoring*\n"
+        "  `/monitor add <url> [min] [label]` — Alert on page change\n"
+        "  `/monitor list|del|clear` — Manage monitors\n\n"
 
         "📊 *My Account*\n"
         "  `/status` — Daily limit + usage\n"
         "  `/history` — Download log (last 10)\n"
-        "  `/mystats` — Detailed stats\n\n"
+        "  `/mystats` — Total stats\n\n"
 
         "💡 *Tips:*\n"
         "  • 50MB+ ဆိုရင် auto split လုပ်ပြီး ပို့ပေးမယ်\n"
@@ -12692,15 +12840,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     admin_section = (
         "\n\n👑 *Admin Commands:*\n"
-        "  `/admin` — Admin panel (full control)\n"
-        "  `/ban <id>` `/unban <id>` — User ban management\n"
-        "  `/setlimit global <n>` — Daily download limit\n"
-        "  `/userinfo <id>` — User details\n"
-        "  `/broadcast <msg>` — All users ကို message ပို့\n"
-        "  `/allusers` — User list\n"
-        "  `/setpages <n>` `/setassets <n>` — Crawler limits\n"
-        "  `/proxy` — Proxy management\n\n"
-    )
+        "  `/admin` — Admin panel\n"
+        "  `/ban` `/unban` `/setlimit` `/userinfo`\n"
+        "  `/broadcast` `/allusers` `/setpages` `/setassets`\n\n"
+            )
 
     await update.effective_message.reply_text(
         base + (admin_section if is_adm else ""),
@@ -12995,51 +13138,28 @@ async def _send_admin_panel(target, db: dict):
     tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
     banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
     today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
-    lim       = db["settings"].get("global_daily_limit", 0)
-    max_pg    = db["settings"].get("max_pages", MAX_PAGES)
-    max_as    = db["settings"].get("max_assets", MAX_ASSETS)
-
-    bot_btn_label = "🔴 Turn OFF" if bot_on else "🟢 Turn ON"
-    bot_status    = "🟢 ONLINE" if bot_on else "🔴 OFFLINE"
-    proxy_st      = proxy_manager.stats()
-    proxy_live    = proxy_st.get("live", 0)
-    proxy_total   = proxy_st.get("total", 0)
-
     kb = [
         [
-            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
-            InlineKeyboardButton("📊 Statistics", callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
+            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
-            InlineKeyboardButton("📜 DL Log",      callback_data="adm_log"),
-        ],
-        [
-            InlineKeyboardButton("🚫 Banned List", callback_data="adm_banned"),
-            InlineKeyboardButton("🌐 Proxy Status", callback_data="adm_proxy"),
-        ],
-        [
+            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
             InlineKeyboardButton(
-                bot_btn_label,
+                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
                 callback_data="adm_toggle_bot"
             ),
-            InlineKeyboardButton("🔄 Refresh",    callback_data="adm_back"),
         ],
+        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
     text = (
-        f"👑 *Admin Panel v17.0*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🤖 Bot Status : {bot_status}\n"
-        f"👥 Total Users : `{tu}` | 🚫 Banned: `{banned_n}`\n"
-        f"📦 Total DL    : `{tdl}` | Today: `{today_dl}`\n\n"
-        f"⚙️ *Config*\n"
-        f"  Daily Limit : `{'∞' if lim == 0 else lim}`\n"
-        f"  Max Pages   : `{max_pg}` | Assets: `{max_as}`\n"
-        f"  Concurrent  : `{MAX_WORKERS}` | Rate: `{RATE_LIMIT_SEC}s`\n"
-        f"  Split Size  : `{SPLIT_MB}MB`\n\n"
-        f"🌐 *Proxy* : `{proxy_live}/{proxy_total}` live\n"
-        f"⚡ JS (Puppeteer): {'✅' if PUPPETEER_OK else '❌'}\n"
-        f"🔒 SSRF / Traversal / RateLimit : ✅"
+        f"👑 *Admin Panel v17.0*\n\n"
+        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total: `{tdl}` | Today: `{today_dl}`\n"
+        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
+        f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
+        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
+        f"JS: {'✅' if PUPPETEER_OK else '❌'}"
     )
     markup = InlineKeyboardMarkup(kb)
     try:
@@ -13047,16 +13167,7 @@ async def _send_admin_panel(target, db: dict):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest as _e:
-        # fallback without markdown
-        try:
-            plain = text.replace("*","").replace("`","")
-            if hasattr(target, 'edit_message_text'):
-                await target.edit_message_text(plain, reply_markup=markup)
-            else:
-                await target.reply_text(plain, reply_markup=markup)
-        except Exception:
-            pass
+    except BadRequest: pass
 
 @admin_only
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13517,8 +13628,7 @@ def analyze_app_file(filepath: str, progress_cb=None) -> dict:
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # NOTE: query.answer() ကို branch တစ်ခုချင်းမှာ တစ်ကြိမ်သာ call ရမယ်
-    # top-level မှာ call မလုပ်ရင် double-answer bug ကင်းမယ်
+    await query.answer()
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("🚫 Admin only", show_alert=True); return
     if update.effective_chat.type != "private":
@@ -13529,21 +13639,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "adm_users":
-        await query.answer()
         lines = ["👥 *Users*\n"]
         for uid, u in list(db["users"].items())[:20]:
             icon = "🚫" if u["banned"] else "✅"
             lines.append(f"{icon} `{uid}` — {u['name']} | {u['total_downloads']} DL")
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
-        try:
-            await query.edit_message_text(
-                "\n".join(lines) or "Empty",
-                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
-            )
+        try: await query.edit_message_text("\n".join(lines) or "Empty", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
         except BadRequest: pass
 
     elif data == "adm_stats":
-        await query.answer()
         today   = str(date.today())
         tdl     = sum(u.get("total_downloads",0) for u in db["users"].values())
         tdl_day = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
@@ -13551,102 +13655,53 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         top_txt = "\n".join(f"  {i+1}. {u['name']} ({u['total_downloads']})" for i,(_,u) in enumerate(top)) or "None"
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
-            f"📊 *Statistics*\n\nTotal Downloads: `{tdl}` | Today: `{tdl_day}`\n\n🏆 Top Users:\n{top_txt}",
+            f"📊 *Stats*\n\nTotal: `{tdl}` | Today: `{tdl_day}`\n\n🏆 Top:\n{top_txt}",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
     elif data == "adm_settings":
-        await query.answer()
         s  = db["settings"]
-        lim = s.get("global_daily_limit", 0)
-        kb = [
-            [InlineKeyboardButton("🔙 Back", callback_data="adm_back")]
-        ]
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
-            f"⚙️ *Settings*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Daily Limit  : `{'∞' if lim==0 else lim}` — `/setlimit global <n>`\n"
-            f"Max Pages    : `{s['max_pages']}` — `/setpages <n>`\n"
-            f"Max Assets   : `{s['max_assets']}` — `/setassets <n>`\n"
-            f"Bot Status   : `{'ON' if s['bot_enabled'] else 'OFF'}`\n"
-            f"Rate Limit   : `{RATE_LIMIT_SEC}s` per request\n"
-            f"Max Asset MB : `{MAX_ASSET_MB}MB`\n"
-            f"Split Size   : `{SPLIT_MB}MB`\n"
-            f"File Expiry  : `{FILE_EXPIRY_HOURS}h`",
+            f"⚙️ *Settings*\n\n"
+            f"Daily Limit: `{s['global_daily_limit']}` (`/setlimit global <n>`)\n"
+            f"Max Pages: `{s['max_pages']}` (`/setpages <n>`)\n"
+            f"Max Assets: `{s['max_assets']}` (`/setassets <n>`)\n"
+            f"Bot: `{'ON' if s['bot_enabled'] else 'OFF'}`\n"
+            f"Rate Limit: `{RATE_LIMIT_SEC}s` per request\n"
+            f"Max Asset Size: `{MAX_ASSET_MB}MB`\n"
+            f"Split: `{SPLIT_MB}MB`",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
     elif data == "adm_toggle_bot":
-        # Fix: save ပြီးမှ answer ခေါ်ရမယ်၊ double-answer မဖြစ်ရဲ
         async with db_lock:
             db2 = _load_db_sync()
             db2["settings"]["bot_enabled"] = not db2["settings"]["bot_enabled"]
             _save_db_sync(db2)
             new_state = db2["settings"]["bot_enabled"]
-        status_txt = "🟢 Bot is now ONLINE" if new_state else "🔴 Bot is now OFFLINE"
-        await query.answer(status_txt, show_alert=True)
+        await query.answer(f"Bot is now {'🟢 ON' if new_state else '🔴 OFF'}", show_alert=True)
         async with db_lock:
             db3 = _load_db_sync()
         await _send_admin_panel(query, db3)
 
-    elif data == "adm_banned":
-        await query.answer()
-        banned = [(uid, u) for uid, u in db["users"].items() if u.get("banned")]
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
-        if not banned:
-            await query.edit_message_text(
-                "🚫 *Banned Users*\n\nBanned user မရှိပါ။",
-                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
-            )
-        else:
-            lines = ["🚫 *Banned Users*\n"]
-            for uid, u in banned[:20]:
-                lines.append(f"  `{uid}` — {u['name']}")
-            lines.append(f"\nTotal: `{len(banned)}`")
-            await query.edit_message_text(
-                "\n".join(lines),
-                reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
-            )
-
-    elif data == "adm_proxy":
-        await query.answer()
-        st = proxy_manager.stats()
-        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
-        en_icon = "🟢" if st["enabled"] else "🔴"
-        await query.edit_message_text(
-            f"🌐 *Proxy Status*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{en_icon} Status    : `{'ENABLED' if st['enabled'] else 'DISABLED'}`\n"
-            f"📋 Total     : `{st['total']}`\n"
-            f"✅ Live      : `{st['live']}`\n"
-            f"⏳ Cooldown  : `{st['in_cooldown']}`\n"
-            f"🚀 Available : `{st['available']}`\n"
-            f"🕐 Last Load : `{st['last_load']}`\n\n"
-            f"Use `/proxy reload` to refresh.",
-            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
-        )
-
     elif data == "adm_log":
-        await query.answer()
         all_logs = []
         for uid, u in db["users"].items():
             for d in u.get("downloads",[]): all_logs.append((u["name"], d))
         all_logs.sort(key=lambda x: x[1]["time"], reverse=True)
-        lines = ["📜 *Recent 15 Downloads*\n"]
+        lines = ["📜 *Recent 15*\n"]
         for name, d in all_logs[:15]:
             icon = "✅" if d["status"]=="success" else "❌"
-            lines.append(f"{icon} {name} — `{d['url'][:30]}` {d['time']}")
+            lines.append(f"{icon} *{name}* `{d['url'][:35]}` {d['time']}")
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
-            "\n".join(lines) if len(lines)>1 else "📭 Log မရှိသေးပါ",
+            "\n".join(lines) if len(lines)>1 else "Empty",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
     elif data == "adm_back":
-        await query.answer()
-        async with db_lock:
-            db_fresh = _load_db_sync()
-        await _send_admin_panel(query, db_fresh)
+        await _send_admin_panel(query, db)
 
 
 # ══════════════════════════════════════════════════
