@@ -1,4 +1,4 @@
- python-telegram-bot[http2]==21.6
+python-telegram-bot[http2]==21.6
 requests==2.31.0
 urllib3==2.2.1
 beautifulsoup4==4.12.3
