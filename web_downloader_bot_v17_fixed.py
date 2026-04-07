@@ -2787,14 +2787,14 @@ _TECH_SIGNATURES = {
     "Google Analytics 4":    [r'G-[A-Z0-9]{8,12}', r'gtag\('],
     "Google Analytics UA":   [r'UA-\d{5,12}-\d', r'google-analytics\.com'],
     "Google Tag Manager":    [r'GTM-[A-Z0-9]+', r'googletagmanager\.com/gtm\.js'],
-    "Google Ads":            [r'AW-\d{8,12}', r'googleadservices\.com'],
+    "Google Ads":                 (r"\b(AW-\d{8,12})\b", "📊"),
     "Hotjar":                [r'hotjar\.com', r'hjid'],
     "Mixpanel":              [r'mixpanel\.init', r'mixpanel\.com/lib'],
     "Amplitude":             [r'amplitude\.getInstance', r'cdn\.amplitude\.com'],
     "Heap":                  [r'heap\.load', r'heapanalytics\.com'],
     "Segment":               [r'analytics\.load', r'cdn\.segment\.com'],
     "Facebook Pixel":        [r'fbq\(', r'connect\.facebook\.net/en_US/fbevents'],
-    "TikTok Pixel":          [r'analytics\.tiktok\.com', r'ttq\.load\('],
+    "TikTok Pixel":               (r"ttq\.load.{0,10}([A-Z0-9]{15,20})", "📱"),
     "LinkedIn Insight":      [r'snap\.licdn\.com', r'_linkedin_partner_id'],
     "Clarity (Microsoft)":   [r'clarity\.ms', r'clarity\('],
     "FullStory":             [r'fullstory\.com/s/fs\.js'],
@@ -6232,8 +6232,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                     let m = src.match(/[?&]k=([A-Za-z0-9_-]{20,60})/);
                     if (m) {
                         const co = src.match(/[?&]co=([A-Za-z0-9%]+)/);
-                        const hl = src.match(/[?&]hl=([a-z\-]+)/);
-                        const v  = src.match(/[?&]v=([A-Za-z0-9_\-]+)/);
+                        const hl = src.match(/[?&]hl=([a-z-]+)/);
+                        const v  = src.match(/[?&]v=([A-Za-z0-9_-]+)/);
                         add(m[1], 'iframe src', 'reCAPTCHA v2', {
                             co: co ? decodeURIComponent(co[1]) : '',
                             hl: hl ? hl[1] : '',
@@ -6242,7 +6242,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         });
                     }
                     // hCaptcha
-                    m = src.match(/sitekey=([0-9a-f\-]{36})/i);
+                    m = src.match(/sitekey=([0-9a-f-]{36})/i);
                     if (m) add(m[1], 'iframe src', 'hCaptcha', {});
                 });
 
@@ -6285,8 +6285,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         const hcIframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
                         hcIframes.forEach(f => {
                             const src = f.src;
-                            const sk = src.match(/sitekey=([0-9a-f\-]{36})/i);
-                            const hl = src.match(/[?&]hl=([a-z\-]+)/i);
+                            const sk = src.match(/sitekey=([0-9a-f-]{36})/i);
+                            const hl = src.match(/[?&]hl=([a-z-]+)/i);
                             const theme = src.match(/[?&]theme=([a-z]+)/i);
                             if (sk) add(sk[1], 'hcaptcha iframe', 'hCaptcha', {
                                 hl:    hl ? hl[1] : '',
@@ -6306,7 +6306,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                             const scriptTexts = Array.from(document.querySelectorAll('script:not([src])'))
                                 .map(s => s.textContent).join('\n');
                             const execMatches = scriptTexts.matchAll(
-                                /grecaptcha\.execute\s*\(\s*['"]([A-Za-z0-9_\-]{20,60})['"]\s*,\s*\{[^}]*action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/g
+                                /grecaptcha\.execute\s*\(\s*['"]([A-Za-z0-9_-]{20,60})['"]\s*,\s*\{[^}]*action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/g
                             );
                             for (const m of execMatches) {
                                 add(m[1], 'grecaptcha.execute() call', 'reCAPTCHA v3', {action: m[2]});
@@ -6319,7 +6319,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 document.querySelectorAll('script:not([src])').forEach((s, i) => {
                     const t = s.textContent || '';
                     // v3 keys (start with 6)
-                    [...t.matchAll(/['"](6[A-Za-z0-9_\-]{39})['"]/g)].forEach(m => {
+                    [...t.matchAll(/['"](6[A-Za-z0-9_-]{39})['"]/g)].forEach(m => {
                         // Look for nearby action
                         const ctx = t.substring(Math.max(0, m.index-200), m.index+200);
                         const act = ctx.match(/action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/);
@@ -6330,11 +6330,11 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         add(m[1], 'inline script #'+i+' (UUID)', 'hCaptcha', {});
                     });
                     // Turnstile 0x/1x keys
-                    [...t.matchAll(/['"]([01]x[A-Fa-f0-9_\-]{20,60})['"]/g)].forEach(m => {
+                    [...t.matchAll(/['"]([01]x[A-Fa-f0-9_-]{20,60})['"]/g)].forEach(m => {
                         add(m[1], 'inline script #'+i, 'Cloudflare Turnstile', {});
                     });
                     // Generic sitekey= assignments
-                    [...t.matchAll(/sitekey\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,60})['"]/gi)].forEach(m => {
+                    [...t.matchAll(/sitekey\s*[:=]\s*['"]([A-Za-z0-9_-]{20,60})['"]/gi)].forEach(m => {
                         add(m[1], 'inline script #'+i+' sitekey=', '', {});
                     });
                 });
@@ -6351,8 +6351,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                                 } else if (typeof v === 'object' && v !== null) {
                                     const js = JSON.stringify(v);
                                     [
-                                        ...js.matchAll(/"(?:sitekey|site_key|key)":"([A-Za-z0-9_\-]{20,60})"/g),
-                                        ...js.matchAll(/"(6[A-Za-z0-9_\-]{39})"/g),
+                                        ...js.matchAll(/"(?:sitekey|site_key|key)":"([A-Za-z0-9_-]{20,60})"/g),
+                                        ...js.matchAll(/"(6[A-Za-z0-9_-]{39})"/g),
                                         ...js.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi),
                                     ].forEach(m => add(m[1], 'window.'+k+' obj', '', {}));
                                 }
@@ -6443,77 +6443,215 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
     }
 
 def _sitekey_sync(url: str, progress_cb=None) -> dict:
-    """
-    Try Playwright (DevTools-style) first.
-    Falls back to requests-based static scan if Playwright not available.
-    """
-    # ── Try Playwright ─────────────────────────────
+    """Try Playwright first; fallback to static scan."""
     result = _sitekey_playwright(url, progress_cb)
     if result.get("error") == "playwright_not_installed":
-        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan သို့ fallback...")
+        if progress_cb: progress_cb("⚠️ Playwright not found — static scan fallback...")
         return _sitekey_static(url, progress_cb)
     return result
 
-
 def _sitekey_static(url: str, progress_cb=None) -> dict:
-    """Fallback: requests-based static HTML + JS scan (no browser)."""
+    """
+    v20: Static captcha scan.
+    FIX 1: Parses render=KEY from Google recaptcha script src URL.
+    Scans: script src URLs, data-sitekey attrs, HTML regex, 20 JS files,
+    __NEXT_DATA__, meta tags.
+    """
     session = requests.Session()
     session.headers.update(_get_headers())
 
-    if progress_cb: progress_cb("⬇️ Fetching page HTML (static)...")
+    if progress_cb: progress_cb("⬇️ Fetching HTML...")
     try:
-        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        resp.raise_for_status()
+        resp     = session.get(url, timeout=20, verify=False, allow_redirects=True)
         html     = resp.text
         page_url = resp.url
     except Exception as e:
-        return {"error": str(e), "findings": [], "page_url": url}
+        return {"error": str(e), "findings": [], "page_url": url, "js_fetched": 0,
+                "scan_methods": [], "diagnostics": [f"Fetch error: {e}"]}
 
-    final_parsed = urlparse(page_url)
-    base_origin  = f"{final_parsed.scheme}://{final_parsed.netloc}"
+    fp          = urlparse(page_url)
+    base_origin = f"{fp.scheme}://{fp.netloc}"
 
     def _resolve(src):
         if not src: return None
         src = src.strip()
-        if src.startswith('//'): return final_parsed.scheme + ':' + src
-        if src.startswith('http'): return src
-        if src.startswith('/'): return base_origin + src
-        base_path = final_parsed.path.rsplit('/', 1)[0]
-        return f"{base_origin}{base_path}/{src}"
+        if src.startswith("//"): return fp.scheme + ":" + src
+        if src.startswith("http"): return src
+        if src.startswith("/"): return base_origin + src
+        bp = fp.path.rsplit("/", 1)[0]
+        return f"{base_origin}{bp}/{src}"
 
-    soup = BeautifulSoup(html, 'html.parser')
+    soup         = BeautifulSoup(html, "html.parser")
+    findings     = []
+    seen_keys    = set()
+    scan_methods = []
+
+    def _add(cap_type, key, action, source):
+        key = (key or "").strip()
+        if not key or len(key) < 10:
+            return
+        dedup = cap_type + ":" + key
+        if dedup in seen_keys:
+            return
+        seen_keys.add(dedup)
+        ctx_action = action or ""
+        findings.append({
+            "type": cap_type, "site_key": key, "page_url": page_url,
+            "action": ctx_action, "source": source,
+            "invisible": False, "enterprise": False, "min_score": "",
+            "theme": "", "size": "", "badge": "", "s_param": "",
+            "hl": "", "co": "", "callback": "", "user_agent": "",
+        })
+
+    # ── Broad regex patterns ──────────────────────────────────────────────
+    _BROAD = [
+        (re.compile(r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA v3"),
+        (re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA v2"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA (generic)"),
+        (re.compile(r'siteKey\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA (generic)"),
+        (re.compile(r'render\s*:\s*["\']([6][A-Za-z0-9_\-]{39})["\']', re.I), "reCAPTCHA v3"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I), "hCaptcha"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,})["\']', re.I), "Cloudflare Turnstile"),
+        (re.compile(r'data-sitekey\s*=\s*["\']([01]x[0-9A-Fa-f_\-]{20,})["\']', re.I), "Cloudflare Turnstile"),
+        (re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I), "FunCaptcha"),
+        (re.compile(r'"gt"\s*:\s*"([0-9a-f]{32})"', re.I), "GeeTest"),
+    ]
+
+    def _scan_text(text, label):
+        for pat, cap_type in _BROAD:
+            for m in pat.finditer(text):
+                key = m.group(1)
+                ctx = text[max(0, m.start()-400):m.end()+400]
+                action = ""
+                am = re.search(r'action\s*:\s*["\']([a-zA-Z0-9_/]{2,60})["\']', ctx)
+                if am and am.group(1) not in ("get","set","use","new","add","key","id"):
+                    action = am.group(1)
+                _add(cap_type, key, action, label)
+        # reCAPTCHA v3 execute with action
+        for m in re.finditer(r'grecaptcha\.execute\s*\(\s*["\']([A-Za-z0-9_\-]{20,})["\']', text, re.I):
+            ctx = text[max(0, m.start()-300):m.end()+300]
+            action = ""
+            am = re.search(r',\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_/]{2,60})["\']', ctx)
+            if am: action = am.group(1)
+            _add("reCAPTCHA v3", m.group(1), action, f"grecaptcha.execute @ {label}")
+
+    # ── Method 1: Script src URL parsing (KEY FIX for reCAPTCHA v3) ─────────
+    scan_methods.append("Script src URL parsing")
+    for tag in soup.find_all("script", src=True):
+        src     = tag.get("src","")
+        src_full = _resolve(src) or src
+
+        if "google.com/recaptcha" in src or "recaptcha/api.js" in src or "recaptcha/enterprise.js" in src:
+            m = re.search(r"[?&]render=([A-Za-z0-9_\-]{20,60})", src)
+            if m:
+                _add("reCAPTCHA v3", m.group(1), "", f"Script src ?render= URL: {src[:100]}")
+            else:
+                scan_methods.append("reCAPTCHA script loaded (key not in src URL)")
+
+        if "hcaptcha.com" in src:
+            m = re.search(r"[?&](?:sitekey|s)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", src, re.I)
+            if m: _add("hCaptcha", m.group(1), "", f"hCaptcha src URL: {src[:100]}")
+
+        if "challenges.cloudflare.com" in src or "turnstile" in src.lower():
+            m = re.search(r"[?&](?:sitekey|k)=([0-9A-Za-z_\-]{20,60})", src, re.I)
+            if m: _add("Cloudflare Turnstile", m.group(1), "", f"Turnstile src URL: {src[:100]}")
+
+    # ── Method 2: data-sitekey HTML attributes ───────────────────────────────
+    scan_methods.append("HTML data-sitekey attributes")
+    for tag in soup.find_all(attrs={"data-sitekey": True}):
+        key = tag.get("data-sitekey","").strip()
+        if not key or len(key) < 10: continue
+        tag_str = str(tag)
+        if re.search(r"hcaptcha|h-captcha", tag_str, re.I) or re.match(r"[0-9a-f]{8}-[0-9a-f]{4}-", key, re.I):
+            _add("hCaptcha", key, "", "HTML data-sitekey")
+        elif re.search(r"turnstile|cf-turnstile", tag_str, re.I) or key.startswith(("0x","1x")):
+            _add("Cloudflare Turnstile", key, "", "HTML data-sitekey")
+        else:
+            _add("reCAPTCHA v2" if key.startswith("6L") else "CAPTCHA (unknown)", key, "", "HTML data-sitekey")
+
+    # ── Method 3: HTML text regex scan ──────────────────────────────────────
+    scan_methods.append("HTML text regex scan")
+    _scan_text(html, "HTML source")
+    for i, sc in enumerate(soup.find_all("script")):
+        if sc.string and sc.string.strip():
+            _scan_text(sc.string, f"Inline script #{i}")
+
+    # ── Method 4: Fetch & scan external JS files ─────────────────────────────
     js_seen, js_ordered = set(), []
-
-    def _add_js(u):
-        if u and u.startswith('http') and u not in js_seen:
+    for tag in soup.find_all("script", src=True):
+        u = _resolve(tag["src"])
+        if u and u.startswith("http") and u not in js_seen:
             js_seen.add(u); js_ordered.append(u)
 
-    for tag in soup.find_all('script', src=True):
-        _add_js(_resolve(tag['src']))
-
-    captcha_sigs_flat = [s for sigs in _CAPTCHA_SCRIPT_SIGS.values() for s in sigs]
+    _PRIO = ["recaptcha","hcaptcha","turnstile","funcaptcha","geetest",
+             "main","app","index","chunk","bundle","vendor"]
     def _prio(u):
         n = u.lower()
-        if any(s in n for s in captcha_sigs_flat): return 0
-        if any(k in n for k in ('main','app','index','chunk','bundle','vendor','runtime')): return 1
-        return 2
+        for i, sig in enumerate(_PRIO):
+            if sig in n: return i
+        return len(_PRIO)
 
-    fetch_list = sorted(js_ordered, key=_prio)[:15]
-
+    fetch_list = sorted(js_ordered, key=_prio)[:20]
     if progress_cb: progress_cb(f"📦 Fetching {len(fetch_list)} JS files...")
+    scan_methods.append(f"External JS scan ({len(fetch_list)} files)")
+
     js_sources = {}
     for js_url in fetch_list:
         try:
             r = session.get(js_url, timeout=10, verify=False)
-            if r.status_code == 200 and len(r.text) > 50:
-                js_sources[js_url] = r.text[:800_000]
+            if r.status_code == 200 and len(r.content) > 50:
+                js_sources[js_url] = r.text[:150_000]
         except Exception:
             pass
 
-    if progress_cb: progress_cb(f"🔍 Scanning {len(js_sources)} JS files...")
-    findings = _extract_captcha_info(html, page_url, js_sources)
-    return {"findings": findings, "page_url": page_url, "js_fetched": len(js_sources), "error": None}
+    for js_url, js_text in js_sources.items():
+        # Also parse render= in the JS file's src URL
+        m = re.search(r"[?&]render=([A-Za-z0-9_\-]{20,60})", js_url)
+        if m: _add("reCAPTCHA v3", m.group(1), "", f"JS src URL: {js_url[:80]}")
+        _scan_text(js_text, f"JS: {js_url[:70]}")
 
+    # ── Method 5: __NEXT_DATA__ JSON mining ──────────────────────────────────
+    scan_methods.append("__NEXT_DATA__ / window state mining")
+    for m in re.finditer(r'__NEXT_DATA__[^{]*({.{50,50000}})', html, re.S):
+        _scan_text(m.group(1), "__NEXT_DATA__ JSON")
+
+    # ── Method 6: Meta tags ──────────────────────────────────────────────────
+    scan_methods.append("Meta tag scan")
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name","") + meta.get("property","")).lower()
+        content = meta.get("content","")
+        if ("captcha" in name or "recaptcha" in name or "sitekey" in name) and content and len(content) >= 20:
+            _add("CAPTCHA (meta tag)", content, "", f"Meta: {meta.get('name','')}")
+
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+    diagnostics = []
+    if not findings:
+        script_srcs = [tag.get("src","") for tag in soup.find_all("script", src=True)]
+        for src in script_srcs:
+            if "recaptcha" in src:
+                diagnostics.append(f"⚠️ Not detected via static scan (HTML/JS regex)")
+                diagnostics.append(f"⚠️ Not detected via script src URL parsing")
+                diagnostics.append(f"⚠️ reCAPTCHA script loaded: `{src[:80]}`")
+                diagnostics.append(f"💡 Key is in `?render=KEY` but script has no render param (v2 invisible?)")
+                diagnostics.append(f"💡 Install Playwright: `pip install playwright && playwright install chromium`")
+                break
+            elif "hcaptcha" in src:
+                diagnostics.append(f"⚠️ hCaptcha script loaded but sitekey not found in src URL")
+                diagnostics.append(f"💡 Try Playwright mode for DOM scan after full JS execution")
+                break
+        else:
+            diagnostics.append("⚠️ Not detected via static scan (HTML/JS)")
+            diagnostics.append("⚠️ Not detected via script src URL parsing")
+            diagnostics.append("⚠️ Not detected via data-sitekey attribute scan")
+            diagnostics.append("⚠️ Not detected via regex across all JS files")
+            diagnostics.append("💡 Page may show captcha only after user interaction")
+            diagnostics.append("💡 Try: Install Playwright for full JS rendering")
+
+    return {
+        "findings": findings, "page_url": page_url,
+        "js_fetched": len(js_sources), "scan_methods": scan_methods,
+        "diagnostics": diagnostics, "error": None,
+    }
 
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
@@ -6601,18 +6739,22 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     findings  = result["findings"]
     page_url  = result["page_url"]
-    js_count  = result["js_fetched"]
+    js_count  = result.get("js_fetched", 0)
 
-    # ─── No captcha found ───────────────────────
+    # ─── No captcha found — show diagnostics ────────────────────────────
     if not findings:
+        diag_lines = result.get("diagnostics", [])
+        methods    = result.get("scan_methods", [])
+        diag_text  = "\n".join(f"  {d}" for d in diag_lines) if diag_lines else "  ⚠️ Unknown reason"
+        meth_text  = " → ".join(methods[:4]) if methods else "static scan"
         await msg.edit_text(
             f"🔑 *Site Key Extractor — `{domain}`*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 *Captcha မတွေ့ပါ*\n\n"
             f"🌐 Page URL: `{page_url}`\n"
-            f"📡 Requests intercepted: `{js_count}`\n\n"
-            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
-            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
+            f"📡 Sources scanned: `{js_count}`\n"
+            f"🔬 Methods: _{meth_text}_\n\n"
+            f"*Diagnostics:*\n{diag_text}",
             parse_mode='Markdown'
         )
         return
@@ -6771,11 +6913,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
     """
-    Generic Playwright runner:
-    - Launches stealth browser
-    - Intercepts ALL network requests/responses
-    - Executes custom js_eval_code in page context after load
-    - Returns: {html, network_log, console_log, dom_result, page_url, error}
+    v20: networkidle wait + 2s extra + stealth enhanced + 30 JS files + bigger body capture
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -6783,7 +6921,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         return {"error": "playwright_not_installed", "html": "", "network_log": [],
                 "console_log": [], "dom_result": None, "page_url": url}
 
-    network_log  = []   # list of {url, method, post_data, response_body}
+    network_log  = []
     console_log  = []
     page_url_ref = [url]
 
@@ -6800,43 +6938,55 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
 
         browser = pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"]
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled",
+                  "--disable-web-security"],
         )
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"),
+                        "Chrome/123.0.0.0 Safari/537.36"),
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
             proxy=_pw_proxy,
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
+                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest":  "document",
+                "Sec-Fetch-Mode":  "navigate",
+                "Sec-Fetch-Site":  "none",
+                "Sec-Fetch-User":  "?1",
             }
         )
+        # FIX 4: Enhanced stealth — navigator.webdriver, plugins, languages, chrome object
         ctx.add_init_script("""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-            window.chrome={runtime:{}};
+            Object.defineProperty(navigator, 'webdriver',   {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins',     {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages',   {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'platform',    {get: () => 'Win32'});
+            window.chrome = {runtime:{}, loadTimes:()=>{}, csi:()=>{}, app:{}};
         """)
+
         page = ctx.new_page()
 
         def _on_request(req):
             entry = {"url": req.url, "method": req.method, "post_data": "", "response_body": ""}
             try:
                 if req.post_data:
-                    entry["post_data"] = req.post_data[:2000]
+                    entry["post_data"] = req.post_data[:3000]
             except Exception:
                 pass
             network_log.append(entry)
 
         def _on_response(resp):
+            ct = resp.headers.get("content-type", "")
+            if not any(t in ct for t in ("javascript","json","text/html","text/plain")):
+                return
             for entry in network_log:
                 if entry["url"] == resp.url and not entry["response_body"]:
                     try:
                         body = resp.body()
-                        entry["response_body"] = body.decode("utf-8", errors="ignore")[:5000]
+                        entry["response_body"] = body.decode("utf-8", errors="ignore")[:120_000]
                     except Exception:
                         pass
                     break
@@ -6846,7 +6996,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         page.on("console",  lambda m: console_log.append(m.text))
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             page_url_ref[0] = page.url
         except PWTimeout:
             page_url_ref[0] = page.url
@@ -6855,32 +7005,45 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
             return {"error": str(e), "html": "", "network_log": [],
                     "console_log": [], "dom_result": None, "page_url": url}
 
+        # FIX 4: wait_for_load_state("networkidle") + 2000ms extra wait
+        if progress_cb: progress_cb("⏳ Waiting for JS (networkidle + 2s)...")
         try:
-            page.wait_for_load_state("networkidle", timeout=7_000)
+            page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
         try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        # Scroll to trigger lazy loads
+        try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(800)
         except Exception:
             pass
 
-        # Fetch external JS via browser context (bypasses IP/geo blocks)
+        # Fetch up to 30 external JS files via browser context
+        if progress_cb: progress_cb("📦 Fetching JS bundles...")
         js_urls = []
         try:
             js_urls = page.evaluate("""() =>
                 [...document.querySelectorAll('script[src]')]
-                    .map(s=>s.src).filter(s=>s.startsWith('http'))
+                    .map(s => s.src).filter(s => s && s.startsWith('http'))
             """) or []
         except Exception:
             pass
-        for js_url in js_urls[:12]:
-            if not any(e["url"] == js_url and e["response_body"] for e in network_log):
+
+        fetched = {e["url"] for e in network_log if e.get("response_body")}
+        for js_url in js_urls[:30]:
+            if js_url not in fetched:
                 try:
-                    r = ctx.request.get(js_url, timeout=8000)
+                    r = ctx.request.get(js_url, timeout=10_000)
                     if r.ok:
-                        network_log.append({"url": js_url, "method": "GET",
-                                            "post_data": "", "response_body": r.text()[:80000]})
+                        network_log.append({
+                            "url": js_url, "method": "GET",
+                            "post_data": "",
+                            "response_body": r.text()[:120_000]
+                        })
                 except Exception:
                     pass
 
@@ -6907,122 +7070,78 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         "page_url":    page_url_ref[0],
     }
 
-
 def _static_extract(url: str) -> dict:
-    """Fallback: requests-based HTML + JS fetch (no browser)."""
+    """Fallback requests-based HTML+JS fetch. Fetches up to 30 JS files, prioritised."""
     session = requests.Session()
     session.headers.update(_get_headers())
     px = proxy_manager.get_proxy()
     if px:
         session.proxies.update(px)
     try:
-        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        html = resp.text
+        resp     = session.get(url, timeout=20, verify=False, allow_redirects=True)
+        html     = resp.text
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "html": "", "network_log": [], "page_url": url}
 
     from urllib.parse import urlparse as _up2
-    fp = _up2(page_url)
+    fp   = _up2(page_url)
     base = f"{fp.scheme}://{fp.netloc}"
     soup_s = BeautifulSoup(html, "html.parser")
-    network_log = []
+
+    js_seen, js_ordered = set(), []
     for tag in soup_s.find_all("script", src=True):
         src = tag["src"]
         if src.startswith("//"): src = fp.scheme + ":" + src
         elif src.startswith("/"): src = base + src
-        if src.startswith("http"):
-            try:
-                r2 = session.get(src, timeout=8, verify=False)
-                if r2.status_code == 200:
-                    network_log.append({"url": src, "method": "GET",
-                                        "post_data": "", "response_body": r2.text[:80000]})
-            except Exception:
-                pass
-    return {"error": None, "html": html, "network_log": network_log,
-            "console_log": [], "page_url": page_url}
+        if src.startswith("http") and src not in js_seen:
+            js_seen.add(src); js_ordered.append(src)
 
+    _PRIO = ["recaptcha","hcaptcha","turnstile","funcaptcha","geetest",
+             "stripe","paypal","braintree","square","razorpay","adyen","firebase",
+             "main","app","index","chunk","bundle","vendor","runtime"]
+    def _prio(u):
+        n = u.lower()
+        for i, sig in enumerate(_PRIO):
+            if sig in n: return i
+        return len(_PRIO)
+
+    network_log = []
+    for js_url in sorted(js_ordered, key=_prio)[:30]:
+        try:
+            r2 = session.get(js_url, timeout=10, verify=False)
+            if r2.status_code == 200 and len(r2.content) > 50:
+                network_log.append({"url": js_url, "method": "GET",
+                                    "post_data": "",
+                                    "response_body": r2.text[:120_000]})
+        except Exception:
+            pass
+
+    return {"error": None, "html": html, "network_log": network_log,
+            "console_log": [], "page_url": page_url, "dom_result": None}
 
 def _gather_all_text(data: dict) -> list:
-    """Return list of (text, source_label) from html + all JS."""
+    """Return list of (text, source_label) from html + all JS + POST bodies + console."""
     texts = []
     if data.get("html"):
         texts.append((data["html"], "HTML source"))
     for entry in data.get("network_log", []):
         if entry.get("response_body"):
-            texts.append((entry["response_body"], f"JS: {entry['url'][:70]}"))
+            texts.append((entry["response_body"], f"JS: {entry['url'][:80]}"))
         if entry.get("post_data"):
-            texts.append((entry["post_data"], f"POST → {entry['url'][:60]}"))
+            texts.append((entry["post_data"], f"POST -> {entry['url'][:60]}"))
     if data.get("console_log"):
         texts.append(("\n".join(data["console_log"]), "Console logs"))
     return texts
 
-
 def _extract_run(url: str, js_code: str, progress_cb=None) -> dict:
-    """Try Playwright first, fallback to static."""
+    """Try Playwright first; fallback to static requests scan."""
     if progress_cb: progress_cb("🌐 Launching browser...")
     data = _run_playwright_extract(url, js_code, progress_cb)
     if data.get("error") == "playwright_not_installed":
         if progress_cb: progress_cb("⚠️ Playwright not found — static scan fallback...")
         data = _static_extract(url)
     return data
-
-
-# ══════════════════════════════════════════════════
-# 🔑  1. /apikeys — API Key Extractor
-# ══════════════════════════════════════════════════
-
-_API_KEY_PATTERNS = [
-    # Google
-    ("Google Maps / Places / YouTube",  re.compile(r'\b(AIza[0-9A-Za-z_\-]{35})\b')),
-    # OpenAI
-    ("OpenAI",                           re.compile(r'\b(sk-[A-Za-z0-9]{20,60})\b')),
-    ("OpenAI Project key",               re.compile(r'\b(sk-proj-[A-Za-z0-9\-_]{40,120})\b')),
-    # AWS
-    ("AWS Access Key ID",                re.compile(r'\b(AKIA[0-9A-Z]{16})\b')),
-    ("AWS Secret Access Key",            re.compile(r'(?i)aws.{0,30}secret.{0,10}[=:\s]["\']?([A-Za-z0-9/+=]{40})\b')),
-    # Twilio
-    ("Twilio Account SID",               re.compile(r'\b(AC[a-f0-9]{32})\b')),
-    ("Twilio Auth Token",                re.compile(r'(?i)twilio.{0,30}auth.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
-    # SendGrid
-    ("SendGrid",                         re.compile(r'\b(SG\.[A-Za-z0-9_\-]{22,60}\.[A-Za-z0-9_\-]{22,60})\b')),
-    # Mapbox
-    ("Mapbox Token",                     re.compile(r'\b(pk\.eyJ1[A-Za-z0-9_\-\.]+)\b')),
-    # GitHub
-    ("GitHub Token",                     re.compile(r'\b(gh[pousr]_[A-Za-z0-9]{36,255})\b')),
-    # Slack
-    ("Slack Bot Token",                  re.compile(r'\b(xox[baprs]-[A-Za-z0-9\-]{20,200})\b')),
-    ("Slack Webhook",                    re.compile(r'(https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+)')),
-    # Mailchimp
-    ("Mailchimp API Key",                re.compile(r'\b([0-9a-f]{32}-us[0-9]{1,2})\b')),
-    # HubSpot
-    ("HubSpot API Key",                  re.compile(r'(?i)hubspot.{0,30}[=:\s]["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b')),
-    # Square
-    ("Square Access Token",              re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,43})\b')),
-    # Shopify
-    ("Shopify Storefront Token",         re.compile(r'(?i)shopify.{0,30}token.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
-    # Generic secret/api key patterns
-    ("Generic API Key",                  re.compile(r'(?i)(?:api[_\-]?key|apikey|api[_\-]?token|access[_\-]?key|secret[_\-]?key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
-]
-
-_APIKEY_JS_EVAL = """() => {
-    const results = {};
-    const kwds = ['apiKey','api_key','apikey','accessKey','secretKey','authToken',
-                  'OPENAI_API_KEY','GOOGLE_API_KEY','MAPBOX_TOKEN','AWS_ACCESS'];
-    kwds.forEach(k => {
-        try {
-            const v = window[k] || (window.__ENV__ && window.__ENV__[k])
-                     || (window._env_ && window._env_[k])
-                     || (window.ENV && window.ENV[k]);
-            if (v && typeof v === 'string' && v.length > 10) results[k] = v;
-        } catch(e) {}
-    });
-    // Also scan meta tags
-    document.querySelectorAll('meta[name*="key"],meta[name*="token"]').forEach(m=>{
-        if (m.content && m.content.length > 10) results['meta:'+m.name] = m.content;
-    });
-    return results;
-}"""
 
 def _apikeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _APIKEY_JS_EVAL, progress_cb)
@@ -7364,30 +7483,165 @@ _PAY_JS_EVAL = """() => {
 }"""
 
 def _paykeys_sync(url: str, progress_cb=None) -> dict:
-    data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
+    """
+    v20 ISOLATED payment key detector. Own fresh fetch — no shared state.
+    FIX 2: PayPal client-id from script src URL, Stripe from JS bundles,
+    __NEXT_DATA__, DOM data attrs, window globals.
+    """
+    _PAY_PATS = [
+        ("Stripe Publishable (LIVE)",  re.compile(r'\b(pk_live_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Publishable (TEST)",  re.compile(r'\b(pk_test_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Secret (LIVE)",       re.compile(r'\b(sk_live_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Secret (TEST)",       re.compile(r'\b(sk_test_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Restricted Key",      re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Webhook Secret",      re.compile(r'\b(whsec_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe PaymentIntent",       re.compile(r'\b(pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
+        ("Square App ID",              re.compile(r'\b(sq0idp-[A-Za-z0-9_\-]{22,50})\b')),
+        ("Square Access Token",        re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,50})\b')),
+        ("Razorpay (LIVE)",            re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,30})\b')),
+        ("Razorpay (TEST)",            re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,30})\b')),
+        ("Checkout.com Public Key",    re.compile(r'\b(pk_(?:sbox|prod|test|live)_[A-Za-z0-9]{20,80})\b')),
+        ("WooCommerce Consumer Key",   re.compile(r'\b(ck_[a-f0-9]{40})\b')),
+        ("WooCommerce Consumer Secret",re.compile(r'\b(cs_[a-f0-9]{40})\b')),
+        ("Braintree Sandbox",          re.compile(r'\b(sandbox_[a-z0-9]{8}_[a-z0-9]{32,})\b')),
+        ("Payment Key (generic)",      re.compile(r'(?i)(?:payment|merchant)[_\-]?(?:key|id|token)["\']?\s*[=:]\s*["\']([A-Za-z0-9_\-]{16,80})["\']')),
+    ]
+
+    _PAY_DOM_EVAL = """() => {
+        const res = {};
+        ['Stripe','STRIPE_PUBLISHABLE_KEY','NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY',
+         'NEXT_PUBLIC_STRIPE_KEY','REACT_APP_STRIPE_KEY','VITE_STRIPE_KEY',
+         '__STRIPE_CLIENT_KEY__','stripeKey','stripePublicKey',
+         'paypal','PAYPAL_CLIENT_ID','NEXT_PUBLIC_PAYPAL_CLIENT_ID',
+         'braintree','square','razorpay'].forEach(k => {
+            try {
+                const v = window[k];
+                if (v) res[k] = typeof v==='string' ? v : JSON.stringify(v).substring(0,400);
+            } catch(e) {}
+        });
+        // data attributes
+        document.querySelectorAll('[data-stripe-key],[data-publishable-key],[data-stripe-public-key]')
+            .forEach(el => {
+                ['data-stripe-key','data-publishable-key','data-stripe-public-key'].forEach(a => {
+                    const v = el.getAttribute(a);
+                    if (v) res['dom:'+a] = v;
+                });
+            });
+        // __NEXT_DATA__
+        try {
+            const nd = window.__NEXT_DATA__;
+            if (nd) {
+                const s = JSON.stringify(nd);
+                const m = s.match(/pk_(?:live|test)_[A-Za-z0-9]{20,120}/);
+                if (m) res['__NEXT_DATA__:stripe'] = m[0];
+            }
+        } catch(e) {}
+        return res;
+    }"""
+
+    if progress_cb: progress_cb("🌐 Fetching page + executing JS...")
+    data = _extract_run(url, _PAY_DOM_EVAL, progress_cb)
     if data.get("error"):
-        return {"error": data["error"], "findings": [], "page_url": url}
-    findings = []; seen = set()
-    def _add(t, v, src):
-        d = t+":"+v[:60]
-        if d not in seen and len(v) >= 6:
-            seen.add(d); findings.append({"type": t, "value": v, "source": src})
-    if progress_cb: progress_cb("🔍 Scanning for payment keys...")
+        return {"error": data["error"], "findings": [], "page_url": url,
+                "requests": 0, "scan_methods": [], "diagnostics": []}
+
+    findings     = []
+    seen         = set()
+    scan_methods = []
+    page_url     = data["page_url"]
+    html         = data.get("html","")
+
+    def _add(key_type, value, source):
+        value = (value or "").strip()
+        if not value or len(value) < 6: return
+        dedup = key_type + ":" + value[:80]
+        if dedup in seen: return
+        seen.add(dedup)
+        is_live = any(x in value.lower() for x in ("live","prod"))
+        is_test = any(x in value.lower() for x in ("test","sandbox","sbox"))
+        findings.append({
+            "type":   key_type, "value":  value, "source": source,
+            "env":    "🔴 LIVE" if is_live else ("🟡 TEST" if is_test else "❓"),
+        })
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Method 1: PayPal script src URL → client-id= param (KEY FIX)
+    scan_methods.append("PayPal script src URL param")
+    for tag in soup.find_all("script", src=True):
+        src = tag.get("src","")
+        if "paypal.com/sdk/js" in src or "paypalobjects.com" in src:
+            m = re.search(r"[?&]client-id=([A-Za-z0-9_\-]{10,120})", src)
+            if m: _add("PayPal Client ID", m.group(1), f"Script src: {src[:100]}")
+            m2 = re.search(r"[?&]merchant-id=([A-Za-z0-9_\-]{5,80})", src)
+            if m2: _add("PayPal Merchant ID", m2.group(1), f"Script src: {src[:100]}")
+
+    # Method 2: Stripe HTML data attributes
+    scan_methods.append("HTML data attributes (Stripe)")
+    for tag in soup.find_all(True):
+        for attr in ["data-stripe-key","data-publishable-key","data-stripe-public-key","data-key"]:
+            val = tag.get(attr,"")
+            if val and re.match(r"pk_(?:live|test)_", val):
+                _add("Stripe Publishable Key", val, f"HTML attr {attr}")
+
+    # Method 3: Regex across all text sources
+    scan_methods.append("HTML + JS regex scan")
     for text, label in _gather_all_text(data):
-        for key_type, pat in _PAY_PATTERNS:
+        for key_type, pat in _PAY_PATS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+
+    # Method 4: DOM window globals
+    scan_methods.append("DOM window globals")
     for k, v in (data.get("dom_result") or {}).items():
         s = str(v)
-        for key_type, pat in _PAY_PATTERNS:
+        for key_type, pat in _PAY_PATS:
             mm = pat.search(s)
             if mm:
-                val = mm.group(1) if mm.lastindex else mm.group(0)
-                _add(key_type, val, f"window.{k}")
-    return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+                _add(key_type, mm.group(1) if mm.lastindex else mm.group(0), f"window.{k}")
+        if re.match(r"pk_(?:live|test)_", s):
+            _add("Stripe Publishable Key", s[:120], f"window.{k}")
 
+    # Method 5: __NEXT_DATA__ deep scan
+    scan_methods.append("__NEXT_DATA__ JSON scan")
+    for m in re.finditer(r'__NEXT_DATA__[^{]*({.{100,100000}})', html, re.S):
+        blob = m.group(1)
+        for key_type, pat in _PAY_PATS:
+            for m2 in pat.finditer(blob):
+                _add(key_type, m2.group(1) if m2.lastindex else m2.group(0), "__NEXT_DATA__ JSON")
+        # PayPal client-id in JSON
+        for m2 in re.finditer(r'"client.?[Ii]d"\s*:\s*"([A-Za-z0-9_\-]{10,120})"', blob):
+            _add("PayPal Client ID", m2.group(1), "__NEXT_DATA__ JSON")
+
+    # Build diagnostics for not-found
+    diagnostics = []
+    if not findings:
+        net_urls = [e.get("url","") for e in data.get("network_log",[])]
+        has_stripe  = any("stripe" in u.lower() for u in net_urls)
+        has_paypal  = any("paypal" in u.lower() for u in net_urls)
+        methods_str = " | ".join(scan_methods)
+        if has_stripe:
+            diagnostics.append(f"⚠️ Not detected via: {methods_str}")
+            diagnostics.append("⚠️ Stripe JS (js.stripe.com) loaded — key not found yet")
+            diagnostics.append("💡 Key may be in server-rendered HTML only (SSR) or lazy chunk")
+            diagnostics.append("💡 Try: View page source → Ctrl+F → 'pk_live' or 'pk_test'")
+            diagnostics.append("💡 Or: DevTools → Network → filter 'stripe' → check request params")
+        elif has_paypal:
+            diagnostics.append("⚠️ PayPal SDK loaded but client-id not in script src URL")
+            diagnostics.append("💡 PayPal may use dynamic SDK injection (no static client-id)")
+        else:
+            diagnostics.append(f"⚠️ Not detected via: {methods_str}")
+            diagnostics.append("⚠️ No Stripe/PayPal scripts detected in network requests")
+            diagnostics.append("💡 Payment form may load only on checkout page, not this URL")
+            diagnostics.append("💡 Try scanning: /checkout, /cart, /payment URL directly")
+            diagnostics.append("💡 Or use /keydump for exhaustive deep scan")
+
+    return {
+        "error": None, "findings": findings, "page_url": page_url,
+        "requests": len(data.get("network_log",[])),
+        "scan_methods": scan_methods, "diagnostics": diagnostics,
+    }
 
 async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/paykeys <url> — Extract Stripe, PayPal, Braintree, Square, Razorpay payment keys"""
@@ -7440,9 +7694,18 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
+        diag_lines = result.get("diagnostics", [])
+        diag_text  = "\n".join(f"  {d}" for d in diag_lines) if diag_lines else "  ⚠️ Unknown reason"
+        reqs       = result.get("requests", 0)
+        methods    = " → ".join(result.get("scan_methods", [])[:4])
         await msg.edit_text(
             f"💳 *Payment Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No payment keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+            f"📭 *Payment key မတွေ့ပါ*\n\n"
+            f"🌐 `{page_url}`\n"
+            f"📡 Requests: `{reqs}`\n"
+            f"🔬 Methods: _{methods}_\n\n"
+            f"*Diagnostics:*\n{diag_text}",
+            parse_mode='Markdown')
         return
     lines = [f"💳 *Payment Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
@@ -7981,7 +8244,7 @@ _ENDPOINT_JS_EVAL = """() => {
             const v = eval(k);
             if (v) {
                 const s = JSON.stringify(v)||'';
-                const urls = s.match(/https?:\\/\\/[A-Za-z0-9._\\-\\/:?=&%]{10,150}/g)||[];
+                const urls = s.match(/https?:\\/\\/[A-Za-z0-9._\-\\/:?=&%]{10,150}/g)||[];
                 res['env_urls_'+k] = [...new Set(urls)].slice(0,20);
             }
         } catch(e) {}
@@ -15749,10 +16012,171 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 import base64 as _b64
 import math
 
-# ─── Shannon Entropy ──────────────────────────────
-def _entropy(s: str) -> float:
-    if not s:
-        return 0.0
+
+# ─── Deep Scraper: HTML + JS bundles (used by keydump & key commands) ────────
+
+def _scrape_full(url: str, max_js: int = 15) -> dict:
+    """
+    Fetch target page + all linked JS bundles aggressively.
+    Handles: lazy-loaded scripts, webpack chunks, CDN-hosted JS,
+             inline scripts, meta-refresh redirects.
+    Returns: {html, headers, status, cookies, js_sources, all_text}
+    """
+    result = {
+        "html": "", "headers": {}, "status": 0,
+        "cookies": {}, "js_sources": [], "all_text": ""
+    }
+
+    # Browser-like headers to avoid bot blocks
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    try:
+        sess = requests.Session()
+        sess.headers.update(browser_headers)
+        proxy = proxy_manager.get_proxy()
+
+        resp = sess.get(
+            url, timeout=20, verify=False,
+            allow_redirects=True, proxies=proxy
+        )
+        result["html"]    = resp.text
+        result["headers"] = dict(resp.headers)
+        result["status"]  = resp.status_code
+        result["cookies"] = {c.name: c.value for c in sess.cookies}
+
+        html_text = resp.text
+        base_url  = url
+
+        # ── Collect JS URLs ──────────────────────────────────────
+        js_urls = []
+        seen    = set()
+
+        def _add_js(raw_url):
+            if not raw_url:
+                return
+            # Skip data URIs and obvious non-JS
+            if raw_url.startswith("data:"):
+                return
+            full = urljoin(base_url, raw_url)
+            # Normalise — drop query for dedup key
+            key = full.split("?")[0]
+            if key in seen:
+                return
+            if not full.startswith("http"):
+                return
+            # Only JS / no-extension paths (could be bundled JS)
+            ext = key.rsplit(".", 1)[-1].lower() if "." in key.split("/")[-1] else ""
+            if ext in ("css", "png", "jpg", "jpeg", "gif", "svg", "ico",
+                       "woff", "woff2", "ttf", "eot", "map", "json"):
+                return
+            seen.add(key)
+            js_urls.append(full)
+
+        # 1. BeautifulSoup: <script src=...>
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+            for tag in soup.find_all("script", src=True):
+                _add_js(tag.get("src", ""))
+        except Exception:
+            pass
+
+        # 2. Regex: all quoted .js URLs (catches lazy-loaded / dynamic imports)
+        for m in re.finditer(
+            r'''["'`]((https?:)?//[^"'`\s<>]+?\.js(?:\?[^"'`\s<>]*)?)["'`]''',
+            html_text
+        ):
+            _add_js(m.group(1))
+
+        # 3. Regex: relative /static /assets /_next /js paths
+        for _js_m in re.finditer(
+            r'(?<=["\' ])(/(?:static|assets|js|_next|dist|build|chunks|bundles|public|_nuxt)[a-zA-Z0-9_./?=&%-]*\.js)',
+            html_text
+        ):
+            _add_js(_js_m.group(1))
+
+        # 4. Next.js / webpack chunk manifest patterns
+        for m in re.finditer(
+            r'"([^"]+\.js)":\s*(?:"[^"]*"|[0-9]+)',
+            html_text
+        ):
+            candidate = m.group(1)
+            if "/" in candidate and len(candidate) < 200:
+                _add_js(candidate)
+
+        # 5. importmap entries
+        for m in re.finditer(
+            r'"imports"\s*:\s*\{([^}]+)\}',
+            html_text
+        ):
+            for url_m in re.finditer(r'"([^"]+\.js[^"]*)"', m.group(1)):
+                _add_js(url_m.group(1))
+
+        # ── Fetch JS concurrently ────────────────────────────────
+        js_headers = {
+            "User-Agent": browser_headers["User-Agent"],
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": url,
+            "Sec-Fetch-Dest": "script",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+
+        def _fetch_js(js_url: str):
+            try:
+                r = sess.get(
+                    js_url, timeout=12, verify=False,
+                    allow_redirects=True, proxies=proxy,
+                    headers=js_headers
+                )
+                if r.status_code == 200:
+                    ct = r.headers.get("Content-Type", "")
+                    # Accept JS and also text/plain (some CDNs serve it wrong)
+                    if any(x in ct for x in ("javascript", "text/plain", "application/")) \
+                            or js_url.endswith(".js"):
+                        text = r.text
+                        if len(text) > 10:   # Skip empty/1-line files
+                            return (js_url, text[:3_000_000])  # cap 3MB
+            except Exception:
+                pass
+            return None
+
+        limit = min(max_js, len(js_urls))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(_fetch_js, u) for u in js_urls[:limit]]
+            for fut in concurrent.futures.as_completed(futs, timeout=30):
+                try:
+                    res = fut.result(timeout=12)
+                    if res:
+                        result["js_sources"].append(res)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.debug("_scrape_full error: %s", e)
+
+    # ── Combine all text ─────────────────────────────────────────
+    parts = [result["html"]] + [js for _, js in result["js_sources"]]
+    result["all_text"] = "\n".join(parts)
+    return result
+
+
     freq = {}
     for c in s:
         freq[c] = freq.get(c, 0) + 1
@@ -15761,92 +16185,91 @@ def _entropy(s: str) -> float:
 
 # ─── Master pattern registry (TruffleHog/Gitleaks style) ──────
 _KD_PATTERNS = {
-    # ── Cloud / Infra ─────────────────────────────
-    "AWS Access Key ID":          (r'(AKIA[0-9A-Z]{16})', "☁️"),
-    "AWS Secret Access Key":      (r'(?:aws_secret|AWS_SECRET_ACCESS_KEY)\s*[=:]\s*["\']?([A-Za-z0-9+/]{40})["\']?', "☁️"),
-    "AWS Session Token":          (r'(AQoX[A-Za-z0-9+/=]{100,})', "☁️"),
-    "GCP API Key":                (r'(AIza[0-9A-Za-z\-_]{35})', "☁️"),
-    "GCP OAuth Client":           (r'([0-9]{8,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com)', "☁️"),
-    "Azure Storage Key":          (r'DefaultEndpointsProtocol=https;AccountName=([^;]+);AccountKey=([A-Za-z0-9+/=]{86,})', "☁️"),
-    "Azure SAS Token":            (r'(sv=\d{4}-\d{2}-\d{2}&s[a-z]=\w+&se=\d{4}[^"\'&\s]{20,})', "☁️"),
-    "Cloudflare API Token":       (r'(Bearer [A-Za-z0-9_\-]{37})', "☁️"),
-    "DigitalOcean Token":         (r'(dop_v1_[a-f0-9]{64})', "☁️"),
-    # ── AI / ML ───────────────────────────────────
-    "OpenAI Key":                 (r'(sk-[A-Za-z0-9]{20,60})', "🤖"),
-    "OpenAI Org":                 (r'(org-[A-Za-z0-9]{20,40})', "🤖"),
-    "Anthropic Key":              (r'(sk-ant-[A-Za-z0-9\-_]{40,})', "🤖"),
-    "HuggingFace Token":          (r'(hf_[A-Za-z]{34})', "🤖"),
-    # ── Version Control ───────────────────────────
-    "GitHub PAT":                 (r'(gh[pousr]_[A-Za-z0-9]{36,})', "📦"),
-    "GitHub OAuth":               (r'(gho_[A-Za-z0-9]{36})', "📦"),
-    "GitLab Token":               (r'(glpat-[A-Za-z0-9\-]{20})', "📦"),
-    "Bitbucket OAuth":            (r'(?:bitbucket[^"\']{0,30})["\']([A-Za-z0-9]{32})["\']', "📦"),
-    # ── Communication ─────────────────────────────
-    "Slack Bot Token":            (r'(xoxb-[0-9]{10,13}-[0-9]{10,13}-[A-Za-z0-9]{24})', "📨"),
-    "Slack User Token":           (r'(xoxp-[0-9A-Za-z\-]{40,80})', "📨"),
-    "Slack Webhook":              (r'(https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+)', "📨"),
-    "Discord Bot Token":          (r'([A-Za-z0-9_\-]{23,28}\.[A-Za-z0-9_\-]{6,7}\.[A-Za-z0-9_\-]{27,})', "📨"),
-    "Discord Webhook":            (r'(https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+)', "📨"),
-    "Twilio Account SID":         (r'(AC[a-f0-9]{32})', "📨"),
-    "Twilio Auth Token":          (r'(?:twilio[^"\']{0,20})["\']([a-f0-9]{32})["\']', "📨"),
-    "SendGrid API Key":           (r'(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})', "📨"),
-    "Mailchimp API Key":          (r'([0-9a-f]{32}-us\d{2})', "📨"),
-    "Mailgun API Key":            (r'(key-[0-9a-zA-Z]{32})', "📨"),
-    # ── Payment ───────────────────────────────────
-    "Stripe Publishable":         (r'(pk_(?:live|test)_[A-Za-z0-9]{24,110})', "💳"),
-    "Stripe Secret":              (r'(sk_(?:live|test)_[A-Za-z0-9]{24,110})', "💳"),
-    "Stripe Webhook":             (r'(whsec_[A-Za-z0-9]{32,64})', "💳"),
-    "PayPal Client ID":           (r'(?:client.id|paypal)[^"\']{0,40}["\']([A-Za-z0-9\-_]{50,100})["\']', "💳"),
-    "Braintree Token":            (r'(sandbox|production)_[a-z0-9]{8}_[a-z0-9]{16}', "💳"),
-    "Square App ID":              (r'(sq0idp-[A-Za-z0-9_\-]{22})', "💳"),
-    "Razorpay Key":               (r'(rzp_(?:live|test)_[A-Za-z0-9]{14,20})', "💳"),
-    "Adyen API Key":              (r'(AQE[a-zA-Z0-9+/]{40,})', "💳"),
-    # ── Firebase / Google ─────────────────────────
-    "Firebase API Key":           (r'(AIza[0-9A-Za-z\-_]{35})', "🔥"),
-    "Firebase URL":               (r'(https://[a-z0-9\-]+\.firebaseio\.com)', "🔥"),
-    "Firebase Project ID":        (r'["\']projectId["\']\s*:\s*["\']([a-z0-9\-]{4,30})["\']', "🔥"),
-    "Firebase App ID":            (r'["\']appId["\']\s*:\s*["\']([0-9:a-z\-]{10,60})["\']', "🔥"),
-    "Firebase Storage":           (r'(https://[a-z0-9\-]+\.appspot\.com)', "🔥"),
-    "Firebase Messaging ID":      (r'["\']messagingSenderId["\']\s*:\s*["\'](\d{8,15})["\']', "🔥"),
-    # ── Social / OAuth ────────────────────────────
-    "Facebook App ID":            (r'(?:appId|fb:app_id)[^"\']{0,20}["\']?(\d{10,17})["\']?', "📱"),
-    "Facebook Pixel":             (r'fbq\s*\(\s*["\']init["\']\s*,\s*["\']?(\d{10,17})["\']?', "📱"),
-    "Facebook Access Token":      (r'(EAAa[A-Za-z0-9]{80,})', "📱"),
-    "Twitter Bearer":             (r'(?:twitter[^"\']*bearer)[^"\']{0,20}["\']([A-Za-z0-9%]{50,})["\']', "📱"),
-    "TikTok Pixel":               (r'ttq\.load\s*\(\s*["\']([A-Z0-9]{15,20})["\']', "📱"),
-    # ── Analytics ────────────────────────────────
-    "Google Analytics 4":         (r'(G-[A-Z0-9]{8,12})', "📊"),
-    "Google Analytics UA":        (r'(UA-\d{5,12}-\d{1,3})', "📊"),
-    "Google Tag Manager":         (r'(GTM-[A-Z0-9]{6,8})', "📊"),
-    "Hotjar":                     (r'(?:hjid|hotjar)[^"\']{0,30}["\']?(\d{5,12})["\']?', "📊"),
-    "Mixpanel":                   (r'mixpanel\.init\s*\(\s*["\']([a-f0-9]{32})["\']', "📊"),
-    "Amplitude":                  (r'amplitude\.init\s*\(\s*["\']([a-f0-9]{32})["\']', "📊"),
-    "Segment":                    (r'analytics\.load\s*\(\s*["\']([A-Za-z0-9]{20,40})["\']', "📊"),
-    # ── Captcha ────────────────────────────────────
-    "reCAPTCHA v2 Sitekey":       (r'data-sitekey=["\']([A-Za-z0-9_\-]{20,60})["\']', "🔑"),
-    "reCAPTCHA v3":               (r'render=([6][A-Za-z0-9_\-]{38})', "🔑"),
-    "hCaptcha Sitekey":           (r'data-sitekey=["\']([a-f0-9\-]{36})["\']', "🔑"),
-    "Turnstile Sitekey":          (r'(0x[A-Z0-9]{20,40})', "🔑"),
-    # ── Secrets / Credentials ─────────────────────
-    "Hardcoded Password":         (r'(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\']{8,60})["\']', "🔒"),
-    "JWT Token":                  (r'(eyJ[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,}\.[A-Za-z0-9\-_]{8,})', "🧬"),
-    "Private Key Header":         (r'(-----BEGIN (?:RSA |EC )?PRIVATE KEY-----)', "🔒"),
-    "MongoDB URI":                (r'(mongodb(?:\+srv)?://[^\s"\'<>]{10,150})', "🔒"),
-    "MySQL URI":                  (r'(mysql://[^\s"\'<>]{10,150})', "🔒"),
-    "Postgres URI":               (r'(postgres(?:ql)?://[^\s"\'<>]{10,150})', "🔒"),
-    "Redis URI":                  (r'(redis://[^\s"\'<>]{10,100})', "🔒"),
-    "Generic API Key (env)":      (r'(?:api[_\-]?key|API_KEY)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']', "🌐"),
-    "Bearer Token":               (r'[Bb]earer\s+([A-Za-z0-9\-_.]{20,200})', "🌐"),
-    "Mapbox Token":               (r'(pk\.eyJ[A-Za-z0-9._\-]{30,})', "🌐"),
-    "NPM Token":                  (r'(npm_[A-Za-z0-9]{36})', "📦"),
-    "Heroku API Key":             (r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', "☁️"),
-    "Pusher App Key":             (r'new\s+Pusher\s*\(\s*["\']([a-z0-9]{8,20})["\']', "📨"),
-    "VAPID Public Key":           (r'vapidKey\s*:\s*["\']([A-Za-z0-9_\-]{86,90})["\']', "🔔"),
-    "SSH Private Key":            (r'(ssh-rsa AAAA[A-Za-z0-9+/]{30,})', "🔒"),
-    "Vault Token":                (r'(hvs\.[A-Za-z0-9_\-]{96,})', "🔒"),
+    # Cloud / Infra
+    "AWS Access Key ID": (r"(AKIA[0-9A-Z]{16}),                                                       ☁️", ),
+    "AWS Secret Access Key": (r"(?:aws_secret_access_key|AWS_SECRET).{0,20}([A-Za-z0-9+/]{40}), ☁️", ),
+    "AWS Session Token": (r"(ASIA[0-9A-Z]{16}),                                                        ☁️", ),
+    "GCP/Firebase API Key": (r"(AIza[0-9A-Za-z\-_]{20,}),                                               ☁️", ),
+    "GCP OAuth Client ID": (r"([0-9]{8,20}-[a-z0-9]{20,}\.apps\.googleusercontent\.com),             ☁️", ),
+    "DigitalOcean Token": (r"(dop_v1_[a-f0-9]{64}),                                                     ☁️", ),
+    # AI / ML
+    "OpenAI API Key": (r"(sk-[A-Za-z0-9T]{20,}),                                                    🤖", ),
+    "Anthropic Key": (r"(sk-ant-[A-Za-z0-9\-_]{40,}),                                            🤖", ),
+    "HuggingFace Token": (r"(hf_[A-Za-z0-9]{30,}),                                                     🤖", ),
+    "OpenAI Org": (r"(org-[A-Za-z0-9]{20,40}),                                                   🤖", ),
+    # Version Control
+    "GitHub PAT": (r"(ghp_[A-Za-z0-9]{36,}|gho_[A-Za-z0-9]{36,}|ghu_[A-Za-z0-9]{36,}),        📦", ),
+    "GitHub Actions Token": (r"(ghs_[A-Za-z0-9]{36,}|ghr_[A-Za-z0-9]{36,}),                              📦", ),
+    "GitLab Token": (r"(glpat-[A-Za-z0-9\-]{20,}),                                              📦", ),
+    "NPM Token": (r"(npm_[A-Za-z0-9]{36,}),                                                     📦", ),
+    # Communication
+    "Slack Bot Token": (r"(xoxb-[0-9]+-[0-9]+-[A-Za-z0-9]+),                                         📨", ),
+    "Slack User Token": (r"(xoxp-[0-9A-Za-z\-]{40,}),                                               📨", ),
+    "Slack App Token": (r"(xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-f0-9]+), 📨", ),
+    "Slack Webhook URL": (r"(https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+), 📨", ),
+    "Discord Webhook URL": (r"(https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+),        📨", ),
+    "Twilio Account SID": (r"(AC[a-f0-9]{32}), 📨", ),
+    "SendGrid API Key": (r"(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}),                         📨", ),
+    "Mailchimp API Key": (r"([0-9a-f]{32}-us\d{1,2}),                                                  📨", ),
+    "Mailgun API Key": (r"(key-[0-9a-zA-Z]{32}),                                                      📨", ),
+    # Payment
+    "Stripe Publishable Key": (r"(pk_(?:live|test)_[A-Za-z0-9]{20,}), 💳", ),
+    "Stripe Secret Key": (r"(sk_(?:live|test)_[A-Za-z0-9]{20,}), 💳", ),
+    "Stripe Webhook Secret": (r"(whsec_[A-Za-z0-9]{20,}),                                                   💳", ),
+    "Square App ID": (r"(sq0idp-[A-Za-z0-9_\-]{20,}),                                             💳", ),
+    "Razorpay Key": (r"(rzp_(?:live|test)_[A-Za-z0-9]{10,}),                                       💳", ),
+    "Braintree Key": (r"(?:sandbox|production)_[a-z0-9]{8}_[a-z0-9]{16}, 💳", ),
+    "Adyen API Key": (r"(AQE[a-zA-Z0-9+/]{40,}),                                                    💳", ),
+    # Firebase / Google
+    "Firebase API Key (context)": (r"(?i)(?:apiKey|api_key).{0,15}(AIza[0-9A-Za-z_-]{20,}), 🔥", ),
+    "Firebase API Key (raw)": (r"(AIza[0-9A-Za-z\-_]{30,}),                                               🔥", ),
+    "Firebase authDomain": (r"authDomain.{0,10}([a-z0-9-]+\.firebaseapp\.com), 🔥", ),
+    "Firebase projectId": (r"projectId.{0,10}([a-z0-9-]{4,40}), 🔥", ),
+    "Firebase storageBucket": (r"storageBucket.{0,10}([a-z0-9-]+\.appspot\.com), 🔥", ),
+    "Firebase messagingSenderId": (r"messagingSenderId.{0,10}(\d{8,15}), 🔥", ),
+    "Firebase appId": (r"appId.{0,10}([0-9:a-z-]{10,80}), 🔥", ),
+    "Firebase DB URL": (r"(https://[a-z0-9\-]+\.firebaseio\.com),                                  🔥", ),
+    "Firebase Storage URL": (r"(https://[a-z0-9\-]+\.appspot\.com),                                     🔥", ),
+    # Social / OAuth
+    "Facebook App ID": (r"(?:appId|fbAppId|fb_app_id)[^'\d]{0,15}(\d{10,18}),                    📱", ),
+    "Facebook Pixel ID": (r"fbq.{0,10}init.{0,10}(\d{10,18}), 📱", ),
+    "Facebook Access Token": (r"(EAAa[A-Za-z0-9]{50,}),                                                     📱", ),
+    "Google Client ID": (r"([0-9]{8,20}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com),             📱", ),
+    "TikTok Pixel": (r"ttq\.load.{0,10}([A-Z0-9]{15,20}), 📱", ),
+    "LinkedIn Partner ID": (r"_linkedin_partner_id.{0,10}(\d{5,12}), 📱", ),
+    # Analytics
+    "Google Analytics 4": (r"\b(G-[A-Za-z0-9]{8,12})\b,                                               📊", ),
+    "Google Analytics UA": (r"\b(UA-\d{5,12}-\d{1,3})\b,                                             📊", ),
+    "Google Tag Manager": (r"\b(GTM-[A-Za-z0-9]{6,8})\b,                                              📊", ),
+    "Google Ads": (r"\b(AW-\d{8,12})\b, 📊", ),
+    "Hotjar Site ID": (r"(?:hjid|hjsv).{0,20}(\d{5,12}), 📊", ),
+    "Mixpanel Token": (r"mixpanel.{0,30}([a-f0-9]{32}), 📊", ),
+    "Segment Write Key": (r"analytics\.load.{0,20}([A-Za-z0-9]{20,40}), 📊", ),
+    "Heap Analytics ID": (r"heap\.load.{0,10}(\d{8,12}), 📊", ),
+    # Captcha
+    "reCAPTCHA Sitekey": (r"data-sitekey=[']([ A-Za-z0-9_-]{20,60})['], 🔑", ),
+    "reCAPTCHA v3 render": (r"(?:render|execute).{0,10}([6L][A-Za-z0-9_-]{38}), 🔑", ),
+    "hCaptcha Sitekey": (r"hcaptcha.{0,30}([a-f0-9-]{36}), 🔑", ),
+    "Cloudflare Turnstile": (r"(0x[A-Za-z0-9]{10,40}),                                                     🔑", ),
+    # JWT / Auth
+    "JWT Token": (r"(eyJ[A-Za-z0-9\-_]{20,}\.eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{10,}), 🧬", ),
+    "JWT Secret (env)": (r"(?:JWT_SECRET|jwt_secret).{0,10}([^\s]{8,80}), 🧬", ),
+    # Secrets / Credentials
+    "Private Key PEM": (r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----),                    🔒", ),
+    "MongoDB URI": (r"(mongodb(?:\+srv)?://[^\s'<>]{10,200}),                                  🔒", ),
+    "PostgreSQL URI": (r"(postgres(?:ql)?://[^\s'<>]{10,200}),                                     🔒", ),
+    "MySQL URI": (r"(mysql(?:2)?://[^\s'<>]{10,200}),                                         🔒", ),
+    "Redis URI": (r"(rediss?://[^\s'<>]{10,150}),                                             🔒", ),
+    "Hardcoded Password": (r"(?:password|passwd|pwd)\s*[=:]\s*[']([ ^']{8,60})['], 🔒", ),
+    "Secret Key (env)": (r"(?:SECRET_KEY|secret_key).{0,10}([^\s']{12,80}), 🔒", ),
+    # Generic / Other
+    "Bearer Token": (r"[Bb]earer\s+([A-Za-z0-9\-_.]{20,200}),                                    🌐", ),
+    "API Key (env var)": (r"(?:api_key|apiKey|API_KEY)\s*[=:]\s*[']([ A-Za-z0-9_-]{20,80})['], 🌐", ),
+    "Mapbox Token": (r"(pk\.eyJ[A-Za-z0-9._\-]{20,}),                                             🌐", ),
+    "VAPID Public Key": (r"(?:vapidKey|applicationServerKey).{0,10}([A-Za-z0-9_-]{86,90}), 🔔", ),
+    "SSH Private Key": (r"(ssh-rsa AAAA[A-Za-z0-9+/]{30,}),                                           🔒", ),
 }
 
-# Category mapping
 _KD_CATEGORIES = {
     "☁️": "Cloud & Infra",
     "🤖": "AI / ML",
@@ -16005,21 +16428,38 @@ def _run_keydump_sync(url: str) -> dict:
         "errors":      [],
     }
 
-    # ── 1. Fetch static ────────────────────────────────────────
+    # ── 1. Fetch static + JS bundles ──────────────────────────────
     try:
-        data = _scrape_full(url, max_js=15)
+        data = _scrape_full(url, max_js=20)
     except Exception as e:
         out["errors"].append(f"Fetch error: {e}")
         return out
 
     if not data["html"]:
-        out["errors"].append("Page fetch failed")
+        out["errors"].append("Page fetch failed — site may block bots")
         return out
 
-    corpus        = data["all_text"]
-    out["js_count"] = len(data["js_sources"])
+    # Also extract inline <script> block content
+    inline_scripts = []
+    try:
+        soup_kd = BeautifulSoup(data["html"], "html.parser")
+        for tag in soup_kd.find_all("script"):
+            if not tag.get("src") and tag.string:
+                txt = tag.string.strip()
+                if len(txt) > 30:
+                    inline_scripts.append(txt)
+    except Exception:
+        pass
 
-    # ── 2. Pattern scan ────────────────────────────────────────
+    # Build full corpus: HTML + inline scripts + all JS bundle text
+    corpus_parts = [data["html"]] + inline_scripts + [
+        js for _, js in data["js_sources"]
+    ]
+    corpus        = "\n".join(corpus_parts)
+    out["js_count"] = len(data["js_sources"])
+    out["inline_scripts"] = len(inline_scripts)
+
+    # ── 2. Pattern scan (all 50+ patterns against full corpus) ────
     for label, (pat, cat_icon) in _KD_PATTERNS.items():
         try:
             raw = re.findall(pat, corpus, re.IGNORECASE)
@@ -16117,13 +16557,14 @@ def _format_keydump_report(result: dict) -> tuple:
     )
 
     # ── Header ─────────────────────────────────────────────────
-    js_mode = "⚡ JS+Static" if PUPPETEER_OK else "📄 Static"
+    js_mode      = "⚡ JS+Static+Dynamic" if PUPPETEER_OK else "📄 Static+JS"
+    inline_cnt   = result.get("inline_scripts", 0)
     lines = [
         f"🔑 *KeyDump v18 — Full Scan*",
         f"🌐 `{domain}`",
         f"📁 Path: `{path}`",
         f"━━━━━━━━━━━━━━━━━━━━",
-        f"📦 JS bundles: `{js_cnt}` | Mode: {js_mode}",
+        f"📦 JS bundles: `{js_cnt}` | Inline scripts: `{inline_cnt}` | {js_mode}",
         f"📊 Patterns: `{len(_KD_PATTERNS)}` | Hits: `{total_hits}`",
         "",
     ]
@@ -16215,6 +16656,8 @@ def _keydump_keyboard(uid: int) -> InlineKeyboardMarkup:
 # Global keydump result cache (per uid)
 _kd_cache: dict = {}   # {uid: result_dict}
 
+
+@user_guard
 async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/keydump <url> — Comprehensive key/token extractor (HTML + JS + Dynamic)"""
     if not context.args:
@@ -16401,6 +16844,7 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── /kdexport shortcut ────────────────────────────────────────
+@user_guard
 async def cmd_kdexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/kdexport — Export last keydump result as JSON"""
     uid    = update.effective_user.id
