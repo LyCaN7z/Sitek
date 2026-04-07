@@ -2712,65 +2712,218 @@ def download_website(
 # ══════════════════════════════════════════════════
 
 _TECH_SIGNATURES = {
-    # CMS
-    "WordPress":        [r'wp-content/', r'wp-includes/', r'wordpress'],
-    "Drupal":           [r'Drupal\.settings', r'/sites/default/files/'],
-    "Joomla":           [r'/media/joomla_', r'Joomla!'],
-    "Ghost CMS":        [r'ghost\.io', r'/ghost/api/'],
-    "Shopify":          [r'cdn\.shopify\.com', r'Shopify\.theme'],
-    # JS Frameworks
-    "Next.js":          [r'__NEXT_DATA__', r'/_next/static/'],
-    "Nuxt.js":          [r'__NUXT__', r'/_nuxt/'],
-    "React":            [r'__reactFiber', r'react-dom\.production'],
-    "Vue.js":           [r'__vue__', r'data-v-[a-f0-9]+'],
-    "Angular":          [r'ng-version=', r'angular\.min\.js'],
-    "Svelte":           [r'__svelte', r'svelte-'],
-    # Servers
-    "Nginx":            [r'server:\s*nginx'],
-    "Apache":           [r'server:\s*apache'],
-    "Caddy":            [r'server:\s*caddy'],
-    "LiteSpeed":        [r'server:\s*litespeed'],
-    "IIS":              [r'server:\s*microsoft-iis'],
-    # CDN / WAF
-    "Cloudflare":       [r'cf-ray', r'server:\s*cloudflare'],
-    "Akamai":           [r'x-akamai-request-id', r'akamai\.net'],
-    "Fastly":           [r'x-fastly-request-id', r'fastly\.net'],
-    "AWS CloudFront":   [r'x-amz-cf-id', r'cloudfront\.net'],
-    # Analytics / Tag
-    "Google Analytics": [r'google-analytics\.com/analytics\.js', r'gtag\('],
-    "Google Tag Manager":[r'googletagmanager\.com/gtm\.js', r'GTM-[A-Z0-9]+'],
-    "Hotjar":           [r'hotjar\.com', r'hj\(\'create\''],
-    # Libraries
-    "jQuery":           [r'jquery\.min\.js', r'jquery-[0-9]'],
-    "Bootstrap":        [r'bootstrap\.min\.css', r'bootstrap\.min\.js'],
-    "Tailwind":         [r'tailwindcss', r'class="[^"]*(?:flex|grid|text-[a-z]+-[0-9])'],
-    # Backend
-    "PHP":              [r'x-powered-by:\s*php', r'\.php'],
-    "Laravel":          [r'laravel_session', r'x-powered-by:\s*php.*laravel'],
-    "Django":           [r'csrfmiddlewaretoken', r'django'],
-    "Rails":            [r'x-powered-by:\s*phusion passenger', r'_rails_'],
-    "ASP.NET":          [r'x-powered-by:\s*asp\.net', r'__viewstate'],
-    # DB / Backend hints
-    "WordPress (WooCommerce)": [r'woocommerce', r'wc-api/'],
-    "Stripe":           [r'stripe\.com/v3', r'Stripe\('],
-    "Firebase":         [r'firebaseapp\.com', r'firebase\.initializeApp'],
-    "Supabase":         [r'supabase\.co', r'supabaseClient'],
+    # ── CMS ──────────────────────────────────────────
+    "WordPress":             [r'wp-content/', r'wp-includes/', r'wordpress', r'wp-json/'],
+    "WordPress+WooCommerce": [r'woocommerce', r'wc-api/', r'wc/v3/'],
+    "Drupal":                [r'Drupal\.settings', r'/sites/default/files/', r'drupal\.js'],
+    "Joomla":                [r'/media/joomla_', r'Joomla!', r'/components/com_'],
+    "Ghost CMS":             [r'ghost\.io', r'/ghost/api/', r'content-api\.ghost\.org'],
+    "Shopify":               [r'cdn\.shopify\.com', r'Shopify\.theme', r'myshopify\.com'],
+    "Magento":               [r'Mage\.', r'/skin/frontend/', r'mage/cookies'],
+    "Prestashop":            [r'prestashop', r'/modules/blockcart/'],
+    "OpenCart":              [r'route=common/home', r'openCart'],
+    "TYPO3":                 [r'typo3/', r'typo3conf/'],
+    "Wix":                   [r'wix\.com', r'static\.parastorage\.com', r'wixstatic\.com'],
+    "Squarespace":           [r'squarespace\.com', r'static1\.squarespace'],
+    "Webflow":               [r'webflow\.com', r'uploads-ssl\.webflow'],
+    "Contentful":            [r'contentful\.com', r'ctfassets\.net'],
+    "Strapi":                [r'strapi', r'/admin/strapi'],
+    "Craft CMS":             [r'craft-csrf-token', r'/cpresources/'],
+    "HubSpot CMS":           [r'hubspot\.com/hs/', r'js\.hs-scripts'],
+    "Sitecore":              [r'sitecore', r'/sitecore/shell/'],
+    "Umbraco":               [r'umbraco', r'/umbraco/api/'],
+    # ── JS Frameworks ────────────────────────────────
+    "Next.js":               [r'__NEXT_DATA__', r'/_next/static/', r'next/dist/'],
+    "Nuxt.js":               [r'__NUXT__', r'/_nuxt/', r'nuxt\.min\.js'],
+    "React":                 [r'__reactFiber', r'react-dom\.production', r'react\.development'],
+    "Vue.js":                [r'__vue__', r'data-v-[a-f0-9]+', r'vue\.runtime'],
+    "Angular":               [r'ng-version=', r'angular\.min\.js', r'ng-app='],
+    "Svelte":                [r'__svelte', r'svelte-', r'svelte/internal'],
+    "Gatsby":                [r'___gatsby', r'/gatsby-', r'gatsby-config'],
+    "Remix":                 [r'__remixContext', r'@remix-run'],
+    "Astro":                 [r'astro-island', r'astro:page-load'],
+    "SvelteKit":             [r'__sveltekit_', r'_app/immutable/'],
+    "Ember.js":              [r'ember-application', r'Ember\.VERSION'],
+    "Alpine.js":             [r'x-data=', r'alpinejs'],
+    "HTMX":                  [r'hx-get=', r'hx-post=', r'htmx\.org'],
+    "Stimulus":              [r'stimulus', r'data-controller='],
+    "Inertia.js":            [r'inertia', r'@inertiajs/'],
+    # ── JS Libraries ─────────────────────────────────
+    "jQuery":                [r'jquery\.min\.js', r'jquery-[0-9]'],
+    "Bootstrap":             [r'bootstrap\.min\.css', r'bootstrap\.min\.js'],
+    "Tailwind CSS":          [r'tailwindcss', r'cdn\.tailwindcss\.com'],
+    "Lodash":                [r'lodash\.min\.js', r'_\.chunk\('],
+    "Axios":                 [r'axios\.min\.js', r'axios\.create\('],
+    "D3.js":                 [r'd3\.min\.js', r'd3-selection'],
+    "Chart.js":              [r'chart\.min\.js', r'Chart\.register'],
+    # ── Servers ──────────────────────────────────────
+    "Nginx":                 [r'server:\s*nginx'],
+    "Apache":                [r'server:\s*apache'],
+    "Caddy":                 [r'server:\s*caddy'],
+    "LiteSpeed":             [r'server:\s*litespeed'],
+    "IIS (Microsoft)":       [r'server:\s*microsoft-iis'],
+    "OpenResty":             [r'server:\s*openresty'],
+    "Gunicorn":              [r'server:\s*gunicorn'],
+    "uWSGI":                 [r'server:\s*uwsgi'],
+    "Kestrel (.NET)":        [r'server:\s*kestrel'],
+    "Tomcat":                [r'server:\s*apache-coyote', r'apache tomcat'],
+    # ── CDN / WAF ────────────────────────────────────
+    "Cloudflare":            [r'cf-ray', r'server:\s*cloudflare', r'__cf_bm'],
+    "Cloudflare WAF":        [r'cf-mitigated', r'cloudflare-nginx'],
+    "Akamai":                [r'x-akamai-request-id', r'akamai\.net'],
+    "Fastly":                [r'x-fastly-request-id', r'fastly\.net'],
+    "AWS CloudFront":        [r'x-amz-cf-id', r'cloudfront\.net'],
+    "AWS ALB":               [r'x-amzn-requestid', r'x-amzn-trace-id'],
+    "Vercel":                [r'x-vercel-id', r'vercel\.app'],
+    "Netlify":               [r'x-nf-request-id', r'netlify\.app'],
+    "Render":                [r'rndr-id', r'onrender\.com'],
+    "Railway":               [r'railway\.app'],
+    "Heroku":                [r'x-request-id.*heroku', r'herokuapp\.com'],
+    "Sucuri WAF":            [r'x-sucuri-id', r'sucuri\.net'],
+    "Imperva/Incapsula":     [r'x-iinfo', r'incapsula', r'visid_incap_'],
+    "Varnish":               [r'x-varnish', r'via.*varnish'],
+    "BunnyCDN":              [r'bunnycdn', r'b-cdn\.net'],
+    # ── Analytics / Marketing ────────────────────────
+    "Google Analytics 4":    [r'G-[A-Z0-9]{8,12}', r'gtag\('],
+    "Google Analytics UA":   [r'UA-\d{5,12}-\d', r'google-analytics\.com'],
+    "Google Tag Manager":    [r'GTM-[A-Z0-9]+', r'googletagmanager\.com/gtm\.js'],
+    "Google Ads":                 (r"\b(AW-\d{8,12})\b", "📊"),
+    "Hotjar":                [r'hotjar\.com', r'hjid'],
+    "Mixpanel":              [r'mixpanel\.init', r'mixpanel\.com/lib'],
+    "Amplitude":             [r'amplitude\.getInstance', r'cdn\.amplitude\.com'],
+    "Heap":                  [r'heap\.load', r'heapanalytics\.com'],
+    "Segment":               [r'analytics\.load', r'cdn\.segment\.com'],
+    "Facebook Pixel":        [r'fbq\(', r'connect\.facebook\.net/en_US/fbevents'],
+    "TikTok Pixel":               (r"ttq\.load.{0,10}([A-Z0-9]{15,20})", "📱"),
+    "LinkedIn Insight":      [r'snap\.licdn\.com', r'_linkedin_partner_id'],
+    "Clarity (Microsoft)":   [r'clarity\.ms', r'clarity\('],
+    "FullStory":             [r'fullstory\.com/s/fs\.js'],
+    # ── Live Chat ────────────────────────────────────
+    "Intercom":              [r'intercom\.io', r'widget\.intercom\.io'],
+    "HubSpot Chat":          [r'js\.hs-scripts\.com', r'hubspot\.com/hs/'],
+    "Drift":                 [r'js\.drift\.com', r'driftt\.com'],
+    "Zendesk":               [r'zopim', r'zendesk\.com/embeddable'],
+    "Crisp":                 [r'crisp\.chat', r'client\.crisp\.chat'],
+    "Tawk.to":               [r'tawk\.to', r'embed\.tawk\.to'],
+    "Freshchat":             [r'wchat\.freshchat\.com'],
+    # ── Backend / Language ───────────────────────────
+    "PHP":                   [r'x-powered-by:\s*php', r'\.php\b', r'PHPSESSID'],
+    "Laravel":               [r'laravel_session', r'laravel_token', r'XSRF-TOKEN'],
+    "Symfony":               [r'symfony', r'_symfony_'],
+    "CakePHP":               [r'cakephp', r'CAKEPHP'],
+    "CodeIgniter":           [r'ci_session', r'codeigniter'],
+    "Django":                [r'csrfmiddlewaretoken', r'django'],
+    "Flask":                 [r'werkzeug', r'flask-session'],
+    "FastAPI":               [r'fastapi'],
+    "Rails":                 [r'_rails_', r'authenticity_token', r'rails-ujs'],
+    "ASP.NET":               [r'x-powered-by:\s*asp\.net', r'__viewstate', r'__eventvalidation'],
+    "ASP.NET Core":          [r'x-powered-by:\s*asp\.net core', r'\.blazor'],
+    "Spring (Java)":         [r'x-application-context', r'spring'],
+    "Go (Gin/Echo)":         [r'server:\s*gin', r'server:\s*echo'],
+    "Node.js":               [r'x-powered-by:\s*node', r'connect\.sid'],
+    "Express.js":            [r'x-powered-by:\s*express'],
+    "NestJS":                [r'nestjs'],
+    ".NET Blazor":           [r'_blazor', r'blazor\.webassembly'],
+    # ── Auth / Identity ──────────────────────────────
+    "Auth0":                 [r'auth0\.com', r'auth0\.js'],
+    "Okta":                  [r'okta\.com', r'okta-signin'],
+    "Firebase Auth":         [r'firebase\.auth\(\)', r'firebaseapp\.com'],
+    "Keycloak":              [r'keycloak\.js', r'/auth/realms/'],
+    "Clerk":                 [r'clerk\.dev', r'clerk\.browser\.js'],
+    "Supabase":              [r'supabase\.co', r'supabaseClient'],
+    # ── Payment ──────────────────────────────────────
+    "Stripe":                [r'stripe\.com/v3', r'Stripe\(', r'js\.stripe\.com'],
+    "PayPal":                [r'paypal\.com/sdk', r'paypalobjects\.com'],
+    "Braintree":             [r'braintreegateway\.com', r'Braintree\.setup'],
+    "Square":                [r'squareup\.com', r'Square\.paymentForm'],
+    "Razorpay":              [r'razorpay\.com', r'Razorpay\('],
+    # ── Captcha ──────────────────────────────────────
+    "reCAPTCHA":             [r'recaptcha/api\.js', r'g-recaptcha'],
+    "hCaptcha":              [r'hcaptcha\.com/1/api\.js', r'h-captcha'],
+    "Cloudflare Turnstile":  [r'challenges\.cloudflare\.com', r'cf-turnstile'],
+    # ── Monitoring ───────────────────────────────────
+    "Sentry":                [r'sentry\.io', r'sentry\.min\.js', r'Sentry\.init'],
+    "Datadog RUM":           [r'datadoghq\.com', r'datadog-rum'],
+    "New Relic":             [r'newrelic\.com', r'nr-data\.net'],
+    # ── Services / APIs ──────────────────────────────
+    "GraphQL":               [r'/graphql', r'__typename', r'IntrospectionQuery'],
+    "Apollo GraphQL":        [r'apollo-client', r'ApolloClient'],
+    "Prisma":                [r'prisma\.io', r'@prisma/client'],
+    "Socket.io":             [r'socket\.io/socket\.io\.js'],
+    "Firebase":              [r'firebaseapp\.com', r'firebase\.initializeApp'],
+    "Supabase DB":           [r'supabase\.co', r'supabaseClient'],
+    "Elasticsearch":         [r'x-elastic-product', r'elastic\.co'],
+    "Pusher":                [r'pusher\.com', r'pusherapp\.com'],
+    "Twilio":                [r'twilio\.com', r'twilio\.js'],
+    "Cloudinary":            [r'res\.cloudinary\.com', r'cloudinary\.com/video'],
+    "Swagger UI":            [r'swagger-ui', r'swaggerUi'],
+    # ── Build Tools ──────────────────────────────────
+    "Webpack":               [r'webpackChunk', r'__webpack_require__'],
+    "Vite":                  [r'/@vite/', r'vite/client'],
+    "PWA":                   [r'serviceWorker\.register', r'workbox-'],
+    "tRPC":                  [r'trpc\.io', r'@trpc/'],
+}
+
+_TECH_CATEGORY = {
+    "CMS":              ["WordPress","WordPress+WooCommerce","Drupal","Joomla","Ghost CMS",
+                         "Shopify","Magento","Prestashop","OpenCart","TYPO3","Wix",
+                         "Squarespace","Webflow","Contentful","Strapi","Craft CMS",
+                         "HubSpot CMS","Sitecore","Umbraco"],
+    "JS Frameworks":    ["Next.js","Nuxt.js","React","Vue.js","Angular","Svelte","Gatsby",
+                         "Remix","Astro","SvelteKit","Ember.js","Alpine.js","HTMX",
+                         "Stimulus","Inertia.js"],
+    "JS Libraries":     ["jQuery","Bootstrap","Tailwind CSS","Lodash","Axios","D3.js","Chart.js"],
+    "Backend":          ["PHP","Laravel","Symfony","CakePHP","CodeIgniter","Django","Flask",
+                         "FastAPI","Rails","ASP.NET","ASP.NET Core","Spring (Java)","Go (Gin/Echo)",
+                         "Node.js","Express.js","NestJS",".NET Blazor"],
+    "Web Server":       ["Nginx","Apache","Caddy","LiteSpeed","IIS (Microsoft)","OpenResty",
+                         "Gunicorn","uWSGI","Kestrel (.NET)","Tomcat"],
+    "CDN / WAF":        ["Cloudflare","Cloudflare WAF","Akamai","Fastly","AWS CloudFront",
+                         "AWS ALB","Vercel","Netlify","Render","Railway","Heroku",
+                         "Sucuri WAF","Imperva/Incapsula","Varnish","BunnyCDN"],
+    "Analytics":        ["Google Analytics 4","Google Analytics UA","Google Tag Manager",
+                         "Google Ads","Hotjar","Mixpanel","Amplitude","Heap","Segment",
+                         "Facebook Pixel","TikTok Pixel","LinkedIn Insight",
+                         "Clarity (Microsoft)","FullStory"],
+    "Live Chat":        ["Intercom","HubSpot Chat","Drift","Zendesk","Crisp","Tawk.to","Freshchat"],
+    "Auth":             ["Auth0","Okta","Firebase Auth","Keycloak","Clerk","Supabase"],
+    "Payment":          ["Stripe","PayPal","Braintree","Square","Razorpay"],
+    "Captcha":          ["reCAPTCHA","hCaptcha","Cloudflare Turnstile"],
+    "Monitoring":       ["Sentry","Datadog RUM","New Relic"],
+    "Services / APIs":  ["GraphQL","Apollo GraphQL","Prisma","Socket.io","Firebase","Supabase DB",
+                         "Elasticsearch","Pusher","Twilio","Cloudinary","Swagger UI","tRPC"],
+    "Build Tools":      ["Webpack","Vite","PWA"],
 }
 
 _NOTABLE_HEADERS = [
     'server', 'x-powered-by', 'x-generator', 'x-framework',
-    'cf-ray', 'via', 'x-drupal-cache', 'x-varnish',
-    'x-shopify-stage', 'x-wix-request-id',
+    'cf-ray', 'cf-cache-status', 'via', 'x-drupal-cache', 'x-varnish',
+    'x-shopify-stage', 'x-wix-request-id', 'x-vercel-id', 'x-nf-request-id',
+    'x-amzn-requestid', 'x-amz-cf-id', 'x-request-id', 'x-correlation-id',
+    'x-ratelimit-limit', 'x-ratelimit-remaining', 'x-frame-options',
+    'content-security-policy', 'strict-transport-security', 'x-content-type-options',
+    'permissions-policy', 'access-control-allow-origin', 'x-elastic-product',
+    'x-application-context', 'x-aspnet-version', 'x-iinfo', 'rndr-id',
 ]
 
 async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/tech <url> — Detect technology stack"""
+    """/tech <url> — Deep technology stack fingerprinting (130+ signatures)"""
     if not context.args:
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/tech https://example.com`\n\n"
-            "🔬 *Detects:*  CMS, JS frameworks, servers, CDN/WAF,\n"
-            "analytics, backend tech, JS libraries & more.\n\n"
-            f"Checks `{len(_TECH_SIGNATURES)}` known tech signatures.",
+            "🔬 *Tech Stack Fingerprinter v2*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:* `/tech https://example.com/any/path`\n\n"
+            f"*{len(_TECH_SIGNATURES)} signatures across:*\n"
+            "  🗂 CMS (WordPress, Shopify, Drupal, Magento...)\n"
+            "  ⚡ JS Frameworks (React, Next.js, Vue, Angular...)\n"
+            "  🖥 Servers (Nginx, Apache, Caddy, IIS...)\n"
+            "  ☁️ CDN/WAF (Cloudflare, Vercel, Akamai...)\n"
+            "  📊 Analytics (GA4, GTM, Mixpanel, Hotjar...)\n"
+            "  🔐 Auth (Auth0, Okta, Firebase, Clerk...)\n"
+            "  💳 Payment (Stripe, PayPal, Razorpay...)\n"
+            "  🔧 Backend (PHP, Django, Rails, Laravel...)\n"
+            "  🧩 Services (GraphQL, Socket.io, Sentry...)\n\n"
+            "📡 Also scans: HTTP headers, cookies, JS bundles",
             parse_mode='Markdown'
         )
         return
@@ -2790,80 +2943,152 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
         return
 
-    msg = await update.effective_message.reply_text("🔬 Tech stack fingerprinting...")
+    domain = urlparse(url).hostname
+    path   = urlparse(url).path or "/"
+    msg    = await update.effective_message.reply_text(
+        f"🔬 *Tech Fingerprinting...*\n🌐 `{domain}`\n📁 `{path}`\n\n⏳",
+        parse_mode='Markdown'
+    )
 
     def _do_tech_scan():
-        resp = requests.get(
-            url, headers=_get_headers(), timeout=TIMEOUT, verify=False,
-            proxies=proxy_manager.get_proxy(), allow_redirects=True
-        )
-        body         = resp.text[:80000]
-        headers_str  = "\n".join(f"{k}: {v}" for k, v in resp.headers.items()).lower()
-        combined     = (body + headers_str).lower()
+        sess = requests.Session()
+        sess.headers.update(_get_headers())
+        proxy = proxy_manager.get_proxy()
+
+        # Fetch main page
+        resp = sess.get(url, timeout=TIMEOUT, verify=False,
+                        proxies=proxy, allow_redirects=True)
+        html         = resp.text
+        body_low     = html.lower()[:120000]
+        hdrs         = dict(resp.headers)
+        hdrs_str     = "\n".join(f"{k}: {v}" for k, v in hdrs.items()).lower()
+        combined_low = body_low + "\n" + hdrs_str
+        cookies_str  = " ".join(f"{c.name}={c.value}" for c in sess.cookies)
+        combined_low += "\n" + cookies_str.lower()
+
+        # Also scan linked JS bundles (first 5)
+        js_corpus = ""
+        soup_tech = BeautifulSoup(html, "html.parser")
+        js_fetched = 0
+        for tag in soup_tech.find_all("script", src=True):
+            if js_fetched >= 5:
+                break
+            js_url = urljoin(url, tag["src"])
+            try:
+                jr = sess.get(js_url, timeout=8, verify=False, proxies=proxy)
+                if jr.status_code == 200:
+                    js_corpus += jr.text[:50000].lower()
+                    js_fetched += 1
+            except Exception:
+                pass
+        combined_low += "\n" + js_corpus
 
         detected = {}
         for tech, patterns in _TECH_SIGNATURES.items():
             for p in patterns:
-                if re.search(p, combined, re.I):
-                    detected[tech] = p
-                    break
+                try:
+                    if re.search(p, combined_low, re.I):
+                        detected[tech] = True
+                        break
+                except Exception:
+                    pass
 
-        notable = {
-            k: v for k, v in resp.headers.items()
-            if k.lower() in _NOTABLE_HEADERS
-        }
-        return detected, notable, resp.status_code
+        notable = {k: v for k, v in hdrs.items()
+                   if k.lower() in _NOTABLE_HEADERS}
+        return detected, notable, resp.status_code, resp.url, js_fetched
 
     try:
-        detected, notable, status = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status, final_url, js_cnt = await asyncio.to_thread(_do_tech_scan)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
+                            parse_mode='Markdown')
         return
 
-    domain = urlparse(url).hostname
-    lines  = [f"🔬 *Tech Stack — `{domain}`*", f"Status: `{status}`\n"]
+    # ── Build report ──────────────────────────────
+    redirect_note = ""
+    if str(final_url).rstrip("/") != url.rstrip("/"):
+        redirect_note = f"\n↪️ Redirected: `{str(final_url)[:60]}`"
 
-    # Group by category
-    _CAT = {
-        "CMS":        ["WordPress","Drupal","Joomla","Ghost CMS","Shopify","WordPress (WooCommerce)"],
-        "JS Frameworks":["Next.js","Nuxt.js","React","Vue.js","Angular","Svelte"],
-        "JS Libraries": ["jQuery","Bootstrap","Tailwind"],
-        "Server":     ["Nginx","Apache","Caddy","LiteSpeed","IIS"],
-        "CDN / WAF":  ["Cloudflare","Akamai","Fastly","AWS CloudFront"],
-        "Analytics":  ["Google Analytics","Google Tag Manager","Hotjar"],
-        "Backend":    ["PHP","Laravel","Django","Rails","ASP.NET"],
-        "Services":   ["Stripe","Firebase","Supabase"],
+    lines = [
+        f"🔬 *Tech Stack Report*",
+        f"🌐 `{domain}` | `{status}`{redirect_note}",
+        f"📦 Signatures: `{len(_TECH_SIGNATURES)}` | JS bundles: `{js_cnt}`",
+        f"✅ Detected: `{len(detected)}` technologies",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    cat_icons = {
+        "CMS": "🗂", "JS Frameworks": "⚡", "JS Libraries": "📚",
+        "Backend": "🔧", "Web Server": "🖥", "CDN / WAF": "☁️",
+        "Analytics": "📊", "Live Chat": "💬", "Auth": "🔐",
+        "Payment": "💳", "Captcha": "🛡", "Monitoring": "👁",
+        "Services / APIs": "🧩", "Build Tools": "⚙️",
     }
 
     any_found = False
-    for cat, techs in _CAT.items():
+    for cat, techs in _TECH_CATEGORY.items():
         hits = [t for t in techs if t in detected]
-        if hits:
-            lines.append(f"*{cat}:*")
-            for h in hits:
-                lines.append(f"  ✅ `{h}`")
-            lines.append("")
-            any_found = True
+        if not hits:
+            continue
+        icon = cat_icons.get(cat, "•")
+        lines.append(f"{icon} *{cat}* `({len(hits)})`")
+        for h in hits:
+            lines.append(f"  ✅ `{h}`")
+        lines.append("")
+        any_found = True
 
-    # Uncategorised
-    known_all = {t for ts in _CAT.values() for t in ts}
-    extras    = [t for t in detected if t not in known_all]
+    # Any detected not in category
+    all_categorised = {t for ts in _TECH_CATEGORY.values() for t in ts}
+    extras = [t for t in detected if t not in all_categorised]
     if extras:
-        lines.append("*Other:*")
+        lines.append("🔍 *Other*")
         for t in extras:
             lines.append(f"  ✅ `{t}`")
         lines.append("")
         any_found = True
 
     if not any_found:
-        lines.append("⚠️ No known tech signatures matched.")
+        lines += [
+            "⚠️ *No known signatures matched*",
+            "",
+            "_Site may use:_",
+            "  • Custom/obscure framework",
+            "  • Heavy minification/obfuscation",
+            "  • Server-side rendering only",
+        ]
 
+    # Security headers check
+    sec_hdrs = {
+        "Strict-Transport-Security": "HSTS",
+        "Content-Security-Policy": "CSP",
+        "X-Frame-Options": "XFO",
+        "X-Content-Type-Options": "XCTO",
+        "Permissions-Policy": "Perms",
+        "Referrer-Policy": "Referrer",
+    }
+    missing_sec = [short for full, short in sec_hdrs.items()
+                   if full.lower() not in {k.lower() for k in notable}
+                   and full not in notable]
+    if missing_sec:
+        lines.append(f"⚠️ *Missing Security Headers:* `{'  '.join(missing_sec)}`")
+        lines.append("")
+
+    # Notable headers
     if notable:
-        lines.append("*📋 Notable Headers:*")
-        for k, v in list(notable.items())[:8]:
-            lines.append(f"  `{k}: {v[:60]}`")
+        lines.append("*📋 Key Headers:*")
+        for k, v in list(notable.items())[:10]:
+            lines.append(f"  `{k}`: `{v[:55]}`")
 
-    await msg.edit_text("\n".join(lines), parse_mode='Markdown')
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000:
+            await msg.edit_text(report, parse_mode='Markdown')
+        else:
+            await msg.edit_text(report[:4000] + "\n_...truncated_", parse_mode='Markdown')
+            await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
+    except Exception:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -4107,7 +4332,10 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain   = urlparse(url).hostname
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     wordlist = _FUZZ_PATHS if mode == 'paths' else _FUZZ_PARAMS
 
     msg = await update.effective_message.reply_text(
@@ -5039,7 +5267,10 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     msg = await update.effective_message.reply_text(
         f"🗂️ *Smart Fuzzer — `{domain}`*\n\n"
         "① Harvesting words from target...\n"
@@ -6001,8 +6232,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                     let m = src.match(/[?&]k=([A-Za-z0-9_-]{20,60})/);
                     if (m) {
                         const co = src.match(/[?&]co=([A-Za-z0-9%]+)/);
-                        const hl = src.match(/[?&]hl=([a-z\-]+)/);
-                        const v  = src.match(/[?&]v=([A-Za-z0-9_\-]+)/);
+                        const hl = src.match(/[?&]hl=([a-z-]+)/);
+                        const v  = src.match(/[?&]v=([A-Za-z0-9_-]+)/);
                         add(m[1], 'iframe src', 'reCAPTCHA v2', {
                             co: co ? decodeURIComponent(co[1]) : '',
                             hl: hl ? hl[1] : '',
@@ -6011,7 +6242,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         });
                     }
                     // hCaptcha
-                    m = src.match(/sitekey=([0-9a-f\-]{36})/i);
+                    m = src.match(/sitekey=([0-9a-f-]{36})/i);
                     if (m) add(m[1], 'iframe src', 'hCaptcha', {});
                 });
 
@@ -6054,8 +6285,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         const hcIframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
                         hcIframes.forEach(f => {
                             const src = f.src;
-                            const sk = src.match(/sitekey=([0-9a-f\-]{36})/i);
-                            const hl = src.match(/[?&]hl=([a-z\-]+)/i);
+                            const sk = src.match(/sitekey=([0-9a-f-]{36})/i);
+                            const hl = src.match(/[?&]hl=([a-z-]+)/i);
                             const theme = src.match(/[?&]theme=([a-z]+)/i);
                             if (sk) add(sk[1], 'hcaptcha iframe', 'hCaptcha', {
                                 hl:    hl ? hl[1] : '',
@@ -6075,7 +6306,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                             const scriptTexts = Array.from(document.querySelectorAll('script:not([src])'))
                                 .map(s => s.textContent).join('\n');
                             const execMatches = scriptTexts.matchAll(
-                                /grecaptcha\.execute\s*\(\s*['"]([A-Za-z0-9_\-]{20,60})['"]\s*,\s*\{[^}]*action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/g
+                                /grecaptcha\.execute\s*\(\s*['"]([A-Za-z0-9_-]{20,60})['"]\s*,\s*\{[^}]*action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/g
                             );
                             for (const m of execMatches) {
                                 add(m[1], 'grecaptcha.execute() call', 'reCAPTCHA v3', {action: m[2]});
@@ -6088,7 +6319,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 document.querySelectorAll('script:not([src])').forEach((s, i) => {
                     const t = s.textContent || '';
                     // v3 keys (start with 6)
-                    [...t.matchAll(/['"](6[A-Za-z0-9_\-]{39})['"]/g)].forEach(m => {
+                    [...t.matchAll(/['"](6[A-Za-z0-9_-]{39})['"]/g)].forEach(m => {
                         // Look for nearby action
                         const ctx = t.substring(Math.max(0, m.index-200), m.index+200);
                         const act = ctx.match(/action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/);
@@ -6099,11 +6330,11 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                         add(m[1], 'inline script #'+i+' (UUID)', 'hCaptcha', {});
                     });
                     // Turnstile 0x/1x keys
-                    [...t.matchAll(/['"]([01]x[A-Fa-f0-9_\-]{20,60})['"]/g)].forEach(m => {
+                    [...t.matchAll(/['"]([01]x[A-Fa-f0-9_-]{20,60})['"]/g)].forEach(m => {
                         add(m[1], 'inline script #'+i, 'Cloudflare Turnstile', {});
                     });
                     // Generic sitekey= assignments
-                    [...t.matchAll(/sitekey\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,60})['"]/gi)].forEach(m => {
+                    [...t.matchAll(/sitekey\s*[:=]\s*['"]([A-Za-z0-9_-]{20,60})['"]/gi)].forEach(m => {
                         add(m[1], 'inline script #'+i+' sitekey=', '', {});
                     });
                 });
@@ -6120,8 +6351,8 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                                 } else if (typeof v === 'object' && v !== null) {
                                     const js = JSON.stringify(v);
                                     [
-                                        ...js.matchAll(/"(?:sitekey|site_key|key)":"([A-Za-z0-9_\-]{20,60})"/g),
-                                        ...js.matchAll(/"(6[A-Za-z0-9_\-]{39})"/g),
+                                        ...js.matchAll(/"(?:sitekey|site_key|key)":"([A-Za-z0-9_-]{20,60})"/g),
+                                        ...js.matchAll(/"(6[A-Za-z0-9_-]{39})"/g),
                                         ...js.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi),
                                     ].forEach(m => add(m[1], 'window.'+k+' obj', '', {}));
                                 }
@@ -6212,77 +6443,215 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
     }
 
 def _sitekey_sync(url: str, progress_cb=None) -> dict:
-    """
-    Try Playwright (DevTools-style) first.
-    Falls back to requests-based static scan if Playwright not available.
-    """
-    # ── Try Playwright ─────────────────────────────
+    """Try Playwright first; fallback to static scan."""
     result = _sitekey_playwright(url, progress_cb)
     if result.get("error") == "playwright_not_installed":
-        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan သို့ fallback...")
+        if progress_cb: progress_cb("⚠️ Playwright not found — static scan fallback...")
         return _sitekey_static(url, progress_cb)
     return result
 
-
 def _sitekey_static(url: str, progress_cb=None) -> dict:
-    """Fallback: requests-based static HTML + JS scan (no browser)."""
+    """
+    v20: Static captcha scan.
+    FIX 1: Parses render=KEY from Google recaptcha script src URL.
+    Scans: script src URLs, data-sitekey attrs, HTML regex, 20 JS files,
+    __NEXT_DATA__, meta tags.
+    """
     session = requests.Session()
     session.headers.update(_get_headers())
 
-    if progress_cb: progress_cb("⬇️ Fetching page HTML (static)...")
+    if progress_cb: progress_cb("⬇️ Fetching HTML...")
     try:
-        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        resp.raise_for_status()
+        resp     = session.get(url, timeout=20, verify=False, allow_redirects=True)
         html     = resp.text
         page_url = resp.url
     except Exception as e:
-        return {"error": str(e), "findings": [], "page_url": url}
+        return {"error": str(e), "findings": [], "page_url": url, "js_fetched": 0,
+                "scan_methods": [], "diagnostics": [f"Fetch error: {e}"]}
 
-    final_parsed = urlparse(page_url)
-    base_origin  = f"{final_parsed.scheme}://{final_parsed.netloc}"
+    fp          = urlparse(page_url)
+    base_origin = f"{fp.scheme}://{fp.netloc}"
 
     def _resolve(src):
         if not src: return None
         src = src.strip()
-        if src.startswith('//'): return final_parsed.scheme + ':' + src
-        if src.startswith('http'): return src
-        if src.startswith('/'): return base_origin + src
-        base_path = final_parsed.path.rsplit('/', 1)[0]
-        return f"{base_origin}{base_path}/{src}"
+        if src.startswith("//"): return fp.scheme + ":" + src
+        if src.startswith("http"): return src
+        if src.startswith("/"): return base_origin + src
+        bp = fp.path.rsplit("/", 1)[0]
+        return f"{base_origin}{bp}/{src}"
 
-    soup = BeautifulSoup(html, 'html.parser')
+    soup         = BeautifulSoup(html, "html.parser")
+    findings     = []
+    seen_keys    = set()
+    scan_methods = []
+
+    def _add(cap_type, key, action, source):
+        key = (key or "").strip()
+        if not key or len(key) < 10:
+            return
+        dedup = cap_type + ":" + key
+        if dedup in seen_keys:
+            return
+        seen_keys.add(dedup)
+        ctx_action = action or ""
+        findings.append({
+            "type": cap_type, "site_key": key, "page_url": page_url,
+            "action": ctx_action, "source": source,
+            "invisible": False, "enterprise": False, "min_score": "",
+            "theme": "", "size": "", "badge": "", "s_param": "",
+            "hl": "", "co": "", "callback": "", "user_agent": "",
+        })
+
+    # ── Broad regex patterns ──────────────────────────────────────────────
+    _BROAD = [
+        (re.compile(r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA v3"),
+        (re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA v2"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA (generic)"),
+        (re.compile(r'siteKey\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,})["\']', re.I), "reCAPTCHA (generic)"),
+        (re.compile(r'render\s*:\s*["\']([6][A-Za-z0-9_\-]{39})["\']', re.I), "reCAPTCHA v3"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I), "hCaptcha"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,})["\']', re.I), "Cloudflare Turnstile"),
+        (re.compile(r'data-sitekey\s*=\s*["\']([01]x[0-9A-Fa-f_\-]{20,})["\']', re.I), "Cloudflare Turnstile"),
+        (re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I), "FunCaptcha"),
+        (re.compile(r'"gt"\s*:\s*"([0-9a-f]{32})"', re.I), "GeeTest"),
+    ]
+
+    def _scan_text(text, label):
+        for pat, cap_type in _BROAD:
+            for m in pat.finditer(text):
+                key = m.group(1)
+                ctx = text[max(0, m.start()-400):m.end()+400]
+                action = ""
+                am = re.search(r'action\s*:\s*["\']([a-zA-Z0-9_/]{2,60})["\']', ctx)
+                if am and am.group(1) not in ("get","set","use","new","add","key","id"):
+                    action = am.group(1)
+                _add(cap_type, key, action, label)
+        # reCAPTCHA v3 execute with action
+        for m in re.finditer(r'grecaptcha\.execute\s*\(\s*["\']([A-Za-z0-9_\-]{20,})["\']', text, re.I):
+            ctx = text[max(0, m.start()-300):m.end()+300]
+            action = ""
+            am = re.search(r',\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_/]{2,60})["\']', ctx)
+            if am: action = am.group(1)
+            _add("reCAPTCHA v3", m.group(1), action, f"grecaptcha.execute @ {label}")
+
+    # ── Method 1: Script src URL parsing (KEY FIX for reCAPTCHA v3) ─────────
+    scan_methods.append("Script src URL parsing")
+    for tag in soup.find_all("script", src=True):
+        src     = tag.get("src","")
+        src_full = _resolve(src) or src
+
+        if "google.com/recaptcha" in src or "recaptcha/api.js" in src or "recaptcha/enterprise.js" in src:
+            m = re.search(r"[?&]render=([A-Za-z0-9_\-]{20,60})", src)
+            if m:
+                _add("reCAPTCHA v3", m.group(1), "", f"Script src ?render= URL: {src[:100]}")
+            else:
+                scan_methods.append("reCAPTCHA script loaded (key not in src URL)")
+
+        if "hcaptcha.com" in src:
+            m = re.search(r"[?&](?:sitekey|s)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", src, re.I)
+            if m: _add("hCaptcha", m.group(1), "", f"hCaptcha src URL: {src[:100]}")
+
+        if "challenges.cloudflare.com" in src or "turnstile" in src.lower():
+            m = re.search(r"[?&](?:sitekey|k)=([0-9A-Za-z_\-]{20,60})", src, re.I)
+            if m: _add("Cloudflare Turnstile", m.group(1), "", f"Turnstile src URL: {src[:100]}")
+
+    # ── Method 2: data-sitekey HTML attributes ───────────────────────────────
+    scan_methods.append("HTML data-sitekey attributes")
+    for tag in soup.find_all(attrs={"data-sitekey": True}):
+        key = tag.get("data-sitekey","").strip()
+        if not key or len(key) < 10: continue
+        tag_str = str(tag)
+        if re.search(r"hcaptcha|h-captcha", tag_str, re.I) or re.match(r"[0-9a-f]{8}-[0-9a-f]{4}-", key, re.I):
+            _add("hCaptcha", key, "", "HTML data-sitekey")
+        elif re.search(r"turnstile|cf-turnstile", tag_str, re.I) or key.startswith(("0x","1x")):
+            _add("Cloudflare Turnstile", key, "", "HTML data-sitekey")
+        else:
+            _add("reCAPTCHA v2" if key.startswith("6L") else "CAPTCHA (unknown)", key, "", "HTML data-sitekey")
+
+    # ── Method 3: HTML text regex scan ──────────────────────────────────────
+    scan_methods.append("HTML text regex scan")
+    _scan_text(html, "HTML source")
+    for i, sc in enumerate(soup.find_all("script")):
+        if sc.string and sc.string.strip():
+            _scan_text(sc.string, f"Inline script #{i}")
+
+    # ── Method 4: Fetch & scan external JS files ─────────────────────────────
     js_seen, js_ordered = set(), []
-
-    def _add_js(u):
-        if u and u.startswith('http') and u not in js_seen:
+    for tag in soup.find_all("script", src=True):
+        u = _resolve(tag["src"])
+        if u and u.startswith("http") and u not in js_seen:
             js_seen.add(u); js_ordered.append(u)
 
-    for tag in soup.find_all('script', src=True):
-        _add_js(_resolve(tag['src']))
-
-    captcha_sigs_flat = [s for sigs in _CAPTCHA_SCRIPT_SIGS.values() for s in sigs]
+    _PRIO = ["recaptcha","hcaptcha","turnstile","funcaptcha","geetest",
+             "main","app","index","chunk","bundle","vendor"]
     def _prio(u):
         n = u.lower()
-        if any(s in n for s in captcha_sigs_flat): return 0
-        if any(k in n for k in ('main','app','index','chunk','bundle','vendor','runtime')): return 1
-        return 2
+        for i, sig in enumerate(_PRIO):
+            if sig in n: return i
+        return len(_PRIO)
 
-    fetch_list = sorted(js_ordered, key=_prio)[:15]
-
+    fetch_list = sorted(js_ordered, key=_prio)[:20]
     if progress_cb: progress_cb(f"📦 Fetching {len(fetch_list)} JS files...")
+    scan_methods.append(f"External JS scan ({len(fetch_list)} files)")
+
     js_sources = {}
     for js_url in fetch_list:
         try:
             r = session.get(js_url, timeout=10, verify=False)
-            if r.status_code == 200 and len(r.text) > 50:
-                js_sources[js_url] = r.text[:800_000]
+            if r.status_code == 200 and len(r.content) > 50:
+                js_sources[js_url] = r.text[:150_000]
         except Exception:
             pass
 
-    if progress_cb: progress_cb(f"🔍 Scanning {len(js_sources)} JS files...")
-    findings = _extract_captcha_info(html, page_url, js_sources)
-    return {"findings": findings, "page_url": page_url, "js_fetched": len(js_sources), "error": None}
+    for js_url, js_text in js_sources.items():
+        # Also parse render= in the JS file's src URL
+        m = re.search(r"[?&]render=([A-Za-z0-9_\-]{20,60})", js_url)
+        if m: _add("reCAPTCHA v3", m.group(1), "", f"JS src URL: {js_url[:80]}")
+        _scan_text(js_text, f"JS: {js_url[:70]}")
 
+    # ── Method 5: __NEXT_DATA__ JSON mining ──────────────────────────────────
+    scan_methods.append("__NEXT_DATA__ / window state mining")
+    for m in re.finditer(r'__NEXT_DATA__[^{]*({.{50,50000}})', html, re.S):
+        _scan_text(m.group(1), "__NEXT_DATA__ JSON")
+
+    # ── Method 6: Meta tags ──────────────────────────────────────────────────
+    scan_methods.append("Meta tag scan")
+    for meta in soup.find_all("meta"):
+        name = (meta.get("name","") + meta.get("property","")).lower()
+        content = meta.get("content","")
+        if ("captcha" in name or "recaptcha" in name or "sitekey" in name) and content and len(content) >= 20:
+            _add("CAPTCHA (meta tag)", content, "", f"Meta: {meta.get('name','')}")
+
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+    diagnostics = []
+    if not findings:
+        script_srcs = [tag.get("src","") for tag in soup.find_all("script", src=True)]
+        for src in script_srcs:
+            if "recaptcha" in src:
+                diagnostics.append(f"⚠️ Not detected via static scan (HTML/JS regex)")
+                diagnostics.append(f"⚠️ Not detected via script src URL parsing")
+                diagnostics.append(f"⚠️ reCAPTCHA script loaded: `{src[:80]}`")
+                diagnostics.append(f"💡 Key is in `?render=KEY` but script has no render param (v2 invisible?)")
+                diagnostics.append(f"💡 Install Playwright: `pip install playwright && playwright install chromium`")
+                break
+            elif "hcaptcha" in src:
+                diagnostics.append(f"⚠️ hCaptcha script loaded but sitekey not found in src URL")
+                diagnostics.append(f"💡 Try Playwright mode for DOM scan after full JS execution")
+                break
+        else:
+            diagnostics.append("⚠️ Not detected via static scan (HTML/JS)")
+            diagnostics.append("⚠️ Not detected via script src URL parsing")
+            diagnostics.append("⚠️ Not detected via data-sitekey attribute scan")
+            diagnostics.append("⚠️ Not detected via regex across all JS files")
+            diagnostics.append("💡 Page may show captcha only after user interaction")
+            diagnostics.append("💡 Try: Install Playwright for full JS rendering")
+
+    return {
+        "findings": findings, "page_url": page_url,
+        "js_fetched": len(js_sources), "scan_methods": scan_methods,
+        "diagnostics": diagnostics, "error": None,
+    }
 
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
@@ -6370,18 +6739,22 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     findings  = result["findings"]
     page_url  = result["page_url"]
-    js_count  = result["js_fetched"]
+    js_count  = result.get("js_fetched", 0)
 
-    # ─── No captcha found ───────────────────────
+    # ─── No captcha found — show diagnostics ────────────────────────────
     if not findings:
+        diag_lines = result.get("diagnostics", [])
+        methods    = result.get("scan_methods", [])
+        diag_text  = "\n".join(f"  {d}" for d in diag_lines) if diag_lines else "  ⚠️ Unknown reason"
+        meth_text  = " → ".join(methods[:4]) if methods else "static scan"
         await msg.edit_text(
             f"🔑 *Site Key Extractor — `{domain}`*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 *Captcha မတွေ့ပါ*\n\n"
             f"🌐 Page URL: `{page_url}`\n"
-            f"📡 Requests intercepted: `{js_count}`\n\n"
-            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
-            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
+            f"📡 Sources scanned: `{js_count}`\n"
+            f"🔬 Methods: _{meth_text}_\n\n"
+            f"*Diagnostics:*\n{diag_text}",
             parse_mode='Markdown'
         )
         return
@@ -6540,11 +6913,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
     """
-    Generic Playwright runner:
-    - Launches stealth browser
-    - Intercepts ALL network requests/responses
-    - Executes custom js_eval_code in page context after load
-    - Returns: {html, network_log, console_log, dom_result, page_url, error}
+    v20: networkidle wait + 2s extra + stealth enhanced + 30 JS files + bigger body capture
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -6552,7 +6921,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         return {"error": "playwright_not_installed", "html": "", "network_log": [],
                 "console_log": [], "dom_result": None, "page_url": url}
 
-    network_log  = []   # list of {url, method, post_data, response_body}
+    network_log  = []
     console_log  = []
     page_url_ref = [url]
 
@@ -6569,43 +6938,55 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
 
         browser = pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"]
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled",
+                  "--disable-web-security"],
         )
         ctx = browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"),
+                        "Chrome/123.0.0.0 Safari/537.36"),
             viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
             proxy=_pw_proxy,
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
-                "Sec-Fetch-Dest": "document",
-                "Sec-Fetch-Mode": "navigate",
+                "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest":  "document",
+                "Sec-Fetch-Mode":  "navigate",
+                "Sec-Fetch-Site":  "none",
+                "Sec-Fetch-User":  "?1",
             }
         )
+        # FIX 4: Enhanced stealth — navigator.webdriver, plugins, languages, chrome object
         ctx.add_init_script("""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-            window.chrome={runtime:{}};
+            Object.defineProperty(navigator, 'webdriver',   {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins',     {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages',   {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'platform',    {get: () => 'Win32'});
+            window.chrome = {runtime:{}, loadTimes:()=>{}, csi:()=>{}, app:{}};
         """)
+
         page = ctx.new_page()
 
         def _on_request(req):
             entry = {"url": req.url, "method": req.method, "post_data": "", "response_body": ""}
             try:
                 if req.post_data:
-                    entry["post_data"] = req.post_data[:2000]
+                    entry["post_data"] = req.post_data[:3000]
             except Exception:
                 pass
             network_log.append(entry)
 
         def _on_response(resp):
+            ct = resp.headers.get("content-type", "")
+            if not any(t in ct for t in ("javascript","json","text/html","text/plain")):
+                return
             for entry in network_log:
                 if entry["url"] == resp.url and not entry["response_body"]:
                     try:
                         body = resp.body()
-                        entry["response_body"] = body.decode("utf-8", errors="ignore")[:5000]
+                        entry["response_body"] = body.decode("utf-8", errors="ignore")[:120_000]
                     except Exception:
                         pass
                     break
@@ -6615,7 +6996,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         page.on("console",  lambda m: console_log.append(m.text))
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             page_url_ref[0] = page.url
         except PWTimeout:
             page_url_ref[0] = page.url
@@ -6624,32 +7005,45 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
             return {"error": str(e), "html": "", "network_log": [],
                     "console_log": [], "dom_result": None, "page_url": url}
 
+        # FIX 4: wait_for_load_state("networkidle") + 2000ms extra wait
+        if progress_cb: progress_cb("⏳ Waiting for JS (networkidle + 2s)...")
         try:
-            page.wait_for_load_state("networkidle", timeout=7_000)
+            page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
         try:
+            page.wait_for_timeout(2000)
+        except Exception:
+            pass
+        # Scroll to trigger lazy loads
+        try:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(800)
         except Exception:
             pass
 
-        # Fetch external JS via browser context (bypasses IP/geo blocks)
+        # Fetch up to 30 external JS files via browser context
+        if progress_cb: progress_cb("📦 Fetching JS bundles...")
         js_urls = []
         try:
             js_urls = page.evaluate("""() =>
                 [...document.querySelectorAll('script[src]')]
-                    .map(s=>s.src).filter(s=>s.startsWith('http'))
+                    .map(s => s.src).filter(s => s && s.startsWith('http'))
             """) or []
         except Exception:
             pass
-        for js_url in js_urls[:12]:
-            if not any(e["url"] == js_url and e["response_body"] for e in network_log):
+
+        fetched = {e["url"] for e in network_log if e.get("response_body")}
+        for js_url in js_urls[:30]:
+            if js_url not in fetched:
                 try:
-                    r = ctx.request.get(js_url, timeout=8000)
+                    r = ctx.request.get(js_url, timeout=10_000)
                     if r.ok:
-                        network_log.append({"url": js_url, "method": "GET",
-                                            "post_data": "", "response_body": r.text()[:80000]})
+                        network_log.append({
+                            "url": js_url, "method": "GET",
+                            "post_data": "",
+                            "response_body": r.text()[:120_000]
+                        })
                 except Exception:
                     pass
 
@@ -6676,122 +7070,78 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         "page_url":    page_url_ref[0],
     }
 
-
 def _static_extract(url: str) -> dict:
-    """Fallback: requests-based HTML + JS fetch (no browser)."""
+    """Fallback requests-based HTML+JS fetch. Fetches up to 30 JS files, prioritised."""
     session = requests.Session()
     session.headers.update(_get_headers())
     px = proxy_manager.get_proxy()
     if px:
         session.proxies.update(px)
     try:
-        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        html = resp.text
+        resp     = session.get(url, timeout=20, verify=False, allow_redirects=True)
+        html     = resp.text
         page_url = resp.url
     except Exception as e:
         return {"error": str(e), "html": "", "network_log": [], "page_url": url}
 
     from urllib.parse import urlparse as _up2
-    fp = _up2(page_url)
+    fp   = _up2(page_url)
     base = f"{fp.scheme}://{fp.netloc}"
     soup_s = BeautifulSoup(html, "html.parser")
-    network_log = []
+
+    js_seen, js_ordered = set(), []
     for tag in soup_s.find_all("script", src=True):
         src = tag["src"]
         if src.startswith("//"): src = fp.scheme + ":" + src
         elif src.startswith("/"): src = base + src
-        if src.startswith("http"):
-            try:
-                r2 = session.get(src, timeout=8, verify=False)
-                if r2.status_code == 200:
-                    network_log.append({"url": src, "method": "GET",
-                                        "post_data": "", "response_body": r2.text[:80000]})
-            except Exception:
-                pass
-    return {"error": None, "html": html, "network_log": network_log,
-            "console_log": [], "page_url": page_url}
+        if src.startswith("http") and src not in js_seen:
+            js_seen.add(src); js_ordered.append(src)
 
+    _PRIO = ["recaptcha","hcaptcha","turnstile","funcaptcha","geetest",
+             "stripe","paypal","braintree","square","razorpay","adyen","firebase",
+             "main","app","index","chunk","bundle","vendor","runtime"]
+    def _prio(u):
+        n = u.lower()
+        for i, sig in enumerate(_PRIO):
+            if sig in n: return i
+        return len(_PRIO)
+
+    network_log = []
+    for js_url in sorted(js_ordered, key=_prio)[:30]:
+        try:
+            r2 = session.get(js_url, timeout=10, verify=False)
+            if r2.status_code == 200 and len(r2.content) > 50:
+                network_log.append({"url": js_url, "method": "GET",
+                                    "post_data": "",
+                                    "response_body": r2.text[:120_000]})
+        except Exception:
+            pass
+
+    return {"error": None, "html": html, "network_log": network_log,
+            "console_log": [], "page_url": page_url, "dom_result": None}
 
 def _gather_all_text(data: dict) -> list:
-    """Return list of (text, source_label) from html + all JS."""
+    """Return list of (text, source_label) from html + all JS + POST bodies + console."""
     texts = []
     if data.get("html"):
         texts.append((data["html"], "HTML source"))
     for entry in data.get("network_log", []):
         if entry.get("response_body"):
-            texts.append((entry["response_body"], f"JS: {entry['url'][:70]}"))
+            texts.append((entry["response_body"], f"JS: {entry['url'][:80]}"))
         if entry.get("post_data"):
-            texts.append((entry["post_data"], f"POST → {entry['url'][:60]}"))
+            texts.append((entry["post_data"], f"POST -> {entry['url'][:60]}"))
     if data.get("console_log"):
         texts.append(("\n".join(data["console_log"]), "Console logs"))
     return texts
 
-
 def _extract_run(url: str, js_code: str, progress_cb=None) -> dict:
-    """Try Playwright first, fallback to static."""
+    """Try Playwright first; fallback to static requests scan."""
     if progress_cb: progress_cb("🌐 Launching browser...")
     data = _run_playwright_extract(url, js_code, progress_cb)
     if data.get("error") == "playwright_not_installed":
         if progress_cb: progress_cb("⚠️ Playwright not found — static scan fallback...")
         data = _static_extract(url)
     return data
-
-
-# ══════════════════════════════════════════════════
-# 🔑  1. /apikeys — API Key Extractor
-# ══════════════════════════════════════════════════
-
-_API_KEY_PATTERNS = [
-    # Google
-    ("Google Maps / Places / YouTube",  re.compile(r'\b(AIza[0-9A-Za-z_\-]{35})\b')),
-    # OpenAI
-    ("OpenAI",                           re.compile(r'\b(sk-[A-Za-z0-9]{20,60})\b')),
-    ("OpenAI Project key",               re.compile(r'\b(sk-proj-[A-Za-z0-9\-_]{40,120})\b')),
-    # AWS
-    ("AWS Access Key ID",                re.compile(r'\b(AKIA[0-9A-Z]{16})\b')),
-    ("AWS Secret Access Key",            re.compile(r'(?i)aws.{0,30}secret.{0,10}[=:\s]["\']?([A-Za-z0-9/+=]{40})\b')),
-    # Twilio
-    ("Twilio Account SID",               re.compile(r'\b(AC[a-f0-9]{32})\b')),
-    ("Twilio Auth Token",                re.compile(r'(?i)twilio.{0,30}auth.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
-    # SendGrid
-    ("SendGrid",                         re.compile(r'\b(SG\.[A-Za-z0-9_\-]{22,60}\.[A-Za-z0-9_\-]{22,60})\b')),
-    # Mapbox
-    ("Mapbox Token",                     re.compile(r'\b(pk\.eyJ1[A-Za-z0-9_\-\.]+)\b')),
-    # GitHub
-    ("GitHub Token",                     re.compile(r'\b(gh[pousr]_[A-Za-z0-9]{36,255})\b')),
-    # Slack
-    ("Slack Bot Token",                  re.compile(r'\b(xox[baprs]-[A-Za-z0-9\-]{20,200})\b')),
-    ("Slack Webhook",                    re.compile(r'(https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+)')),
-    # Mailchimp
-    ("Mailchimp API Key",                re.compile(r'\b([0-9a-f]{32}-us[0-9]{1,2})\b')),
-    # HubSpot
-    ("HubSpot API Key",                  re.compile(r'(?i)hubspot.{0,30}[=:\s]["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b')),
-    # Square
-    ("Square Access Token",              re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,43})\b')),
-    # Shopify
-    ("Shopify Storefront Token",         re.compile(r'(?i)shopify.{0,30}token.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
-    # Generic secret/api key patterns
-    ("Generic API Key",                  re.compile(r'(?i)(?:api[_\-]?key|apikey|api[_\-]?token|access[_\-]?key|secret[_\-]?key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
-]
-
-_APIKEY_JS_EVAL = """() => {
-    const results = {};
-    const kwds = ['apiKey','api_key','apikey','accessKey','secretKey','authToken',
-                  'OPENAI_API_KEY','GOOGLE_API_KEY','MAPBOX_TOKEN','AWS_ACCESS'];
-    kwds.forEach(k => {
-        try {
-            const v = window[k] || (window.__ENV__ && window.__ENV__[k])
-                     || (window._env_ && window._env_[k])
-                     || (window.ENV && window.ENV[k]);
-            if (v && typeof v === 'string' && v.length > 10) results[k] = v;
-        } catch(e) {}
-    });
-    // Also scan meta tags
-    document.querySelectorAll('meta[name*="key"],meta[name*="token"]').forEach(m=>{
-        if (m.content && m.content.length > 10) results['meta:'+m.name] = m.content;
-    });
-    return results;
-}"""
 
 def _apikeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _APIKEY_JS_EVAL, progress_cb)
@@ -7133,30 +7483,165 @@ _PAY_JS_EVAL = """() => {
 }"""
 
 def _paykeys_sync(url: str, progress_cb=None) -> dict:
-    data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
+    """
+    v20 ISOLATED payment key detector. Own fresh fetch — no shared state.
+    FIX 2: PayPal client-id from script src URL, Stripe from JS bundles,
+    __NEXT_DATA__, DOM data attrs, window globals.
+    """
+    _PAY_PATS = [
+        ("Stripe Publishable (LIVE)",  re.compile(r'\b(pk_live_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Publishable (TEST)",  re.compile(r'\b(pk_test_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Secret (LIVE)",       re.compile(r'\b(sk_live_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Secret (TEST)",       re.compile(r'\b(sk_test_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Restricted Key",      re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe Webhook Secret",      re.compile(r'\b(whsec_[A-Za-z0-9]{20,120})\b')),
+        ("Stripe PaymentIntent",       re.compile(r'\b(pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
+        ("Square App ID",              re.compile(r'\b(sq0idp-[A-Za-z0-9_\-]{22,50})\b')),
+        ("Square Access Token",        re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,50})\b')),
+        ("Razorpay (LIVE)",            re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,30})\b')),
+        ("Razorpay (TEST)",            re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,30})\b')),
+        ("Checkout.com Public Key",    re.compile(r'\b(pk_(?:sbox|prod|test|live)_[A-Za-z0-9]{20,80})\b')),
+        ("WooCommerce Consumer Key",   re.compile(r'\b(ck_[a-f0-9]{40})\b')),
+        ("WooCommerce Consumer Secret",re.compile(r'\b(cs_[a-f0-9]{40})\b')),
+        ("Braintree Sandbox",          re.compile(r'\b(sandbox_[a-z0-9]{8}_[a-z0-9]{32,})\b')),
+        ("Payment Key (generic)",      re.compile(r'(?i)(?:payment|merchant)[_\-]?(?:key|id|token)["\']?\s*[=:]\s*["\']([A-Za-z0-9_\-]{16,80})["\']')),
+    ]
+
+    _PAY_DOM_EVAL = """() => {
+        const res = {};
+        ['Stripe','STRIPE_PUBLISHABLE_KEY','NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY',
+         'NEXT_PUBLIC_STRIPE_KEY','REACT_APP_STRIPE_KEY','VITE_STRIPE_KEY',
+         '__STRIPE_CLIENT_KEY__','stripeKey','stripePublicKey',
+         'paypal','PAYPAL_CLIENT_ID','NEXT_PUBLIC_PAYPAL_CLIENT_ID',
+         'braintree','square','razorpay'].forEach(k => {
+            try {
+                const v = window[k];
+                if (v) res[k] = typeof v==='string' ? v : JSON.stringify(v).substring(0,400);
+            } catch(e) {}
+        });
+        // data attributes
+        document.querySelectorAll('[data-stripe-key],[data-publishable-key],[data-stripe-public-key]')
+            .forEach(el => {
+                ['data-stripe-key','data-publishable-key','data-stripe-public-key'].forEach(a => {
+                    const v = el.getAttribute(a);
+                    if (v) res['dom:'+a] = v;
+                });
+            });
+        // __NEXT_DATA__
+        try {
+            const nd = window.__NEXT_DATA__;
+            if (nd) {
+                const s = JSON.stringify(nd);
+                const m = s.match(/pk_(?:live|test)_[A-Za-z0-9]{20,120}/);
+                if (m) res['__NEXT_DATA__:stripe'] = m[0];
+            }
+        } catch(e) {}
+        return res;
+    }"""
+
+    if progress_cb: progress_cb("🌐 Fetching page + executing JS...")
+    data = _extract_run(url, _PAY_DOM_EVAL, progress_cb)
     if data.get("error"):
-        return {"error": data["error"], "findings": [], "page_url": url}
-    findings = []; seen = set()
-    def _add(t, v, src):
-        d = t+":"+v[:60]
-        if d not in seen and len(v) >= 6:
-            seen.add(d); findings.append({"type": t, "value": v, "source": src})
-    if progress_cb: progress_cb("🔍 Scanning for payment keys...")
+        return {"error": data["error"], "findings": [], "page_url": url,
+                "requests": 0, "scan_methods": [], "diagnostics": []}
+
+    findings     = []
+    seen         = set()
+    scan_methods = []
+    page_url     = data["page_url"]
+    html         = data.get("html","")
+
+    def _add(key_type, value, source):
+        value = (value or "").strip()
+        if not value or len(value) < 6: return
+        dedup = key_type + ":" + value[:80]
+        if dedup in seen: return
+        seen.add(dedup)
+        is_live = any(x in value.lower() for x in ("live","prod"))
+        is_test = any(x in value.lower() for x in ("test","sandbox","sbox"))
+        findings.append({
+            "type":   key_type, "value":  value, "source": source,
+            "env":    "🔴 LIVE" if is_live else ("🟡 TEST" if is_test else "❓"),
+        })
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Method 1: PayPal script src URL → client-id= param (KEY FIX)
+    scan_methods.append("PayPal script src URL param")
+    for tag in soup.find_all("script", src=True):
+        src = tag.get("src","")
+        if "paypal.com/sdk/js" in src or "paypalobjects.com" in src:
+            m = re.search(r"[?&]client-id=([A-Za-z0-9_\-]{10,120})", src)
+            if m: _add("PayPal Client ID", m.group(1), f"Script src: {src[:100]}")
+            m2 = re.search(r"[?&]merchant-id=([A-Za-z0-9_\-]{5,80})", src)
+            if m2: _add("PayPal Merchant ID", m2.group(1), f"Script src: {src[:100]}")
+
+    # Method 2: Stripe HTML data attributes
+    scan_methods.append("HTML data attributes (Stripe)")
+    for tag in soup.find_all(True):
+        for attr in ["data-stripe-key","data-publishable-key","data-stripe-public-key","data-key"]:
+            val = tag.get(attr,"")
+            if val and re.match(r"pk_(?:live|test)_", val):
+                _add("Stripe Publishable Key", val, f"HTML attr {attr}")
+
+    # Method 3: Regex across all text sources
+    scan_methods.append("HTML + JS regex scan")
     for text, label in _gather_all_text(data):
-        for key_type, pat in _PAY_PATTERNS:
+        for key_type, pat in _PAY_PATS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+
+    # Method 4: DOM window globals
+    scan_methods.append("DOM window globals")
     for k, v in (data.get("dom_result") or {}).items():
         s = str(v)
-        for key_type, pat in _PAY_PATTERNS:
+        for key_type, pat in _PAY_PATS:
             mm = pat.search(s)
             if mm:
-                val = mm.group(1) if mm.lastindex else mm.group(0)
-                _add(key_type, val, f"window.{k}")
-    return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+                _add(key_type, mm.group(1) if mm.lastindex else mm.group(0), f"window.{k}")
+        if re.match(r"pk_(?:live|test)_", s):
+            _add("Stripe Publishable Key", s[:120], f"window.{k}")
 
+    # Method 5: __NEXT_DATA__ deep scan
+    scan_methods.append("__NEXT_DATA__ JSON scan")
+    for m in re.finditer(r'__NEXT_DATA__[^{]*({.{100,100000}})', html, re.S):
+        blob = m.group(1)
+        for key_type, pat in _PAY_PATS:
+            for m2 in pat.finditer(blob):
+                _add(key_type, m2.group(1) if m2.lastindex else m2.group(0), "__NEXT_DATA__ JSON")
+        # PayPal client-id in JSON
+        for m2 in re.finditer(r'"client.?[Ii]d"\s*:\s*"([A-Za-z0-9_\-]{10,120})"', blob):
+            _add("PayPal Client ID", m2.group(1), "__NEXT_DATA__ JSON")
+
+    # Build diagnostics for not-found
+    diagnostics = []
+    if not findings:
+        net_urls = [e.get("url","") for e in data.get("network_log",[])]
+        has_stripe  = any("stripe" in u.lower() for u in net_urls)
+        has_paypal  = any("paypal" in u.lower() for u in net_urls)
+        methods_str = " | ".join(scan_methods)
+        if has_stripe:
+            diagnostics.append(f"⚠️ Not detected via: {methods_str}")
+            diagnostics.append("⚠️ Stripe JS (js.stripe.com) loaded — key not found yet")
+            diagnostics.append("💡 Key may be in server-rendered HTML only (SSR) or lazy chunk")
+            diagnostics.append("💡 Try: View page source → Ctrl+F → 'pk_live' or 'pk_test'")
+            diagnostics.append("💡 Or: DevTools → Network → filter 'stripe' → check request params")
+        elif has_paypal:
+            diagnostics.append("⚠️ PayPal SDK loaded but client-id not in script src URL")
+            diagnostics.append("💡 PayPal may use dynamic SDK injection (no static client-id)")
+        else:
+            diagnostics.append(f"⚠️ Not detected via: {methods_str}")
+            diagnostics.append("⚠️ No Stripe/PayPal scripts detected in network requests")
+            diagnostics.append("💡 Payment form may load only on checkout page, not this URL")
+            diagnostics.append("💡 Try scanning: /checkout, /cart, /payment URL directly")
+            diagnostics.append("💡 Or use /keydump for exhaustive deep scan")
+
+    return {
+        "error": None, "findings": findings, "page_url": page_url,
+        "requests": len(data.get("network_log",[])),
+        "scan_methods": scan_methods, "diagnostics": diagnostics,
+    }
 
 async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/paykeys <url> — Extract Stripe, PayPal, Braintree, Square, Razorpay payment keys"""
@@ -7209,9 +7694,18 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
+        diag_lines = result.get("diagnostics", [])
+        diag_text  = "\n".join(f"  {d}" for d in diag_lines) if diag_lines else "  ⚠️ Unknown reason"
+        reqs       = result.get("requests", 0)
+        methods    = " → ".join(result.get("scan_methods", [])[:4])
         await msg.edit_text(
             f"💳 *Payment Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No payment keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+            f"📭 *Payment key မတွေ့ပါ*\n\n"
+            f"🌐 `{page_url}`\n"
+            f"📡 Requests: `{reqs}`\n"
+            f"🔬 Methods: _{methods}_\n\n"
+            f"*Diagnostics:*\n{diag_text}",
+            parse_mode='Markdown')
         return
     lines = [f"💳 *Payment Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
@@ -7750,7 +8244,7 @@ _ENDPOINT_JS_EVAL = """() => {
             const v = eval(k);
             if (v) {
                 const s = JSON.stringify(v)||'';
-                const urls = s.match(/https?:\\/\\/[A-Za-z0-9._\\-\\/:?=&%]{10,150}/g)||[];
+                const urls = s.match(/https?:\\/\\/[A-Za-z0-9._\-\\/:?=&%]{10,150}/g)||[];
                 res['env_urls_'+k] = [...new Set(urls)].slice(0,20);
             }
         } catch(e) {}
@@ -12791,7 +13285,10 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain   = urlparse(url).hostname
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     wordlist = _FUZZ_PATHS if mode == 'paths' else _FUZZ_PARAMS
 
     msg = await update.effective_message.reply_text(
@@ -13723,7 +14220,10 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
-    base_url = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    # Full URL path preserved — do not strip to root
+    _pu = urlparse(url)
+    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
+    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
     msg = await update.effective_message.reply_text(
         f"🗂️ *Smart Fuzzer — `{domain}`*\n\n"
         "① Harvesting words from target...\n"
@@ -15503,6 +16003,892 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _send_admin_panel(query, db)
 
 
+
+# ══════════════════════════════════════════════════
+# 🔑  KEYDUMP ENGINE v18 — Flagship Key Extractor
+# ══════════════════════════════════════════════════
+
+
+import base64 as _b64
+import math
+
+
+# ─── Deep Scraper: HTML + JS bundles (used by keydump & key commands) ────────
+
+def _scrape_full(url: str, max_js: int = 15) -> dict:
+    """
+    Fetch target page + all linked JS bundles aggressively.
+    Handles: lazy-loaded scripts, webpack chunks, CDN-hosted JS,
+             inline scripts, meta-refresh redirects.
+    Returns: {html, headers, status, cookies, js_sources, all_text}
+    """
+    result = {
+        "html": "", "headers": {}, "status": 0,
+        "cookies": {}, "js_sources": [], "all_text": ""
+    }
+
+    # Browser-like headers to avoid bot blocks
+    browser_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,image/apng,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+    try:
+        sess = requests.Session()
+        sess.headers.update(browser_headers)
+        proxy = proxy_manager.get_proxy()
+
+        resp = sess.get(
+            url, timeout=20, verify=False,
+            allow_redirects=True, proxies=proxy
+        )
+        result["html"]    = resp.text
+        result["headers"] = dict(resp.headers)
+        result["status"]  = resp.status_code
+        result["cookies"] = {c.name: c.value for c in sess.cookies}
+
+        html_text = resp.text
+        base_url  = url
+
+        # ── Collect JS URLs ──────────────────────────────────────
+        js_urls = []
+        seen    = set()
+
+        def _add_js(raw_url):
+            if not raw_url:
+                return
+            # Skip data URIs and obvious non-JS
+            if raw_url.startswith("data:"):
+                return
+            full = urljoin(base_url, raw_url)
+            # Normalise — drop query for dedup key
+            key = full.split("?")[0]
+            if key in seen:
+                return
+            if not full.startswith("http"):
+                return
+            # Only JS / no-extension paths (could be bundled JS)
+            ext = key.rsplit(".", 1)[-1].lower() if "." in key.split("/")[-1] else ""
+            if ext in ("css", "png", "jpg", "jpeg", "gif", "svg", "ico",
+                       "woff", "woff2", "ttf", "eot", "map", "json"):
+                return
+            seen.add(key)
+            js_urls.append(full)
+
+        # 1. BeautifulSoup: <script src=...>
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+            for tag in soup.find_all("script", src=True):
+                _add_js(tag.get("src", ""))
+        except Exception:
+            pass
+
+        # 2. Regex: all quoted .js URLs (catches lazy-loaded / dynamic imports)
+        for m in re.finditer(
+            r'''["'`]((https?:)?//[^"'`\s<>]+?\.js(?:\?[^"'`\s<>]*)?)["'`]''',
+            html_text
+        ):
+            _add_js(m.group(1))
+
+        # 3. Regex: relative /static /assets /_next /js paths
+        for _js_m in re.finditer(
+            r'(?<=["\' ])(/(?:static|assets|js|_next|dist|build|chunks|bundles|public|_nuxt)[a-zA-Z0-9_./?=&%-]*\.js)',
+            html_text
+        ):
+            _add_js(_js_m.group(1))
+
+        # 4. Next.js / webpack chunk manifest patterns
+        for m in re.finditer(
+            r'"([^"]+\.js)":\s*(?:"[^"]*"|[0-9]+)',
+            html_text
+        ):
+            candidate = m.group(1)
+            if "/" in candidate and len(candidate) < 200:
+                _add_js(candidate)
+
+        # 5. importmap entries
+        for m in re.finditer(
+            r'"imports"\s*:\s*\{([^}]+)\}',
+            html_text
+        ):
+            for url_m in re.finditer(r'"([^"]+\.js[^"]*)"', m.group(1)):
+                _add_js(url_m.group(1))
+
+        # ── Fetch JS concurrently ────────────────────────────────
+        js_headers = {
+            "User-Agent": browser_headers["User-Agent"],
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": url,
+            "Sec-Fetch-Dest": "script",
+            "Sec-Fetch-Mode": "no-cors",
+            "Sec-Fetch-Site": "cross-site",
+        }
+
+        def _fetch_js(js_url: str):
+            try:
+                r = sess.get(
+                    js_url, timeout=12, verify=False,
+                    allow_redirects=True, proxies=proxy,
+                    headers=js_headers
+                )
+                if r.status_code == 200:
+                    ct = r.headers.get("Content-Type", "")
+                    # Accept JS and also text/plain (some CDNs serve it wrong)
+                    if any(x in ct for x in ("javascript", "text/plain", "application/")) \
+                            or js_url.endswith(".js"):
+                        text = r.text
+                        if len(text) > 10:   # Skip empty/1-line files
+                            return (js_url, text[:3_000_000])  # cap 3MB
+            except Exception:
+                pass
+            return None
+
+        limit = min(max_js, len(js_urls))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(_fetch_js, u) for u in js_urls[:limit]]
+            for fut in concurrent.futures.as_completed(futs, timeout=30):
+                try:
+                    res = fut.result(timeout=12)
+                    if res:
+                        result["js_sources"].append(res)
+                except Exception:
+                    pass
+
+    except Exception as e:
+        logger.debug("_scrape_full error: %s", e)
+
+    # ── Combine all text ─────────────────────────────────────────
+    parts = [result["html"]] + [js for _, js in result["js_sources"]]
+    result["all_text"] = "\n".join(parts)
+    return result
+
+
+    freq = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    ln = len(s)
+    return -sum((f/ln) * math.log2(f/ln) for f in freq.values())
+
+# ─── Master pattern registry (TruffleHog/Gitleaks style) ──────
+_KD_PATTERNS = {
+    # Cloud / Infra
+    "AWS Access Key ID": (r"(AKIA[0-9A-Z]{16}),                                                       ☁️", ),
+    "AWS Secret Access Key": (r"(?:aws_secret_access_key|AWS_SECRET).{0,20}([A-Za-z0-9+/]{40}), ☁️", ),
+    "AWS Session Token": (r"(ASIA[0-9A-Z]{16}),                                                        ☁️", ),
+    "GCP/Firebase API Key": (r"(AIza[0-9A-Za-z\-_]{20,}),                                               ☁️", ),
+    "GCP OAuth Client ID": (r"([0-9]{8,20}-[a-z0-9]{20,}\.apps\.googleusercontent\.com),             ☁️", ),
+    "DigitalOcean Token": (r"(dop_v1_[a-f0-9]{64}),                                                     ☁️", ),
+    # AI / ML
+    "OpenAI API Key": (r"(sk-[A-Za-z0-9T]{20,}),                                                    🤖", ),
+    "Anthropic Key": (r"(sk-ant-[A-Za-z0-9\-_]{40,}),                                            🤖", ),
+    "HuggingFace Token": (r"(hf_[A-Za-z0-9]{30,}),                                                     🤖", ),
+    "OpenAI Org": (r"(org-[A-Za-z0-9]{20,40}),                                                   🤖", ),
+    # Version Control
+    "GitHub PAT": (r"(ghp_[A-Za-z0-9]{36,}|gho_[A-Za-z0-9]{36,}|ghu_[A-Za-z0-9]{36,}),        📦", ),
+    "GitHub Actions Token": (r"(ghs_[A-Za-z0-9]{36,}|ghr_[A-Za-z0-9]{36,}),                              📦", ),
+    "GitLab Token": (r"(glpat-[A-Za-z0-9\-]{20,}),                                              📦", ),
+    "NPM Token": (r"(npm_[A-Za-z0-9]{36,}),                                                     📦", ),
+    # Communication
+    "Slack Bot Token": (r"(xoxb-[0-9]+-[0-9]+-[A-Za-z0-9]+),                                         📨", ),
+    "Slack User Token": (r"(xoxp-[0-9A-Za-z\-]{40,}),                                               📨", ),
+    "Slack App Token": (r"(xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-f0-9]+), 📨", ),
+    "Slack Webhook URL": (r"(https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+), 📨", ),
+    "Discord Webhook URL": (r"(https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+),        📨", ),
+    "Twilio Account SID": (r"(AC[a-f0-9]{32}), 📨", ),
+    "SendGrid API Key": (r"(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}),                         📨", ),
+    "Mailchimp API Key": (r"([0-9a-f]{32}-us\d{1,2}),                                                  📨", ),
+    "Mailgun API Key": (r"(key-[0-9a-zA-Z]{32}),                                                      📨", ),
+    # Payment
+    "Stripe Publishable Key": (r"(pk_(?:live|test)_[A-Za-z0-9]{20,}), 💳", ),
+    "Stripe Secret Key": (r"(sk_(?:live|test)_[A-Za-z0-9]{20,}), 💳", ),
+    "Stripe Webhook Secret": (r"(whsec_[A-Za-z0-9]{20,}),                                                   💳", ),
+    "Square App ID": (r"(sq0idp-[A-Za-z0-9_\-]{20,}),                                             💳", ),
+    "Razorpay Key": (r"(rzp_(?:live|test)_[A-Za-z0-9]{10,}),                                       💳", ),
+    "Braintree Key": (r"(?:sandbox|production)_[a-z0-9]{8}_[a-z0-9]{16}, 💳", ),
+    "Adyen API Key": (r"(AQE[a-zA-Z0-9+/]{40,}),                                                    💳", ),
+    # Firebase / Google
+    "Firebase API Key (context)": (r"(?i)(?:apiKey|api_key).{0,15}(AIza[0-9A-Za-z_-]{20,}), 🔥", ),
+    "Firebase API Key (raw)": (r"(AIza[0-9A-Za-z\-_]{30,}),                                               🔥", ),
+    "Firebase authDomain": (r"authDomain.{0,10}([a-z0-9-]+\.firebaseapp\.com), 🔥", ),
+    "Firebase projectId": (r"projectId.{0,10}([a-z0-9-]{4,40}), 🔥", ),
+    "Firebase storageBucket": (r"storageBucket.{0,10}([a-z0-9-]+\.appspot\.com), 🔥", ),
+    "Firebase messagingSenderId": (r"messagingSenderId.{0,10}(\d{8,15}), 🔥", ),
+    "Firebase appId": (r"appId.{0,10}([0-9:a-z-]{10,80}), 🔥", ),
+    "Firebase DB URL": (r"(https://[a-z0-9\-]+\.firebaseio\.com),                                  🔥", ),
+    "Firebase Storage URL": (r"(https://[a-z0-9\-]+\.appspot\.com),                                     🔥", ),
+    # Social / OAuth
+    "Facebook App ID": (r"(?:appId|fbAppId|fb_app_id)[^'\d]{0,15}(\d{10,18}),                    📱", ),
+    "Facebook Pixel ID": (r"fbq.{0,10}init.{0,10}(\d{10,18}), 📱", ),
+    "Facebook Access Token": (r"(EAAa[A-Za-z0-9]{50,}),                                                     📱", ),
+    "Google Client ID": (r"([0-9]{8,20}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com),             📱", ),
+    "TikTok Pixel": (r"ttq\.load.{0,10}([A-Z0-9]{15,20}), 📱", ),
+    "LinkedIn Partner ID": (r"_linkedin_partner_id.{0,10}(\d{5,12}), 📱", ),
+    # Analytics
+    "Google Analytics 4": (r"\b(G-[A-Za-z0-9]{8,12})\b,                                               📊", ),
+    "Google Analytics UA": (r"\b(UA-\d{5,12}-\d{1,3})\b,                                             📊", ),
+    "Google Tag Manager": (r"\b(GTM-[A-Za-z0-9]{6,8})\b,                                              📊", ),
+    "Google Ads": (r"\b(AW-\d{8,12})\b, 📊", ),
+    "Hotjar Site ID": (r"(?:hjid|hjsv).{0,20}(\d{5,12}), 📊", ),
+    "Mixpanel Token": (r"mixpanel.{0,30}([a-f0-9]{32}), 📊", ),
+    "Segment Write Key": (r"analytics\.load.{0,20}([A-Za-z0-9]{20,40}), 📊", ),
+    "Heap Analytics ID": (r"heap\.load.{0,10}(\d{8,12}), 📊", ),
+    # Captcha
+    "reCAPTCHA Sitekey": (r"data-sitekey=[']([ A-Za-z0-9_-]{20,60})['], 🔑", ),
+    "reCAPTCHA v3 render": (r"(?:render|execute).{0,10}([6L][A-Za-z0-9_-]{38}), 🔑", ),
+    "hCaptcha Sitekey": (r"hcaptcha.{0,30}([a-f0-9-]{36}), 🔑", ),
+    "Cloudflare Turnstile": (r"(0x[A-Za-z0-9]{10,40}),                                                     🔑", ),
+    # JWT / Auth
+    "JWT Token": (r"(eyJ[A-Za-z0-9\-_]{20,}\.eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{10,}), 🧬", ),
+    "JWT Secret (env)": (r"(?:JWT_SECRET|jwt_secret).{0,10}([^\s]{8,80}), 🧬", ),
+    # Secrets / Credentials
+    "Private Key PEM": (r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----),                    🔒", ),
+    "MongoDB URI": (r"(mongodb(?:\+srv)?://[^\s'<>]{10,200}),                                  🔒", ),
+    "PostgreSQL URI": (r"(postgres(?:ql)?://[^\s'<>]{10,200}),                                     🔒", ),
+    "MySQL URI": (r"(mysql(?:2)?://[^\s'<>]{10,200}),                                         🔒", ),
+    "Redis URI": (r"(rediss?://[^\s'<>]{10,150}),                                             🔒", ),
+    "Hardcoded Password": (r"(?:password|passwd|pwd)\s*[=:]\s*[']([ ^']{8,60})['], 🔒", ),
+    "Secret Key (env)": (r"(?:SECRET_KEY|secret_key).{0,10}([^\s']{12,80}), 🔒", ),
+    # Generic / Other
+    "Bearer Token": (r"[Bb]earer\s+([A-Za-z0-9\-_.]{20,200}),                                    🌐", ),
+    "API Key (env var)": (r"(?:api_key|apiKey|API_KEY)\s*[=:]\s*[']([ A-Za-z0-9_-]{20,80})['], 🌐", ),
+    "Mapbox Token": (r"(pk\.eyJ[A-Za-z0-9._\-]{20,}),                                             🌐", ),
+    "VAPID Public Key": (r"(?:vapidKey|applicationServerKey).{0,10}([A-Za-z0-9_-]{86,90}), 🔔", ),
+    "SSH Private Key": (r"(ssh-rsa AAAA[A-Za-z0-9+/]{30,}),                                           🔒", ),
+}
+
+_KD_CATEGORIES = {
+    "☁️": "Cloud & Infra",
+    "🤖": "AI / ML",
+    "📦": "Version Control / DevOps",
+    "📨": "Communication & Messaging",
+    "💳": "Payment Gateways",
+    "🔥": "Firebase / Google",
+    "📱": "Social / OAuth",
+    "📊": "Analytics & Tracking",
+    "🔑": "Captcha Keys",
+    "🧬": "JWT Tokens",
+    "🔒": "Secrets & Credentials",
+    "🌐": "Generic / Other",
+    "🔔": "Push Notifications",
+}
+
+# ─── High-entropy string finder ───────────────────────────────
+def _find_high_entropy(text: str, threshold: float = 4.5) -> list:
+    """Find high-entropy strings (> threshold) — likely secrets."""
+    candidates = []
+    # Scan quoted strings
+    for m in re.finditer(r'["\']([A-Za-z0-9+/=_\-]{20,120})["\']', text):
+        s = m.group(1)
+        ent = _entropy(s)
+        if ent >= threshold:
+            candidates.append({"value": s, "entropy": round(ent, 2)})
+    # Deduplicate
+    seen = set()
+    out  = []
+    for c in candidates:
+        if c["value"] not in seen:
+            seen.add(c["value"])
+            out.append(c)
+    return sorted(out, key=lambda x: -x["entropy"])[:20]
+
+# ─── Source map fetcher ───────────────────────────────────────
+def _fetch_source_maps(js_sources: list, base_url: str) -> list:
+    """
+    Try to fetch .js.map files for each JS bundle.
+    Returns list of (js_url, map_content_text).
+    """
+    found = []
+    for js_url, _ in js_sources[:8]:
+        map_url = js_url + ".map"
+        try:
+            r = requests.get(map_url, timeout=8, verify=False,
+                             headers=_get_headers(),
+                             proxies=proxy_manager.get_proxy())
+            if r.status_code == 200 and "sourcesContent" in r.text:
+                found.append((js_url, r.text[:200_000]))
+        except Exception:
+            pass
+    return found
+
+# ─── Puppeteer-based dynamic scan (network request capture) ──
+_KD_INTERCEPT_JS = """
+const puppeteer = require('puppeteer');
+
+(async () => {
+    const url = process.argv[2];
+    const browser = await puppeteer.launch({
+        headless: 'new',
+        args: ['--no-sandbox','--disable-setuid-sandbox',
+               '--disable-dev-shm-usage','--disable-gpu']
+    });
+    const page = await browser.newPage();
+
+    const findings = {requests: [], storage: {}, cookies: []};
+
+    // Intercept all outgoing requests for auth headers
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+        const hdrs = req.headers();
+        const interestingHdrs = {};
+        for (const [k,v] of Object.entries(hdrs)) {
+            const kl = k.toLowerCase();
+            if (kl === 'authorization' || kl === 'x-api-key' ||
+                kl === 'x-auth-token' || kl.includes('token') || kl.includes('key')) {
+                interestingHdrs[k] = v;
+            }
+        }
+        if (Object.keys(interestingHdrs).length > 0) {
+            findings.requests.push({url: req.url().substring(0,120), headers: interestingHdrs});
+        }
+        req.continue();
+    });
+
+    try {
+        await page.goto(url, {waitUntil:'networkidle2', timeout:25000});
+    } catch(e) {}
+
+    // Extract localStorage + sessionStorage
+    const storage = await page.evaluate(() => {
+        const ls = {}, ss = {};
+        for(let i=0;i<localStorage.length;i++){
+            const k=localStorage.key(i);
+            ls[k]=localStorage.getItem(k);
+        }
+        for(let i=0;i<sessionStorage.length;i++){
+            const k=sessionStorage.key(i);
+            ss[k]=sessionStorage.getItem(k);
+        }
+        return {localStorage: ls, sessionStorage: ss};
+    });
+    findings.storage = storage;
+
+    // Cookies
+    findings.cookies = (await page.cookies()).map(c=>({name:c.name,value:c.value.substring(0,80)}));
+
+    await browser.close();
+    process.stdout.write(JSON.stringify(findings));
+})();
+"""
+
+def _run_puppeteer_keydump(url: str) -> dict:
+    """Run Puppeteer-based dynamic analysis. Returns findings dict."""
+    if not PUPPETEER_OK:
+        return {"requests": [], "storage": {}, "cookies": []}
+    try:
+        import tempfile, os as _os
+        # Write intercept script to temp file
+        tmp = tempfile.NamedTemporaryFile(suffix=".js", delete=False, mode="w")
+        tmp.write(_KD_INTERCEPT_JS)
+        tmp.close()
+
+        result = subprocess.run(
+            ["node", tmp.name, url],
+            capture_output=True, timeout=35, text=True, shell=False
+        )
+        _os.unlink(tmp.name)
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+    except Exception as e:
+        logger.debug("Puppeteer keydump error: %s", e)
+    return {"requests": [], "storage": {}, "cookies": []}
+
+
+# ─── Master keydump engine ────────────────────────────────────
+def _run_keydump_sync(url: str) -> dict:
+    """
+    Full synchronous keydump:
+    1. Static HTML + JS bundles scan
+    2. Source map extraction
+    3. High-entropy analysis
+    4. Cookie/storage via Puppeteer (if available)
+    Returns structured results dict.
+    """
+    out = {
+        "url":         url,
+        "js_count":    0,
+        "by_category": {},   # {emoji: {label: [values]}}
+        "high_entropy": [],
+        "source_maps":  [],
+        "dynamic":     {"requests": [], "storage": {}, "cookies": []},
+        "raw_hits":    {},   # {label: [values]}
+        "errors":      [],
+    }
+
+    # ── 1. Fetch static + JS bundles ──────────────────────────────
+    try:
+        data = _scrape_full(url, max_js=20)
+    except Exception as e:
+        out["errors"].append(f"Fetch error: {e}")
+        return out
+
+    if not data["html"]:
+        out["errors"].append("Page fetch failed — site may block bots")
+        return out
+
+    # Also extract inline <script> block content
+    inline_scripts = []
+    try:
+        soup_kd = BeautifulSoup(data["html"], "html.parser")
+        for tag in soup_kd.find_all("script"):
+            if not tag.get("src") and tag.string:
+                txt = tag.string.strip()
+                if len(txt) > 30:
+                    inline_scripts.append(txt)
+    except Exception:
+        pass
+
+    # Build full corpus: HTML + inline scripts + all JS bundle text
+    corpus_parts = [data["html"]] + inline_scripts + [
+        js for _, js in data["js_sources"]
+    ]
+    corpus        = "\n".join(corpus_parts)
+    out["js_count"] = len(data["js_sources"])
+    out["inline_scripts"] = len(inline_scripts)
+
+    # ── 2. Pattern scan (all 50+ patterns against full corpus) ────
+    for label, (pat, cat_icon) in _KD_PATTERNS.items():
+        try:
+            raw = re.findall(pat, corpus, re.IGNORECASE)
+        except Exception:
+            continue
+        flat = []
+        for m in raw:
+            if isinstance(m, tuple):
+                flat.extend([x.strip() for x in m if x and len(x) > 4])
+            else:
+                if m and len(m) > 4:
+                    flat.append(m.strip())
+        unique = list(dict.fromkeys(flat))[:8]
+        if unique:
+            out["raw_hits"][label] = unique
+            if cat_icon not in out["by_category"]:
+                out["by_category"][cat_icon] = {}
+            out["by_category"][cat_icon][label] = unique
+
+    # ── 3. High-entropy strings ────────────────────────────────
+    out["high_entropy"] = _find_high_entropy(corpus, threshold=4.5)
+
+    # ── 4. Source maps ─────────────────────────────────────────
+    try:
+        maps = _fetch_source_maps(data["js_sources"], url)
+        if maps:
+            # Scan source map content too
+            for js_url, map_text in maps:
+                for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                    try:
+                        raw = re.findall(pat, map_text, re.IGNORECASE)
+                    except Exception:
+                        continue
+                    flat = []
+                    for m in raw:
+                        if isinstance(m, tuple):
+                            flat.extend([x.strip() for x in m if x and len(x) > 4])
+                        else:
+                            if m and len(m) > 4:
+                                flat.append(m.strip())
+                    if flat:
+                        key = f"{label} (sourcemap)"
+                        if cat_icon not in out["by_category"]:
+                            out["by_category"][cat_icon] = {}
+                        existing = out["by_category"][cat_icon].get(key, [])
+                        out["by_category"][cat_icon][key] = list(dict.fromkeys(existing + flat[:4]))
+            out["source_maps"] = [js_url for js_url, _ in maps]
+    except Exception as e:
+        out["errors"].append(f"Sourcemap: {e}")
+
+    # ── 5. Dynamic via Puppeteer ───────────────────────────────
+    try:
+        dyn = _run_puppeteer_keydump(url)
+        out["dynamic"] = dyn
+
+        # Scan localStorage/sessionStorage values for keys
+        for store_name, store_data in dyn.get("storage", {}).items():
+            if not isinstance(store_data, dict):
+                continue
+            for k, v in store_data.items():
+                if not v:
+                    continue
+                for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                    try:
+                        if re.search(pat, str(v), re.IGNORECASE):
+                            key = f"{label} ({store_name})"
+                            if cat_icon not in out["by_category"]:
+                                out["by_category"][cat_icon] = {}
+                            if key not in out["by_category"][cat_icon]:
+                                out["by_category"][cat_icon][key] = []
+                            out["by_category"][cat_icon][key].append(f"{k}={str(v)[:60]}")
+                    except Exception:
+                        pass
+    except Exception as e:
+        out["errors"].append(f"Dynamic: {e}")
+
+    return out
+
+
+def _format_keydump_report(result: dict) -> tuple:
+    """
+    Returns (telegram_text: str, full_json: dict)
+    """
+    url      = result["url"]
+    domain   = urlparse(url).netloc
+    path     = urlparse(url).path or "/"
+    js_cnt   = result["js_count"]
+    cats     = result["by_category"]
+    entropy  = result["high_entropy"]
+    dyn      = result["dynamic"]
+    smaps    = result["source_maps"]
+
+    total_hits = sum(
+        len(v) for cat in cats.values() for v in cat.values()
+    )
+
+    # ── Header ─────────────────────────────────────────────────
+    js_mode      = "⚡ JS+Static+Dynamic" if PUPPETEER_OK else "📄 Static+JS"
+    inline_cnt   = result.get("inline_scripts", 0)
+    lines = [
+        f"🔑 *KeyDump v18 — Full Scan*",
+        f"🌐 `{domain}`",
+        f"📁 Path: `{path}`",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📦 JS bundles: `{js_cnt}` | Inline scripts: `{inline_cnt}` | {js_mode}",
+        f"📊 Patterns: `{len(_KD_PATTERNS)}` | Hits: `{total_hits}`",
+        "",
+    ]
+
+    if total_hits == 0 and not entropy and not dyn["requests"]:
+        lines += [
+            "✅ *Nothing exposed in source*",
+            "",
+            "_Keys may be: server-side only, env vars, or heavily obfuscated_",
+            "",
+            f"📌 Scanned: HTML + `{js_cnt}` JS files",
+            f"🔍 High-entropy strings: `{len(entropy)}`",
+        ]
+    else:
+        # Per-category results
+        for cat_icon, cat_name in _KD_CATEGORIES.items():
+            if cat_icon not in cats:
+                continue
+            cat_data = cats[cat_icon]
+            count = sum(len(v) for v in cat_data.values())
+            lines.append(f"{cat_icon} *{cat_name}* `({count})`")
+            for label, vals in cat_data.items():
+                lines.append(f"  ┌ *{label}*")
+                for v in vals[:3]:
+                    safe = v.replace("`", "'")
+                    lines.append(f"  └ `{safe[:70]}`")
+            lines.append("")
+
+        # Dynamic interception results
+        if dyn.get("requests"):
+            lines.append(f"🌐 *Network Intercepted Tokens* `({len(dyn['requests'])})`")
+            for req in dyn["requests"][:4]:
+                lines.append(f"  🔗 `{req['url'][:50]}`")
+                for hk, hv in req.get("headers", {}).items():
+                    lines.append(f"     `{hk}: {str(hv)[:50]}`")
+            lines.append("")
+
+        # Cookies with interesting values
+        interesting_cookies = [
+            c for c in dyn.get("cookies", [])
+            if any(k in c["name"].lower() for k in
+                   ["token","auth","session","key","jwt","access","secret","api"])
+        ]
+        if interesting_cookies:
+            lines.append(f"🍪 *Auth Cookies* `({len(interesting_cookies)})`")
+            for c in interesting_cookies[:5]:
+                lines.append(f"  `{c['name']}` = `{c['value'][:50]}`")
+            lines.append("")
+
+        # High-entropy
+        if entropy:
+            lines.append(f"🔬 *High-Entropy Strings* `(H>{4.5})` — `{len(entropy)}` found")
+            for item in entropy[:5]:
+                lines.append(
+                    f"  H=`{item['entropy']}` `{item['value'][:55]}`"
+                )
+            lines.append("")
+
+        # Source maps
+        if smaps:
+            lines.append(f"🗺 *Source Maps Found* `({len(smaps)})`")
+            for sm in smaps[:3]:
+                lines.append(f"  `{sm[-60:]}`")
+            lines.append("")
+
+    # Footer with action hint
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ _For authorized/security research use only_",
+        "",
+        f"💾 Reply with /kdexport to get full JSON report",
+    ]
+
+    return "\n".join(lines), result
+
+
+# ── Inline keyboard for keydump actions ──────────────────────
+def _keydump_keyboard(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📋 Show Raw", callback_data=f"kd_raw_{uid}"),
+            InlineKeyboardButton("🔬 Entropy", callback_data=f"kd_entropy_{uid}"),
+        ],
+        [
+            InlineKeyboardButton("💾 Export JSON", callback_data=f"kd_json_{uid}"),
+        ],
+    ])
+
+# Global keydump result cache (per uid)
+_kd_cache: dict = {}   # {uid: result_dict}
+
+async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/keydump <url> — Comprehensive key/token extractor (HTML + JS + Dynamic)"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🔑 *KeyDump v18 — Flagship Key Extractor*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:* `/keydump https://example.com/path/page`\n\n"
+            "*Scans ALL of the following at once:*\n"
+            f"• {len(_KD_PATTERNS)} regex patterns (TruffleHog/Gitleaks style)\n"
+            "• High-entropy string analysis (H > 4.5)\n"
+            "• Source map extraction (.js.map)\n"
+            "• Browser storage (localStorage, sessionStorage, cookies)\n"
+            "• Network request interception (Authorization headers)\n"
+            "• All linked JS bundles (up to 15 files)\n\n"
+            "*Categories scanned:*\n"
+            "☁️ Cloud  🔥 Firebase  💳 Payment  🧬 JWT\n"
+            "📱 Social  📊 Analytics  🔒 Secrets  📨 Comms\n\n"
+            f"⚡ Dynamic mode: {'✅ Puppeteer ready' if PUPPETEER_OK else '⚠️ Static only (npm install puppeteer)'}",
+            parse_mode="Markdown"
+        )
+        return
+
+    uid  = update.effective_user.id
+    raw  = context.args[0]
+    url  = raw if raw.startswith("http") else "https://" + raw
+
+    # ── Security checks ────────────────────────────────────────
+    ok, reason = is_safe_url(url)
+    if not ok:
+        await update.effective_message.reply_text(
+            f"🚫 `{reason}`", parse_mode="Markdown"); return
+
+    ok2, wait = check_rate_limit(uid)
+    if not ok2:
+        await update.effective_message.reply_text(
+            f"⏳ Rate limit — `{wait}s` စောင့်ပါ", parse_mode="Markdown"); return
+
+    domain = urlparse(url).netloc
+    path   = urlparse(url).path or "/"
+
+    msg = await update.effective_message.reply_text(
+        f"🔑 *KeyDump Scanning...*\n"
+        f"🌐 `{domain}`\n"
+        f"📁 `{path}`\n\n"
+        f"① HTML fetch + JS bundle crawl...\n"
+        f"② Pattern matching (`{len(_KD_PATTERNS)}` rules)...\n"
+        f"③ Entropy analysis...\n"
+        f"④ Source map check...\n"
+        f"{'⑤ Dynamic intercept (Puppeteer)...' if PUPPETEER_OK else '⑤ Dynamic: skipped (no Puppeteer)'}",
+        parse_mode="Markdown"
+    )
+
+    try:
+        result = await asyncio.to_thread(_run_keydump_sync, url)
+    except Exception as e:
+        await msg.edit_text(
+            f"❌ *KeyDump Error*\n`{type(e).__name__}: {str(e)[:100]}`",
+            parse_mode="Markdown")
+        return
+
+    # Cache result for export callbacks
+    _kd_cache[uid] = result
+
+    report, _ = _format_keydump_report(result)
+
+    total = sum(len(v) for cat in result["by_category"].values() for v in cat.values())
+    kb = _keydump_keyboard(uid) if total > 0 or result["high_entropy"] else None
+
+    try:
+        if len(report) <= 4000:
+            await msg.edit_text(report, parse_mode="Markdown",
+                                reply_markup=kb)
+        else:
+            await msg.edit_text(report[:4000] + "\n_...continued_",
+                                parse_mode="Markdown", reply_markup=kb)
+            await update.effective_message.reply_text(
+                report[4000:8000], parse_mode="Markdown")
+    except Exception:
+        await update.effective_message.reply_text(
+            report[:4000], parse_mode="Markdown")
+
+
+async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /keydump inline buttons: raw, entropy, json export"""
+    query = update.callback_query
+    await query.answer()
+    data = query.data   # kd_raw_UID | kd_entropy_UID | kd_json_UID
+
+    try:
+        parts  = data.split("_")
+        action = parts[1]                    # raw / entropy / json
+        uid    = int(parts[2])
+    except Exception:
+        return
+
+    # Only the requesting user can use the buttons
+    if query.from_user.id != uid:
+        await query.answer("🚫 သင်မဟုတ်ပါ", show_alert=True)
+        return
+
+    result = _kd_cache.get(uid)
+    if not result:
+        await query.answer("⚠️ Cache expired — /keydump ထပ်လုပ်ပါ", show_alert=True)
+        return
+
+    if action == "raw":
+        lines = ["📋 *Raw Findings*\n"]
+        for label, vals in result["raw_hits"].items():
+            lines.append(f"*{label}:*")
+            for v in vals[:4]:
+                lines.append(f"  `{v[:80]}`")
+            lines.append("")
+        text = "\n".join(lines) or "Nothing found"
+        try:
+            await query.edit_message_text(text[:4000], parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text(text[:4000], parse_mode="Markdown")
+
+    elif action == "entropy":
+        entropy = result.get("high_entropy", [])
+        if not entropy:
+            await query.answer("High-entropy strings မတွေ့ပါ", show_alert=True)
+            return
+        lines = [f"🔬 *High-Entropy Strings ({len(entropy)})*\n",
+                 "_H > 4.5 = likely secret/key_\n"]
+        for item in entropy[:15]:
+            lines.append(
+                f"H=`{item['entropy']}` `{item['value'][:65]}`"
+            )
+        try:
+            await query.edit_message_text(
+                "\n".join(lines), parse_mode="Markdown")
+        except Exception:
+            await query.message.reply_text(
+                "\n".join(lines)[:4000], parse_mode="Markdown")
+
+    elif action == "json":
+        # Export as JSON file
+        try:
+            export = {
+                "url":         result["url"],
+                "scanned_at":  datetime.now().isoformat(),
+                "js_bundles":  result["js_count"],
+                "findings":    result["raw_hits"],
+                "high_entropy": result["high_entropy"],
+                "source_maps": result["source_maps"],
+                "dynamic":     {
+                    "intercepted_requests": result["dynamic"]["requests"],
+                    "auth_cookies": [
+                        c for c in result["dynamic"].get("cookies", [])
+                        if any(k in c["name"].lower() for k in
+                               ["token","auth","session","key","jwt"])
+                    ],
+                },
+                "errors":      result["errors"],
+            }
+            import tempfile, os as _os
+            tmp = tempfile.NamedTemporaryFile(
+                suffix=".json", delete=False, mode="w", encoding="utf-8"
+            )
+            json.dump(export, tmp, ensure_ascii=False, indent=2)
+            tmp.close()
+
+            domain = urlparse(result["url"]).netloc.replace(".", "_")
+            ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname  = f"keydump_{domain}_{ts}.json"
+
+            with open(tmp.name, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=query.from_user.id,
+                    document=f,
+                    filename=fname,
+                    caption=(
+                        f"💾 *KeyDump JSON Export*\n"
+                        f"🌐 `{result['url'][:60]}`\n"
+                        f"📊 `{sum(len(v) for v in export['findings'].values())}` findings"
+                    ),
+                    parse_mode="Markdown"
+                )
+            _os.unlink(tmp.name)
+            await query.answer("✅ JSON exported!", show_alert=False)
+        except Exception as e:
+            await query.answer(f"Export error: {e}", show_alert=True)
+
+
+# ── /kdexport shortcut ────────────────────────────────────────
+async def cmd_kdexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/kdexport — Export last keydump result as JSON"""
+    uid    = update.effective_user.id
+    result = _kd_cache.get(uid)
+    if not result:
+        await update.effective_message.reply_text(
+            "⚠️ Cache မရှိပါ — `/keydump <url>` ကနေ scan ဦးစွာ လုပ်ပါ",
+            parse_mode="Markdown"); return
+
+    # Trigger json export inline
+    export = {
+        "url":          result["url"],
+        "scanned_at":   datetime.now().isoformat(),
+        "js_bundles":   result["js_count"],
+        "findings":     result["raw_hits"],
+        "high_entropy": result["high_entropy"],
+        "source_maps":  result["source_maps"],
+        "dynamic":      result["dynamic"],
+        "errors":       result["errors"],
+    }
+    import tempfile, os as _os
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=".json", delete=False, mode="w", encoding="utf-8"
+    )
+    json.dump(export, tmp, ensure_ascii=False, indent=2)
+    tmp.close()
+
+    domain = urlparse(result["url"]).netloc.replace(".", "_")
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname  = f"keydump_{domain}_{ts}.json"
+
+    with open(tmp.name, "rb") as f:
+        await context.bot.send_document(
+            chat_id=uid,
+            document=f,
+            filename=fname,
+            caption=(
+                f"💾 *KeyDump Export*\n"
+                f"🌐 `{result['url'][:60]}`\n"
+                f"📊 `{sum(len(v) for v in export['findings'].values())}` total findings"
+            ),
+            parse_mode="Markdown"
+        )
+    _os.unlink(tmp.name)
+
+
+
 # ══════════════════════════════════════════════════
 # 🚀  MAIN
 # ══════════════════════════════════════════════════
@@ -15575,6 +16961,8 @@ def main():
     app.add_handler(CommandHandler("antibot",        cmd_antibot))
     app.add_handler(CommandHandler("smartfuzz",      cmd_smartfuzz))
     app.add_handler(CommandHandler("jwtattack",      cmd_jwtattack))
+    app.add_handler(CommandHandler("keydump",        cmd_keydump))
+    app.add_handler(CommandHandler("kdexport",       cmd_kdexport))
     app.add_handler(CommandHandler("sitekey",        cmd_sitekey))
     # ── Key Extractor commands ────────────────────────
     app.add_handler(CommandHandler("apikeys",         cmd_apikeys))
@@ -15607,6 +16995,7 @@ def main():
         filters.Document.ALL, handle_app_upload
     ))
     # ── Callbacks ─────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(keydump_callback,      pattern="^kd_"))
     app.add_handler(CallbackQueryHandler(force_join_callback,   pattern="^fj_check$"))
     app.add_handler(CallbackQueryHandler(appassets_cat_callback, pattern="^apa_"))
     app.add_handler(CallbackQueryHandler(admin_callback,        pattern="^adm_"))
