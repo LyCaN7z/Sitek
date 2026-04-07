@@ -5560,176 +5560,79 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 #     Extracts: site_key, page_url, action, captcha_type
 # ══════════════════════════════════════════════════
 
-# ── Regex patterns per captcha type ──────────────────────────────
-# Supports: reCAPTCHA v2/v3/Enterprise, hCaptcha, Cloudflare Turnstile,
-#           FunCaptcha/Arkose, GeeTest v3/v4, AWS WAF, DataDome,
-#           PerimeterX/Human, MTCaptcha, KeyCAPTCHA, Lemin, Friendly Captcha
+# ── Regex patterns per captcha type ─────────────
 _CAPTCHA_PATTERNS = {
 
-    # ─── reCAPTCHA v2 ─────────────────────────────────────────────
+    # ─── reCAPTCHA v2 ────────────────────────────
     "reCAPTCHA v2": [
+        # data-sitekey attribute
         re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        # grecaptcha.render
         re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        # siteKey / site_key object key
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
         re.compile(r'["\']site_key["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
         re.compile(r'siteKey\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # g-recaptcha widget
-        re.compile(r'<div[^>]+class=["\'][^"\']*g-recaptcha[^"\']*["\'][^>]*data-sitekey=["\']([^"\']{20,60})["\']', re.I | re.S),
-        # recaptcha/api.js?render=KEY (v3 loaded as script)
-        re.compile(r'recaptcha/(?:api|enterprise)\.js[^"\']*[?&]render=([0-9A-Za-z_\-]{20,60})', re.I),
-        # window.rcv2SiteKey or similar global vars
-        re.compile(r'(?:rcv2|recaptchav2|captchaKey|recaptchaKey|RECAPTCHA_SITE_KEY|recaptchaSiteKey)\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
     ],
 
-    # ─── reCAPTCHA v3 ─────────────────────────────────────────────
+    # ─── reCAPTCHA v3 ────────────────────────────
     "reCAPTCHA v3": [
+        # grecaptcha.execute(key, {action:...})
         re.compile(r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        # grecaptcha.ready + execute in same script
         re.compile(r'execute\(["\']([6][A-Za-z0-9_\-]{39})["\']', re.I),
-        re.compile(r'grecaptcha\.ready[^;]{0,200}execute\(["\']([0-9A-Za-z_\-]{20,60})["\']', re.I | re.S),
-        re.compile(r'["\']recaptchaV3SiteKey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'(?:v3SiteKey|recaptcha_v3_key|RECAPTCHA_V3_KEY)\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
     ],
 
-    # ─── reCAPTCHA Enterprise ──────────────────────────────────────
-    "reCAPTCHA Enterprise": [
-        re.compile(r'recaptchaenterprise\.js[^"\']*[?&]render=([0-9A-Za-z_\-]{20,60})', re.I),
-        re.compile(r'grecaptcha\.enterprise\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'enterprise\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'["\'](?:enterpriseSiteKey|enterprise_site_key|ENTERPRISE_KEY)\s*["\']\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-    ],
-
-    # ─── hCaptcha ─────────────────────────────────────────────────
+    # ─── hCaptcha ────────────────────────────────
     "hCaptcha": [
         re.compile(r'data-sitekey=["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
         re.compile(r'hcaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9a-f\-]{36})["\']', re.I),
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-        re.compile(r'hcaptcha\.com.*?sitekey=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I),
-        re.compile(r'(?:hcaptchaSiteKey|HCAPTCHA_SITE_KEY|hcaptcha_sitekey)\s*[=:]\s*["\']([0-9a-f\-]{36})["\']', re.I),
     ],
 
-    # ─── Cloudflare Turnstile ──────────────────────────────────────
+    # ─── Cloudflare Turnstile ─────────────────────
     "Cloudflare Turnstile": [
-        re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
+        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\'].*?turnstile|turnstile.*?data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I | re.S),
         re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        # Turnstile keys start with 0x4A or 1x00
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
-        re.compile(r'<div[^>]+class=["\'][^"\']*cf-turnstile[^"\']*["\'][^>]*data-sitekey=["\']([^"\']{10,60})["\']', re.I | re.S),
-        re.compile(r'challenges\.cloudflare\.com/turnstile[^"\']*[?&](?:sitekey|k)=([0-9A-Za-z_\-]{20,60})', re.I),
-        re.compile(r'(?:turnstileSiteKey|TURNSTILE_SITE_KEY|CF_TURNSTILE_KEY)\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
     ],
 
-    # ─── FunCaptcha / Arkose Labs ──────────────────────────────────
+    # ─── FunCaptcha (Arkose Labs) ─────────────────
     "FunCaptcha": [
-        re.compile(r'(?:public_key|data-pkey|pk)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
+        re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
         re.compile(r'ArkoseEnforcement\s*\([^)]*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
-        re.compile(r'arkoselabs\.com[^"\']*pk=([0-9A-Fa-f\-]{36})', re.I),
-        re.compile(r'funcaptcha\.com[^"\']*pk=([0-9A-Fa-f\-]{36})', re.I),
-        re.compile(r'(?:arkoselabsKey|ARKOSE_KEY|FUNCAPTCHA_KEY)\s*[=:]\s*["\']([0-9A-Fa-f\-]{36})["\']', re.I),
     ],
 
-    # ─── GeeTest v3 ───────────────────────────────────────────────
-    "GeeTest v3": [
+    # ─── GeeTest ─────────────────────────────────
+    "GeeTest": [
         re.compile(r'gt\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
         re.compile(r'["\']gt["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
-        re.compile(r'initGeetest\s*\(\s*\{[^}]*gt\s*:\s*["\']([0-9a-f]{32})["\']', re.I | re.S),
-        re.compile(r'geetest_id\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
     ],
 
-    # ─── GeeTest v4 ───────────────────────────────────────────────
-    "GeeTest v4": [
-        re.compile(r'captchaId\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
-        re.compile(r'["\']captchaId["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
-        re.compile(r'initGeetest4\s*\(\s*\{[^}]*captchaId\s*:\s*["\']([0-9a-f]{32})["\']', re.I | re.S),
-    ],
-
-    # ─── AWS WAF Captcha ──────────────────────────────────────────
+    # ─── AWS WAF Captcha ──────────────────────────
     "AWS WAF Captcha": [
         re.compile(r'AwsWafIntegration\.getToken\s*\(\s*["\']([^"\']{10,200})["\']', re.I),
         re.compile(r'jsapi\.token\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
-        re.compile(r'aws-waf-token["\'\s]*[=:]["\'\s]*([A-Za-z0-9+/=\-_]{20,200})', re.I),
-        re.compile(r'wafCaptchaSiteKey\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
-    ],
-
-    # ─── DataDome ─────────────────────────────────────────────────
-    "DataDome": [
-        re.compile(r'datadome["\']?\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
-        re.compile(r'dd_app_id\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I),
-        re.compile(r'DataDomeObject\s*=\s*["\']([^"\']{10,60})["\']', re.I),
-    ],
-
-    # ─── PerimeterX / Human ───────────────────────────────────────
-    "PerimeterX": [
-        re.compile(r'window\._pxAppId\s*=\s*["\']([^"\']{5,30})["\']', re.I),
-        re.compile(r'PX["\']?\s*[=:]\s*\{[^}]*appId\s*:\s*["\']([^"\']{5,30})["\']', re.I | re.S),
-        re.compile(r'_pxParam1\s*=\s*["\']([^"\']{10,100})["\']', re.I),
-    ],
-
-    # ─── MTCaptcha ────────────────────────────────────────────────
-    "MTCaptcha": [
-        re.compile(r'mt-captcha[^"\']*sitekey=([A-Za-z0-9\-_]{10,80})', re.I),
-        re.compile(r'mtcaptcha\.(?:load|render)\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([^"\']{10,60})["\']', re.I),
-        re.compile(r'mt-sitekey\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,60})["\']', re.I),
-    ],
-
-    # ─── Lemin Cropped Captcha ────────────────────────────────────
-    "Lemin Captcha": [
-        re.compile(r'lemin-cropped-captcha[^>]*captcha_id=["\']([^"\']{10,60})["\']', re.I),
-        re.compile(r'leminCaptchaId\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I),
-    ],
-
-    # ─── Friendly Captcha ─────────────────────────────────────────
-    "Friendly Captcha": [
-        re.compile(r'frc-captcha[^>]*data-sitekey=["\']([^"\']{10,60})["\']', re.I | re.S),
-        re.compile(r'WidgetInstance[^"\']*sitekey\s*:\s*["\']([^"\']{10,60})["\']', re.I),
-    ],
-
-    # ─── KeyCAPTCHA ───────────────────────────────────────────────
-    "KeyCAPTCHA": [
-        re.compile(r's_s_c_user_id\s*=\s*["\']?(\d{3,20})["\']?', re.I),
-        re.compile(r'keycaptcha_task\s*=\s*["\']([^"\']{10,200})["\']', re.I),
     ],
 }
 
-# ─── reCAPTCHA action pattern ────────────────────────────────────
+# ─── reCAPTCHA action pattern ────────────────────
 _ACTION_PATTERNS = [
     re.compile(r'action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
     re.compile(r'["\']action["\']\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
     re.compile(r'grecaptcha\.execute\s*\([^,]+,\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
 ]
 
-# ─── Script src signatures (detect captcha from <script src=...>) ─
+# ─── Script src patterns (detect captcha from includes) ─
 _CAPTCHA_SCRIPT_SIGS = {
-    "reCAPTCHA":       ["google.com/recaptcha", "recaptcha/api.js", "recaptcha/enterprise.js"],
-    "hCaptcha":        ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
-    "Turnstile":       ["challenges.cloudflare.com/turnstile"],
-    "FunCaptcha":      ["funcaptcha.com", "arkoselabs.com"],
-    "GeeTest":         ["gt.captcha.com", "static.geetest.com", "gcaptcha4.geetest.com"],
-    "DataDome":        ["js.datadome.co", "interstitial.datadome.co"],
-    "PerimeterX":      ["client.px-cdn.net", "captcha.px-cdn.net"],
-    "MTCaptcha":       ["mt-captcha.com/MTCaptcha"],
-    "AWS WAF Captcha": ["captcha.us-east-1.amazonaws.com", "aws-waf-captcha.js"],
-    "Friendly Captcha":["cdn.friendlycaptcha.com"],
+    "reCAPTCHA": ["google.com/recaptcha", "recaptcha/api.js", "recaptcha/enterprise.js"],
+    "hCaptcha":  ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
+    "Turnstile": ["challenges.cloudflare.com/turnstile"],
+    "FunCaptcha": ["funcaptcha.com", "arkoselabs.com"],
+    "GeeTest":   ["gt.captcha.com", "static.geetest.com"],
 }
-
-# ─── Known TEST keys (warn user) ────────────────────────────────
-_TEST_KEYS = {
-    "6LeIxAcTAAAAAJcZVRqyHh71UMIEGNQ_MXjiZKhI": "reCAPTCHA v2 TEST KEY (Google official)",
-    "6LebCcoUAAAAABhm4GuYBMmMlHPO6nGVgXRbHRxD": "reCAPTCHA v3 TEST KEY",
-    "10000000-ffff-ffff-ffff-000000000001": "hCaptcha TEST KEY",
-    "1x00000000000000000000AA": "Cloudflare Turnstile TEST KEY (always passes)",
-    "2x00000000000000000000AB": "Cloudflare Turnstile TEST KEY (always blocks)",
-    "3x00000000000000000000FF": "Cloudflare Turnstile TEST KEY (forces challenge)",
-}
-
-# ─── Common captcha-hosting subpaths to deep-scan ───────────────
-_CAPTCHA_PAGES = [
-    "/login", "/signin", "/sign-in", "/log-in",
-    "/register", "/signup", "/sign-up", "/join",
-    "/contact", "/contact-us", "/feedback",
-    "/forgot-password", "/reset-password", "/password-reset",
-    "/checkout", "/cart", "/subscribe", "/newsletter",
-    "/verify", "/confirm", "/2fa", "/otp",
-    "/submit", "/apply",
-]
 
 
 def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> list:
@@ -6219,43 +6122,27 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         "error":       None,
     }
 
-def _sitekey_sync(url: str, progress_cb=None, deep: bool = False) -> dict:
+def _sitekey_sync(url: str, progress_cb=None) -> dict:
     """
-    Try Playwright first (full JS execution + network intercept).
+    Try Playwright (DevTools-style) first.
     Falls back to requests-based static scan if Playwright not available.
-    deep=True: also scan /login /register /contact /signup pages.
     """
+    # ── Try Playwright ─────────────────────────────
     result = _sitekey_playwright(url, progress_cb)
     if result.get("error") == "playwright_not_installed":
-        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan fallback...")
-        return _sitekey_static(url, progress_cb, deep=deep)
-    # Deep mode: run static on sub-pages even after playwright succeeded
-    if deep and not result.get("error"):
-        if progress_cb: progress_cb("🔍 Deep: scanning common captcha pages...")
-        static = _sitekey_static(url, progress_cb=None, deep=True)
-        # Merge findings from static deep-scan
-        seen = {f["type"]+":"+f["site_key"] for f in result["findings"]}
-        for f in static.get("findings", []):
-            dk = f["type"]+":"+f["site_key"]
-            if dk not in seen:
-                seen.add(dk)
-                result["findings"].append(f)
-        result["pages_scanned"] = static.get("pages_scanned", 1)
+        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan သို့ fallback...")
+        return _sitekey_static(url, progress_cb)
     return result
 
 
-def _sitekey_static(url: str, progress_cb=None, deep: bool = False) -> dict:
-    """
-    Fallback requests-based scanner.
-    - Fetches HTML + up to 20 JS files
-    - deep=True: also scans common captcha pages (/login, /register, etc.)
-    """
+def _sitekey_static(url: str, progress_cb=None) -> dict:
+    """Fallback: requests-based static HTML + JS scan (no browser)."""
     session = requests.Session()
     session.headers.update(_get_headers())
 
-    if progress_cb: progress_cb("⬇️ Fetching page HTML...")
+    if progress_cb: progress_cb("⬇️ Fetching page HTML (static)...")
     try:
-        resp     = session.get(url, timeout=15, verify=False, allow_redirects=True)
+        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
         resp.raise_for_status()
         html     = resp.text
         page_url = resp.url
@@ -6265,23 +6152,24 @@ def _sitekey_static(url: str, progress_cb=None, deep: bool = False) -> dict:
     final_parsed = urlparse(page_url)
     base_origin  = f"{final_parsed.scheme}://{final_parsed.netloc}"
 
-    def _resolve(src_url):
-        if not src_url: return None
-        src_url = src_url.strip()
-        if src_url.startswith('//'): return final_parsed.scheme + ':' + src_url
-        if src_url.startswith('http'): return src_url
-        if src_url.startswith('/'): return base_origin + src_url
+    def _resolve(src):
+        if not src: return None
+        src = src.strip()
+        if src.startswith('//'): return final_parsed.scheme + ':' + src
+        if src.startswith('http'): return src
+        if src.startswith('/'): return base_origin + src
         base_path = final_parsed.path.rsplit('/', 1)[0]
-        return f"{base_origin}{base_path}/{src_url}"
+        return f"{base_origin}{base_path}/{src}"
 
-    def _collect_js(html_text):
-        soup2 = BeautifulSoup(html_text, 'html.parser')
-        seen, ordered = set(), []
-        for tag in soup2.find_all('script', src=True):
-            u = _resolve(tag['src'])
-            if u and u.startswith('http') and u not in seen:
-                seen.add(u); ordered.append(u)
-        return ordered
+    soup = BeautifulSoup(html, 'html.parser')
+    js_seen, js_ordered = set(), []
+
+    def _add_js(u):
+        if u and u.startswith('http') and u not in js_seen:
+            js_seen.add(u); js_ordered.append(u)
+
+    for tag in soup.find_all('script', src=True):
+        _add_js(_resolve(tag['src']))
 
     captcha_sigs_flat = [s for sigs in _CAPTCHA_SCRIPT_SIGS.values() for s in sigs]
     def _prio(u):
@@ -6290,92 +6178,46 @@ def _sitekey_static(url: str, progress_cb=None, deep: bool = False) -> dict:
         if any(k in n for k in ('main','app','index','chunk','bundle','vendor','runtime')): return 1
         return 2
 
-    all_html   = {"main": html}
-    all_js_srcs = {u: "" for u in sorted(_collect_js(html), key=_prio)[:20]}
+    fetch_list = sorted(js_ordered, key=_prio)[:15]
 
-    # ── Deep mode: scan /login /register /contact etc. ─────────────
-    if deep:
-        if progress_cb: progress_cb(f"🔍 Deep scan: checking {len(_CAPTCHA_PAGES)} common captcha pages...")
-        for subpath in _CAPTCHA_PAGES[:12]:
-            try:
-                sub_url = base_origin.rstrip('/') + subpath
-                sr = session.get(sub_url, timeout=8, verify=False, allow_redirects=True)
-                if sr.status_code == 200 and len(sr.text) > 200:
-                    all_html[subpath] = sr.text
-                    for u in sorted(_collect_js(sr.text), key=_prio)[:5]:
-                        if u not in all_js_srcs:
-                            all_js_srcs[u] = ""
-            except Exception:
-                pass
-
-    # ── Fetch JS files ──────────────────────────────────────────────
-    fetch_list = list(all_js_srcs.keys())[:20]
     if progress_cb: progress_cb(f"📦 Fetching {len(fetch_list)} JS files...")
     js_sources = {}
     for js_url in fetch_list:
         try:
             r = session.get(js_url, timeout=10, verify=False)
             if r.status_code == 200 and len(r.text) > 50:
-                js_sources[js_url] = r.text[:1_000_000]
+                js_sources[js_url] = r.text[:800_000]
         except Exception:
             pass
 
-    if progress_cb: progress_cb(f"🔍 Scanning {len(all_html)} pages + {len(js_sources)} JS files...")
-    all_findings = []
-    seen_dedup   = set()
-    for label, html_text in all_html.items():
-        for f in _extract_captcha_info(html_text, page_url, js_sources):
-            dedup = f["type"] + ":" + f["site_key"]
-            if dedup not in seen_dedup:
-                seen_dedup.add(dedup)
-                if label != "main":
-                    f["source"] += f" [page: {label}]"
-                all_findings.append(f)
-
-    return {
-        "findings":   all_findings,
-        "page_url":   page_url,
-        "js_fetched": len(js_sources),
-        "pages_scanned": len(all_html),
-        "error":      None,
-    }
+    if progress_cb: progress_cb(f"🔍 Scanning {len(js_sources)} JS files...")
+    findings = _extract_captcha_info(html, page_url, js_sources)
+    return {"findings": findings, "page_url": page_url, "js_fetched": len(js_sources), "error": None}
 
 
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /sitekey <url> [deep] — Extract captcha site keys
-    Modes:
-      /sitekey https://example.com        — Standard scan
-      /sitekey https://example.com deep   — Deep scan (checks /login, /register, /contact etc.)
-    """
+    """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
     if not await check_force_join(update, context):
         return
 
     if not context.args:
         await update.effective_message.reply_text(
-            "🔑 *Site Key Extractor*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "*Usage:*\n"
-            "  `/sitekey <url>` — Standard scan\n"
-            "  `/sitekey <url> deep` — Deep scan\n\n"
-            "*Extracts:*\n"
+            "📌 *Usage:* `/sitekey https://example.com`\n\n"
+            "🔑 *Extracts:*\n"
             "  • `site_key` — Captcha public key\n"
-            "  • `page_url` — Final URL after redirects\n"
+            "  • `page_url` — Final URL (after redirects)\n"
             "  • `action`   — reCAPTCHA v3 action name\n\n"
-            "*Supported Captcha Types:*\n"
-            "  🔵 reCAPTCHA v2\n"
-            "  🟣 reCAPTCHA v3\n"
-            "  🟤 reCAPTCHA Enterprise\n"
-            "  🟡 hCaptcha\n"
-            "  🟠 Cloudflare Turnstile\n"
-            "  🔴 FunCaptcha / Arkose Labs\n"
-            "  🟢 GeeTest v3 / v4\n"
-            "  ⚪ AWS WAF Captcha\n"
-            "  🔷 DataDome\n"
-            "  🔶 PerimeterX / Human\n"
-            "  ⬛ MTCaptcha / Lemin / Friendly Captcha\n\n"
-            "*Deep mode* (`deep`) scans `/login`, `/register`, `/contact`, `/checkout` pages too\n\n"
-            "_HTML + JS bundles + network requests all scanned_",
+            "🛡️ *Supported Captcha Types:*\n"
+            "  • reCAPTCHA v2 _(data-sitekey / grecaptcha.render)_\n"
+            "  • reCAPTCHA v3 _(grecaptcha.execute + action)_\n"
+            "  • reCAPTCHA Enterprise\n"
+            "  • hCaptcha _(UUID format key)_\n"
+            "  • Cloudflare Turnstile _(0x4A... / 1x00...)_\n"
+            "  • FunCaptcha / Arkose Labs\n"
+            "  • GeeTest\n"
+            "  • AWS WAF Captcha\n\n"
+            "📦 HTML source + JS bundles ကို scan မည်\n"
+            "⚠️ _Authorized testing only_",
             parse_mode='Markdown'
         )
         return
@@ -6386,8 +6228,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
-    url  = context.args[0].strip()
-    deep = len(context.args) > 1 and context.args[1].lower() == "deep"
+    url = context.args[0].strip()
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -6397,35 +6238,32 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
-    mode_label = "🔍 Deep Scan" if deep else "Standard Scan"
     msg = await update.effective_message.reply_text(
-        f"🔑 *Site Key Extractor*\n"
-        f"🌐 `{domain}`\n"
-        f"⚙️ Mode: {mode_label}\n\n"
-        f"⏳ Scanning...",
+        f"🔑 *Site Key Extractor*\n🌐 `{domain}`\n\n"
+        "🌐 Launching headless browser...\n"
+        "📡 Intercepting network requests...\n"
+        "🔍 Scanning DOM + console logs...\n⏳",
         parse_mode='Markdown'
     )
 
     progress_q = []
+
     async def _prog():
         while True:
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(2)
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
                     await msg.edit_text(
-                        f"🔑 *Site Key Extractor*\n"
-                        f"🌐 `{domain}` — {mode_label}\n\n"
-                        f"{txt}",
-                        parse_mode='Markdown'
-                    )
+                        f"🔑 *Scanning `{domain}`*\n\n{txt}",
+                        parse_mode='Markdown')
                 except BadRequest:
                     pass
 
     prog = asyncio.create_task(_prog())
     try:
         result = await asyncio.to_thread(
-            _sitekey_sync, url, lambda t: progress_q.append(t), deep
+            _sitekey_sync, url, lambda t: progress_q.append(t)
         )
     except Exception as e:
         prog.cancel()
@@ -6436,32 +6274,40 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.get("error"):
         await msg.edit_text(
-            f"❌ *Fetch Error*\n`{result['error']}`",
+            f"❌ *Fetch error*\n`{result['error']}`",
             parse_mode='Markdown'
         )
         return
 
-    findings      = result["findings"]
-    page_url      = result["page_url"]
-    js_count      = result["js_fetched"]
-    pages_scanned = result.get("pages_scanned", 1)
+    findings  = result["findings"]
+    page_url  = result["page_url"]
+    js_count  = result["js_fetched"]
 
-    # ─── No captcha found ────────────────────────────────────────
+    # ─── No captcha found ───────────────────────
     if not findings:
-        tip = "\n_Deep mode: tried /login, /register, /contact pages too_" if deep else "\n_Tip: Add `deep` for deeper scan → `/sitekey <url> deep`_"
         await msg.edit_text(
-            f"🔑 *Site Key Extractor*\n"
+            f"🔑 *Site Key Extractor — `{domain}`*\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 *Captcha မတွေ့ပါ*\n\n"
-            f"🌐 Page URL  : `{page_url}`\n"
-            f"📦 JS scanned: `{js_count}`\n"
-            f"📄 Pages     : `{pages_scanned}`\n"
-            f"{tip}",
+            f"🌐 Page URL: `{page_url}`\n"
+            f"📡 Requests intercepted: `{js_count}`\n\n"
+            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
+            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
             parse_mode='Markdown'
         )
         return
 
-    # ─── Build Telegram report ────────────────────────────────────
+    # ─── Build report ────────────────────────────
+    lines = [
+        f"🔑 *Site Key Extractor — `{domain}`*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 Page URL: `{page_url}`",
+        f"📡 Requests intercepted: `{js_count}`",
+        f"✅ Found: `{len(findings)}` captcha instance(s)",
+        "",
+    ]
+
+    # Type icons
     _TYPE_ICON = {
         "reCAPTCHA v2":          "🔵",
         "reCAPTCHA v3":          "🟣",
@@ -6469,75 +6315,50 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "hCaptcha":              "🟡",
         "Cloudflare Turnstile":  "🟠",
         "FunCaptcha":            "🔴",
-        "GeeTest v3":            "🟢",
-        "GeeTest v4":            "🟢",
+        "GeeTest":               "🟢",
         "AWS WAF Captcha":       "⚪",
-        "DataDome":              "🔷",
-        "PerimeterX":            "🔶",
-        "MTCaptcha":             "⬛",
-        "Lemin Captcha":         "⬛",
-        "Friendly Captcha":      "⬛",
-        "KeyCAPTCHA":            "⬛",
     }
-
-    lines = [
-        f"🔑 *Site Key Extractor — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 `{page_url}`",
-        f"📦 JS: `{js_count}` | Pages: `{pages_scanned}` | Found: `{len(findings)}`",
-        "",
-    ]
 
     for i, f in enumerate(findings, 1):
         icon = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
-
-        # Test key warning
-        is_test = f["site_key"] in _TEST_KEYS
-        test_warn = f"\n  ⚠️ _TEST KEY: {_TEST_KEYS[f['site_key']]}_" if is_test else ""
-
-        lines.append(f"*{icon} [{i}] {f['type']}*{test_warn}")
-        lines.append(f"  🔑 `{f['site_key'] or 'N/A'}`")
-        if f.get("action"):
-            lines.append(f"  ⚡ action: `{f['action']}`")
-        lines.append(f"  📂 _{f['source'][:65]}_")
+        lines.append(f"*{icon} [{i}] {f['type']}*")
+        lines.append(f"  🔑 `site_key` : `{f['site_key'] or 'N/A'}`")
+        lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
+        if f["action"]:
+            lines.append(f"  ⚡ `action`    : `{f['action']}`")
+        lines.append(f"  📂 Source     : _{f['source'][:70]}_")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Authorized testing only_")
 
     report = "\n".join(lines)
 
     try:
         if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
+            await msg.edit_text(report, parse_mode=None)
         else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-            await update.effective_message.reply_text(report[4000:8000])
+            await msg.edit_text(report[:4000], parse_mode=None)
+            await update.effective_message.reply_text(report[4000:8000], parse_mode='Markdown')
     except BadRequest:
-        try:
-            await msg.edit_text(report[:4000])
-        except Exception:
-            await update.effective_message.reply_text(report[:4000])
+        await update.effective_message.reply_text(report[:4000], parse_mode=None)
 
-    # ─── Export JSON ───────────────────────────────────────────────
+    # ─── Export JSON ─────────────────────────────
     import io as _io
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    export = {
-        "domain":        domain,
-        "page_url":      page_url,
-        "scanned_at":    datetime.now().isoformat(),
-        "mode":          "deep" if deep else "standard",
-        "js_scanned":    js_count,
-        "pages_scanned": pages_scanned,
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d    = re.sub(r'[^\w\-]', '_', domain)
+    export    = {
+        "domain":      domain,
+        "page_url":    page_url,
+        "scanned_at":  datetime.now().isoformat(),
+        "js_scanned":  js_count,
         "findings": [
             {
                 "type":     f["type"],
                 "site_key": f["site_key"],
                 "page_url": f["page_url"],
-                "action":   f.get("action", ""),
+                "action":   f["action"],
                 "source":   f["source"],
-                "is_test_key": f["site_key"] in _TEST_KEYS,
-                "test_key_note": _TEST_KEYS.get(f["site_key"], ""),
             }
             for f in findings
         ],
@@ -6550,7 +6371,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=f"sitekey_{safe_d}_{ts}.json",
             caption=(
                 f"🔑 *Site Key Report — `{domain}`*\n"
-                f"Found: `{len(findings)}` | JS: `{js_count}` | Pages: `{pages_scanned}`"
+                f"Found: `{len(findings)}` | JS: `{js_count}`"
             ),
             parse_mode='Markdown'
         )
