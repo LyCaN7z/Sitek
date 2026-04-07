@@ -4610,10 +4610,11 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
-        error_msg = '\n'.join(result['errors'][:3])
-await msg.edit_text(f"❌ `{error_msg}`", parse_mode='Markdown')
-stats = result["stats"]
+        _err_txt = '\n'.join(result['errors'][:3])
+        await msg.edit_text(f"❌ `{_err_txt}`", parse_mode='Markdown')
+        return
 
+    stats = result["stats"]
     extracted = result.get("extracted", 0)
     zip_buf: io.BytesIO = result.get("zip_buffer")
 
@@ -5640,11 +5641,22 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                                 break
 
                     findings.append({
-                        "type":     cap_type,
-                        "site_key": key,
-                        "page_url": page_url,
-                        "action":   action,
-                        "source":   source_label,
+                        "type":       cap_type,
+                        "site_key":   key,
+                        "page_url":   page_url,
+                        "action":     action,
+                        "source":     source_label,
+                        "theme":      "",
+                        "size":       "",
+                        "invisible":  False,
+                        "badge":      "",
+                        "min_score":  "",
+                        "enterprise": False,
+                        "s_param":    "",
+                        "hl":         "",
+                        "co":         "",
+                        "callback":   "",
+                        "user_agent": "",
                     })
 
     # Scan main HTML
@@ -5685,78 +5697,127 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
     return findings
 
 
+# ════════════════════════════════════════════════════════════
+# NEW _sitekey_playwright — works even when JS files blocked
+# Techniques:
+#  1. Network interception (request URLs + POST bodies)
+#  2. Response body scan (captcha API JSON responses)
+#  3. DOM deep scan after full JS execution
+#  4. window object mining (grecaptcha, hcaptcha, turnstile)
+#  5. JavaScript variable extraction via page.evaluate
+#  6. iframe src scan (captcha widgets inside iframes)
+#  7. Shadow DOM traversal
+#  8. MutationObserver hook (catches dynamically injected widgets)
+#  9. Click/interact simulation (trigger lazy-load captchas)
+# 10. Console log scraping
+# ════════════════════════════════════════════════════════════
+
 def _sitekey_playwright(url: str, progress_cb=None) -> dict:
-    """
-    DevTools-style sitekey extraction using Playwright.
-    Intercepts ALL network requests like Chrome DevTools → Network tab.
-    Extracts sitekeys from:
-      - Request URLs  (recaptcha/api2/anchor?k=SITEKEY)
-      - POST bodies   (hcaptcha checksiteconfig)
-      - Console logs  (window.console messages)
-      - Final DOM     (data-sitekey attributes after JS execution)
-    """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except ImportError:
         return {"error": "playwright_not_installed", "findings": [], "page_url": url}
 
-    findings     = []
-    seen_keys    = set()
-    network_log  = []   # all intercepted requests
-    console_log  = []   # all console messages
+    findings    = []
+    seen_keys   = set()
+    network_log = []
+    console_log = []
     page_url_ref = [url]
 
-    # ── Patterns to extract key from intercepted request URL ──
+    # ── Network URL patterns ──────────────────────
     _NET_PATTERNS = [
-        # reCAPTCHA v2 / v3
-        (re.compile(r'google\.com/recaptcha/api2/(?:anchor|bframe|reload)\?[^"\']*[?&]k=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA v2"),
-        (re.compile(r'google\.com/recaptcha/enterprise/(?:anchor|bframe|reload)\?[^"\']*[?&]k=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA Enterprise"),
-        (re.compile(r'recaptcha/api\.js\?render=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA v3"),
-        (re.compile(r'recaptcha/enterprise\.js\?render=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA Enterprise"),
-        # hCaptcha
-        (re.compile(r'hcaptcha\.com/checksiteconfig\?[^"\']*sitekey=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I), "hCaptcha"),
-        (re.compile(r'hcaptcha\.com/getcaptcha\?s=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I), "hCaptcha"),
-        (re.compile(r'hcaptcha\.com/[^?]*\?[^"\']*sitekey=([0-9a-f\-]{36})', re.I), "hCaptcha"),
-        # Cloudflare Turnstile
-        (re.compile(r'challenges\.cloudflare\.com/turnstile/[^?]+\?[^"\']*sitekey=([0-9A-Za-z_\-]{20,60})', re.I), "Cloudflare Turnstile"),
-        (re.compile(r'challenges\.cloudflare\.com/turnstile/v0/api\.js\?[^"\']*render=([0-9A-Za-z_\-]{20,60})', re.I), "Cloudflare Turnstile"),
-        # FunCaptcha
-        (re.compile(r'(?:funcaptcha\.com|arkoselabs\.com)[^"\']*pk=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})', re.I), "FunCaptcha"),
+        (re.compile(r'google\.com/recaptcha/(?:api2|enterprise)/(?:anchor|bframe|reload)[^"\']*[?&]k=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA v2"),
+        (re.compile(r'recaptcha/(?:api|enterprise)\.js[^"\']*[?&]render=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA v3"),
+        (re.compile(r'recaptcha/enterprise\.js[^"\']*[?&]render=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA Enterprise"),
+        (re.compile(r'hcaptcha\.com/(?:checksiteconfig|getcaptcha|anchor)[^"\']*[?&](?:sitekey|s)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I), "hCaptcha"),
+        (re.compile(r'challenges\.cloudflare\.com/turnstile[^"\']*[?&](?:sitekey|k)=([0-9A-Za-z_\-]{20,60})', re.I), "Cloudflare Turnstile"),
+        (re.compile(r'(?:funcaptcha\.com|arkoselabs\.com)[^"\']*(?:pk|public_key)=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})', re.I), "FunCaptcha"),
+        (re.compile(r'geo\.captcha\.com[^"\']*gt=([0-9a-f]{32})', re.I), "GeeTest"),
+        # Generic sitekey in any captcha-related URL
+        (re.compile(r'(?:recaptcha|hcaptcha|captcha|turnstile)[^"\']*[?&](?:sitekey|k|key)=([0-9A-Za-z_\-]{20,60})', re.I), "Captcha (generic)"),
     ]
 
-    # ── POST body patterns ─────────────────────────
     _BODY_PATTERNS = [
-        (re.compile(r'"sitekey"\s*:\s*"([0-9A-Za-z_\-]{20,60})"', re.I), "From POST body"),
-        (re.compile(r'sitekey=([0-9A-Za-z_\-]{20,60})', re.I), "From POST body"),
-        (re.compile(r'"k"\s*:\s*"([0-9A-Za-z_\-]{20,60})"', re.I), "From POST body"),
+        (re.compile(r'"sitekey"\s*:\s*"([0-9A-Za-z_\-]{20,60})"', re.I), "POST body"),
+        (re.compile(r'"site_key"\s*:\s*"([0-9A-Za-z_\-]{20,60})"', re.I), "POST body"),
+        (re.compile(r'sitekey=([0-9A-Za-z_\-]{20,60})', re.I), "POST body"),
+        (re.compile(r'"k"\s*:\s*"(6[A-Za-z0-9_\-]{39})"', re.I), "POST body (reCAPTCHA v3)"),
+        (re.compile(r'"gt"\s*:\s*"([0-9a-f]{32})"', re.I), "POST body (GeeTest)"),
     ]
 
-    def _add_finding(cap_type, key, source, page_url):
+    def _classify_key(key: str) -> str:
+        if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', key, re.I):
+            return "hCaptcha"
+        if re.match(r'^[01]x[0-9A-Fa-f_\-]{20,}', key):
+            return "Cloudflare Turnstile"
+        if re.match(r'^6[A-Za-z0-9_\-]{39}$', key):
+            return "reCAPTCHA v2/v3"
+        if re.match(r'^[0-9a-f]{32}$', key):
+            return "GeeTest"
+        if re.match(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-', key):
+            return "FunCaptcha"
+        return "reCAPTCHA"
+
+    def _add(cap_type, key, source, extra=None):
+        key = key.strip()
         dedup = cap_type + ":" + key
         if dedup not in seen_keys and len(key) >= 10:
             seen_keys.add(dedup)
+            ex = extra or {}
             findings.append({
-                "type":     cap_type,
-                "site_key": key,
-                "page_url": page_url,
-                "action":   "",
-                "source":   source,
+                "type":       cap_type,
+                "site_key":   key,
+                "page_url":   page_url_ref[0],
+                "action":     ex.get("action", ""),
+                "source":     source,
+                "theme":      ex.get("theme", ""),
+                "size":       ex.get("size", ""),
+                "invisible":  ex.get("invisible", False),
+                "badge":      ex.get("badge", ""),
+                "min_score":  ex.get("min_score", ""),
+                "enterprise": ex.get("enterprise", False),
+                "s_param":    ex.get("s_param", ""),
+                "hl":         ex.get("hl", ""),
+                "co":         ex.get("co", ""),
+                "callback":   ex.get("callback", ""),
+                "user_agent": "",   # filled later
             })
 
-    def _scan_url(req_url: str, page_url: str):
+    def _scan_url(req_url):
         for pat, cap_type in _NET_PATTERNS:
             m = pat.search(req_url)
             if m:
-                _add_finding(cap_type, m.group(1), f"Network request: {req_url[:100]}", page_url)
+                _add(cap_type, m.group(1), f"Network URL: {req_url[:120]}")
 
-    def _scan_body(body: str, req_url: str, page_url: str):
+    def _scan_text(text, source):
         for pat, label in _BODY_PATTERNS:
-            for m in pat.finditer(body):
-                _add_finding("reCAPTCHA/hCaptcha (POST)", m.group(1),
-                             f"{label} → {req_url[:80]}", page_url)
+            for m in pat.finditer(text):
+                key = m.group(1)
+                _add(_classify_key(key), key, f"{label} / {source}")
+        # also run full _CAPTCHA_PATTERNS
+        for cap_type, patterns in _CAPTCHA_PATTERNS.items():
+            for pat in patterns:
+                for m in pat.finditer(text):
+                    try:
+                        key = next((g for g in m.groups() if g), m.group(0))
+                        if key and len(key) >= 10:
+                            _add(cap_type, key, source)
+                    except Exception:
+                        pass
 
     with sync_playwright() as pw:
-        if progress_cb: progress_cb("🌐 Launching headless browser...")
+        if progress_cb: progress_cb("🌐 Launching stealth browser...")
+
+        # Proxy support
+        _pw_proxy_cfg = None
+        _px = proxy_manager.get_proxy()
+        if _px:
+            from urllib.parse import urlparse as _up
+            _pp = _up(_px.get("http") or _px.get("https", ""))
+            _pw_proxy_cfg = {"server": f"{_pp.scheme}://{_pp.hostname}:{_pp.port}"}
+            if _pp.username:
+                _pw_proxy_cfg["username"] = _pp.username
+                _pw_proxy_cfg["password"] = _pp.password or ""
 
         browser = pw.chromium.launch(
             headless=True,
@@ -5765,47 +5826,70 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 '--disable-dev-shm-usage',
                 '--disable-blink-features=AutomationControlled',
                 '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--flag-switches-begin',
+                '--disable-site-isolation-trials',
+                '--flag-switches-end',
             ]
         )
-        context_pw = browser.new_context(
+
+        ctx = browser.new_context(
             user_agent=(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
+                'Chrome/122.0.0.0 Safari/537.36'
             ),
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1366, "height": 768},
             ignore_https_errors=True,
+            proxy=_pw_proxy_cfg,
+            java_script_enabled=True,
+            # Bypass bot detection headers
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+            }
         )
-        page = context_pw.new_page()
 
-        # ── Intercept every network request ────────
-        def _on_request(request):
-            req_url = request.url
-            network_log.append(req_url)
-            _scan_url(req_url, page_url_ref[0])
-            # Also scan POST body
+        # Anti-detection: remove webdriver flag
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            window.chrome = {runtime: {}};
+        """)
+
+        page = ctx.new_page()
+
+        # ── Hook 1: Network request interception ─────
+        def _on_request(req):
+            ru = req.url
+            network_log.append(ru)
+            _scan_url(ru)
             try:
-                body = request.post_data
+                body = req.post_data
                 if body and len(body) > 5:
-                    _scan_body(body, req_url, page_url_ref[0])
+                    _scan_text(body, f"POST → {ru[:80]}")
             except Exception:
                 pass
 
-        # ── Intercept responses for captcha API JSON ─
-        def _on_response(response):
-            resp_url = response.url
-            try:
-                if any(sig in resp_url for sig in [
-                    'recaptcha', 'hcaptcha', 'turnstile', 'funcaptcha'
-                ]):
-                    body = response.body()
+        # ── Hook 2: Response body scan ───────────────
+        def _on_response(resp):
+            ru = resp.url
+            captcha_sigs = ['recaptcha', 'hcaptcha', 'turnstile', 'funcaptcha',
+                            'geetest', 'captcha', 'arkoselabs']
+            if any(s in ru.lower() for s in captcha_sigs):
+                try:
+                    body = resp.body()
                     if body:
-                        text = body.decode('utf-8', errors='ignore')
-                        _scan_body(text, resp_url, page_url_ref[0])
-            except Exception:
-                pass
+                        _scan_text(body.decode('utf-8', errors='ignore'), f"Response ← {ru[:80]}")
+                except Exception:
+                    pass
 
-        # ── Capture console messages ────────────────
+        # ── Hook 3: Console messages ─────────────────
         def _on_console(msg):
             try:
                 console_log.append(msg.text)
@@ -5816,103 +5900,316 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         page.on("response", _on_response)
         page.on("console",  _on_console)
 
-        if progress_cb: progress_cb("📡 Loading page & intercepting requests...")
+        if progress_cb: progress_cb("📡 Loading page (intercepting all network traffic)...")
 
         try:
-            resp = page.goto(url, wait_until="networkidle", timeout=30_000)
-            if resp:
-                page_url_ref[0] = page.url
+            page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            page_url_ref[0] = page.url
         except PWTimeout:
-            # networkidle timeout — still extract what we got
             page_url_ref[0] = page.url
         except Exception as e:
             browser.close()
             return {"error": str(e), "findings": [], "page_url": url}
 
-        # Extra wait for lazy-loaded captcha widgets
+        # Wait for networkidle with shorter timeout (don't block forever)
         try:
-            page.wait_for_timeout(3000)
+            page.wait_for_load_state("networkidle", timeout=8_000)
         except Exception:
             pass
 
-        # ── Scroll to trigger lazy-load ─────────────
+        if progress_cb: progress_cb("🖱️ Simulating user interaction to trigger lazy captchas...")
+
+        # ── Simulate user interaction ─────────────────
         try:
+            # Scroll down to trigger lazy-load
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            page.wait_for_timeout(1500)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+            # Click on forms/buttons to trigger captcha widgets
+            for selector in ['form', 'button[type="submit"]', '.g-recaptcha',
+                              '[data-sitekey]', '#contact', '.contact-form', 'input[type="submit"]']:
+                try:
+                    el = page.query_selector(selector)
+                    if el and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    pass
             page.wait_for_timeout(2000)
         except Exception:
             pass
 
-        if progress_cb: progress_cb("🔍 Scanning final DOM + console logs...")
+        if progress_cb: progress_cb("🔍 Deep DOM + window object mining...")
 
-        # ── Scan final rendered HTML (post-JS) ──────
+        # ── DOM + window object deep scan ─────────────
+        try:
+            dom_result = page.evaluate("""() => {
+                const results = [];
+                const seen = new Set();
+
+                function add(key, source, type, extra) {
+                    if (!key || key.length < 10) return;
+                    const dedup = type + ':' + key;
+                    if (seen.has(dedup)) return;
+                    seen.add(dedup);
+                    results.push({key, source, type: type || 'unknown', extra: extra || {}});
+                }
+
+                // ── 1. data-sitekey + ALL captcha widget attributes ──
+                function getWidgetAttrs(el) {
+                    return {
+                        theme:    el.getAttribute('data-theme') || '',
+                        size:     el.getAttribute('data-size') || '',
+                        callback: el.getAttribute('data-callback') || '',
+                        expired:  el.getAttribute('data-expired-callback') || '',
+                        tabindex: el.getAttribute('data-tabindex') || '',
+                        invisible: el.getAttribute('data-size') === 'invisible' ||
+                                   el.getAttribute('data-badge') != null,
+                        badge:    el.getAttribute('data-badge') || '',
+                        action:   el.getAttribute('data-action') || '',
+                    };
+                }
+                function scanDOM(root) {
+                    root.querySelectorAll('[data-sitekey]').forEach(el => {
+                        add(el.getAttribute('data-sitekey'),
+                            'DOM attr: ' + el.tagName,
+                            '',
+                            getWidgetAttrs(el));
+                    });
+                    // cf-turnstile specific
+                    root.querySelectorAll('.cf-turnstile').forEach(el => {
+                        const k = el.getAttribute('data-sitekey');
+                        if (k) add(k, 'cf-turnstile div', 'Cloudflare Turnstile', {
+                            theme:  el.getAttribute('data-theme') || '',
+                            action: el.getAttribute('data-action') || '',
+                            cData:  el.getAttribute('data-cdata') || '',
+                        });
+                    });
+                    // Shadow DOM
+                    root.querySelectorAll('*').forEach(el => {
+                        if (el.shadowRoot) scanDOM(el.shadowRoot);
+                    });
+                }
+                scanDOM(document);
+
+                // ── 2. iframe srcs ──
+                document.querySelectorAll('iframe').forEach(f => {
+                    const src = f.src || '';
+                    // reCAPTCHA anchor
+                    let m = src.match(/[?&]k=([A-Za-z0-9_-]{20,60})/);
+                    if (m) {
+                        const co = src.match(/[?&]co=([A-Za-z0-9%]+)/);
+                        const hl = src.match(/[?&]hl=([a-z\-]+)/);
+                        const v  = src.match(/[?&]v=([A-Za-z0-9_\-]+)/);
+                        add(m[1], 'iframe src', 'reCAPTCHA v2', {
+                            co: co ? decodeURIComponent(co[1]) : '',
+                            hl: hl ? hl[1] : '',
+                            v:  v  ? v[1]  : '',
+                            invisible: src.includes('size=invisible'),
+                        });
+                    }
+                    // hCaptcha
+                    m = src.match(/sitekey=([0-9a-f\-]{36})/i);
+                    if (m) add(m[1], 'iframe src', 'hCaptcha', {});
+                });
+
+                // ── 3. window.___grecaptcha_cfg — full client details ──
+                try {
+                    if (window.___grecaptcha_cfg && window.___grecaptcha_cfg.clients) {
+                        Object.entries(window.___grecaptcha_cfg.clients).forEach(([id, c]) => {
+                            function findSitekeys(obj, depth, path) {
+                                if (depth > 6 || !obj) return;
+                                if (typeof obj === 'object') {
+                                    // Look for sitekey/key fields directly
+                                    const skFields = ['sitekey','site_key','k','key'];
+                                    skFields.forEach(f => {
+                                        if (obj[f] && typeof obj[f] === 'string' && obj[f].length >= 20) {
+                                            const extra = {
+                                                action:    obj.action || obj.params?.action || '',
+                                                theme:     obj.theme || obj.params?.theme || '',
+                                                size:      obj.size || obj.params?.size || '',
+                                                invisible: !!(obj.size === 'invisible' || obj.badge),
+                                                badge:     obj.badge || '',
+                                                s_param:   obj.s || '',
+                                                enterprise: !!window.___grecaptcha_cfg.fns,
+                                                min_score:  obj.minScore || '',
+                                            };
+                                            add(obj[f], 'grecaptcha_cfg.clients[' + id + '].' + f, 'reCAPTCHA', extra);
+                                        }
+                                    });
+                                    Object.values(obj).forEach(v => findSitekeys(v, depth+1, path));
+                                }
+                            }
+                            findSitekeys(c, 0, '');
+                        });
+                    }
+                } catch(e) {}
+
+                // ── 4. hCaptcha widget config ──
+                try {
+                    if (window.hcaptcha) {
+                        // hcaptcha.getRespKey / internal state
+                        const hcIframes = document.querySelectorAll('iframe[src*="hcaptcha"]');
+                        hcIframes.forEach(f => {
+                            const src = f.src;
+                            const sk = src.match(/sitekey=([0-9a-f\-]{36})/i);
+                            const hl = src.match(/[?&]hl=([a-z\-]+)/i);
+                            const theme = src.match(/[?&]theme=([a-z]+)/i);
+                            if (sk) add(sk[1], 'hcaptcha iframe', 'hCaptcha', {
+                                hl:    hl ? hl[1] : '',
+                                theme: theme ? theme[1] : '',
+                            });
+                        });
+                    }
+                } catch(e) {}
+
+                // ── 5. reCAPTCHA v3 grecaptcha.execute calls ──
+                try {
+                    // Intercept grecaptcha.execute to grab key + action
+                    if (window.grecaptcha) {
+                        const origExec = window.grecaptcha.execute;
+                        if (typeof origExec === 'function') {
+                            // Try to extract from source text
+                            const scriptTexts = Array.from(document.querySelectorAll('script:not([src])'))
+                                .map(s => s.textContent).join('\n');
+                            const execMatches = scriptTexts.matchAll(
+                                /grecaptcha\.execute\s*\(\s*['"]([A-Za-z0-9_\-]{20,60})['"]\s*,\s*\{[^}]*action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/g
+                            );
+                            for (const m of execMatches) {
+                                add(m[1], 'grecaptcha.execute() call', 'reCAPTCHA v3', {action: m[2]});
+                            }
+                        }
+                    }
+                } catch(e) {}
+
+                // ── 6. Inline script full scan with extra fields ──
+                document.querySelectorAll('script:not([src])').forEach((s, i) => {
+                    const t = s.textContent || '';
+                    // v3 keys (start with 6)
+                    [...t.matchAll(/['"](6[A-Za-z0-9_\-]{39})['"]/g)].forEach(m => {
+                        // Look for nearby action
+                        const ctx = t.substring(Math.max(0, m.index-200), m.index+200);
+                        const act = ctx.match(/action\s*:\s*['"]([a-zA-Z0-9_\/]{2,60})['"]/);
+                        add(m[1], 'inline script #'+i, 'reCAPTCHA v3', {action: act ? act[1] : ''});
+                    });
+                    // hCaptcha UUIDs
+                    [...t.matchAll(/['"]([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['"]/gi)].forEach(m => {
+                        add(m[1], 'inline script #'+i+' (UUID)', 'hCaptcha', {});
+                    });
+                    // Turnstile 0x/1x keys
+                    [...t.matchAll(/['"]([01]x[A-Fa-f0-9_\-]{20,60})['"]/g)].forEach(m => {
+                        add(m[1], 'inline script #'+i, 'Cloudflare Turnstile', {});
+                    });
+                    // Generic sitekey= assignments
+                    [...t.matchAll(/sitekey\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,60})['"]/gi)].forEach(m => {
+                        add(m[1], 'inline script #'+i+' sitekey=', '', {});
+                    });
+                });
+
+                // ── 7. window globals ──
+                const kwds = ['sitekey','site_key','recaptcha','captcha','hcaptcha','turnstile','captchaKey'];
+                try {
+                    Object.keys(window).forEach(k => {
+                        if (kwds.some(kw => k.toLowerCase().includes(kw))) {
+                            try {
+                                const v = window[k];
+                                if (typeof v === 'string' && v.length >= 10 && v.length <= 80) {
+                                    add(v, 'window.' + k, '', {});
+                                } else if (typeof v === 'object' && v !== null) {
+                                    const js = JSON.stringify(v);
+                                    [
+                                        ...js.matchAll(/"(?:sitekey|site_key|key)":"([A-Za-z0-9_\-]{20,60})"/g),
+                                        ...js.matchAll(/"(6[A-Za-z0-9_\-]{39})"/g),
+                                        ...js.matchAll(/"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"/gi),
+                                    ].forEach(m => add(m[1], 'window.'+k+' obj', '', {}));
+                                }
+                            } catch(e) {}
+                        }
+                    });
+                } catch(e) {}
+
+                return results;
+            }""")
+
+            for item in (dom_result or []):
+                key = (item.get("key") or "").strip()
+                if not key or len(key) < 10:
+                    continue
+                hint = item.get("type") or _classify_key(key)
+                if not hint or hint == "unknown":
+                    hint = _classify_key(key)
+                extra = item.get("extra") or {}
+                dedup = hint + ":" + key
+                if dedup not in seen_keys:
+                    seen_keys.add(dedup)
+                    findings.append({
+                        "type":     hint,
+                        "site_key": key,
+                        "page_url": page_url_ref[0],
+                        "action":   extra.get("action", ""),
+                        "source":   item.get("source", "DOM"),
+                        # ── Extra fields for captcha solvers ──
+                        "theme":      extra.get("theme", ""),
+                        "size":       extra.get("size", ""),
+                        "invisible":  extra.get("invisible", False),
+                        "badge":      extra.get("badge", ""),
+                        "min_score":  extra.get("min_score", ""),
+                        "enterprise": extra.get("enterprise", False),
+                        "s_param":    extra.get("s_param", ""),
+                        "hl":         extra.get("hl", ""),
+                        "co":         extra.get("co", ""),
+                        "callback":   extra.get("callback", ""),
+                    })
+
+        except Exception as e:
+            logger.debug("DOM eval error: %s", e)
+
+        # ── Scan rendered HTML ─────────────────────────
         try:
             final_html = page.content()
+            _scan_text(final_html, "Rendered HTML (post-JS)")
         except Exception:
             final_html = ""
 
-        # ── Extract data-sitekey from DOM via evaluate ──
+        # ── Scan all loaded JS source text via CDP ─────
+        if progress_cb: progress_cb("📦 Extracting inline JS variables...")
         try:
-            dom_keys = page.evaluate("""() => {
-                const results = [];
-                // data-sitekey attributes
-                document.querySelectorAll('[data-sitekey]').forEach(el => {
-                    results.push({key: el.getAttribute('data-sitekey'), tag: el.tagName});
-                });
-                // grecaptcha object
-                try {
-                    if (window.grecaptcha && window.grecaptcha.enterprise) {
-                        results.push({key: 'grecaptcha.enterprise detected', tag: 'JS'});
-                    }
-                } catch(e) {}
-                return results;
-            }""")
-            for item in (dom_keys or []):
-                key = (item.get("key") or "").strip()
-                if key and len(key) >= 10:
-                    # Determine type from key format
-                    if re.match(r'[0-9a-f]{8}-[0-9a-f]{4}', key, re.I):
-                        cap_type = "hCaptcha"
-                    elif re.match(r'[01]x[0-9A-Fa-f]', key):
-                        cap_type = "Cloudflare Turnstile"
-                    else:
-                        cap_type = "reCAPTCHA"
-                    _add_finding(cap_type, key, f"DOM data-sitekey ({item.get('tag','')})", page_url_ref[0])
+            js_urls_in_page = page.evaluate("""() =>
+                Array.from(document.querySelectorAll('script[src]'))
+                     .map(s => s.src)
+                     .filter(s => s.startsWith('http'))
+            """)
+            # Fetch and scan up to 10 JS files via browser (bypasses IP blocks)
+            for js_url in (js_urls_in_page or [])[:10]:
+                try:
+                    js_resp = ctx.request.get(js_url, timeout=8000)
+                    if js_resp.ok:
+                        _scan_text(js_resp.text(), f"JS via browser: {js_url[:80]}")
+                except Exception:
+                    pass
         except Exception:
             pass
 
         browser.close()
 
-    # ── Also scan final HTML with existing extractor ─
-    if final_html:
-        js_sources_extra = {}
-        existing = _extract_captcha_info(final_html, page_url_ref[0], js_sources_extra)
-        for f in existing:
-            dedup = f["type"] + ":" + f["site_key"]
-            if dedup not in seen_keys and f["site_key"]:
-                seen_keys.add(dedup)
-                f["source"] = "Rendered HTML — " + f["source"]
-                findings.append(f)
+    # ── Console log scan ─────────────────────────────
+    if console_log:
+        _scan_text("\n".join(console_log), "Console log")
 
-    # ── Scan console logs for leaked keys ───────────
-    console_text = "\n".join(console_log)
-    if console_text:
-        for pat, cap_type in _CAPTCHA_PATTERNS.items():
-            for p in _CAPTCHA_PATTERNS[pat] if isinstance(pat, str) else []:
-                for m in p.finditer(console_text):
-                    try:
-                        key = m.group(1)
-                        _add_finding(pat, key, "Console log", page_url_ref[0])
-                    except Exception:
-                        pass
+    # ── Fill user_agent into all findings ────────────
+    ua = _get_headers().get("User-Agent", "")
+    for f in findings:
+        if not f.get("user_agent"):
+            f["user_agent"] = ua
 
     return {
-        "findings":      findings,
-        "page_url":      page_url_ref[0],
-        "js_fetched":    len(network_log),   # total intercepted requests
-        "network_log":   network_log[:50],   # first 50 for debug
-        "error":         None,
+        "findings":    findings,
+        "page_url":    page_url_ref[0],
+        "js_fetched":  len(network_log),
+        "error":       None,
     }
-
 
 def _sitekey_sync(url: str, progress_cb=None) -> dict:
     """
@@ -6114,11 +6411,50 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, f in enumerate(findings, 1):
         icon = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
         lines.append(f"*{icon} [{i}] {f['type']}*")
-        lines.append(f"  🔑 `site_key` : `{f['site_key'] or 'N/A'}`")
+        lines.append(f"  🔑 `site_key`  : `{f['site_key'] or 'N/A'}`")
         lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
-        if f["action"]:
-            lines.append(f"  ⚡ `action`    : `{f['action']}`")
-        lines.append(f"  📂 Source     : _{f['source'][:70]}_")
+        if f.get("action"):
+            lines.append(f"  ⚡ `action`     : `{f['action']}`")
+        if f.get("invisible"):
+            lines.append(f"  👁️ `invisible`  : `true`")
+        if f.get("min_score"):
+            lines.append(f"  📊 `min_score` : `{f['min_score']}`")
+        if f.get("enterprise"):
+            lines.append(f"  🏢 `enterprise` : `true`")
+        if f.get("theme"):
+            lines.append(f"  🎨 `theme`      : `{f['theme']}`")
+        if f.get("size") and f["size"] != "normal":
+            lines.append(f"  📐 `size`       : `{f['size']}`")
+        if f.get("badge"):
+            lines.append(f"  🏷️ `badge`      : `{f['badge']}`")
+        if f.get("s_param"):
+            lines.append(f"  🔐 `s param`    : `{f['s_param'][:40]}`")
+        if f.get("hl"):
+            lines.append(f"  🌍 `hl`         : `{f['hl']}`")
+        if f.get("co"):
+            lines.append(f"  🏠 `co`         : `{f['co']}`")
+        if f.get("callback"):
+            lines.append(f"  📞 `callback`   : `{f['callback']}`")
+        if f.get("user_agent"):
+            lines.append(f"  🖥️ `user_agent` : `{f['user_agent'][:60]}`")
+        lines.append(f"  📂 Source      : _{f['source'][:70]}_")
+        lines.append("")
+
+        # ── Solver-ready block ─────────────────────────────
+        lines.append("  *📋 Solver params (copy-ready):*")
+        lines.append(f"  `type`      = `{f['type']}`")
+        lines.append(f"  `sitekey`   = `{f['site_key']}`")
+        lines.append(f"  `pageurl`   = `{f['page_url']}`")
+        if f.get("action"):
+            lines.append(f"  `action`    = `{f['action']}`")
+        if f.get("enterprise"):
+            lines.append(f"  `enterprise`= `1`")
+        if f.get("min_score"):
+            lines.append(f"  `min_score` = `{f['min_score']}`")
+        if f.get("invisible"):
+            lines.append(f"  `invisible` = `1`")
+        if f.get("s_param"):
+            lines.append(f"  `data-s`    = `{f['s_param'][:40]}`")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
@@ -6139,18 +6475,43 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import io as _io
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d    = re.sub(r'[^\w\-]', '_', domain)
-    export    = {
-        "domain":      domain,
-        "page_url":    page_url,
-        "scanned_at":  datetime.now().isoformat(),
-        "js_scanned":  js_count,
+    export = {
+        "domain":     domain,
+        "page_url":   page_url,
+        "scanned_at": datetime.now().isoformat(),
+        "js_scanned": js_count,
         "findings": [
             {
-                "type":     f["type"],
-                "site_key": f["site_key"],
-                "page_url": f["page_url"],
-                "action":   f["action"],
-                "source":   f["source"],
+                "type":       f["type"],
+                "site_key":   f["site_key"],
+                "page_url":   f["page_url"],
+                "action":     f.get("action", ""),
+                "source":     f.get("source", ""),
+                "theme":      f.get("theme", ""),
+                "size":       f.get("size", ""),
+                "invisible":  f.get("invisible", False),
+                "badge":      f.get("badge", ""),
+                "min_score":  f.get("min_score", ""),
+                "enterprise": f.get("enterprise", False),
+                "s_param":    f.get("s_param", ""),
+                "hl":         f.get("hl", ""),
+                "co":         f.get("co", ""),
+                "callback":   f.get("callback", ""),
+                "user_agent": f.get("user_agent", ""),
+                # ── Solver-ready format ──
+                "solver_params": {
+                    k: v for k, v in {
+                        "type":       f["type"],
+                        "sitekey":    f["site_key"],
+                        "pageurl":    f["page_url"],
+                        "action":     f.get("action"),
+                        "enterprise": 1 if f.get("enterprise") else None,
+                        "min_score":  f.get("min_score") or None,
+                        "invisible":  1 if f.get("invisible") else None,
+                        "data-s":     f.get("s_param") or None,
+                        "useragent":  f.get("user_agent") or None,
+                    }.items() if v is not None and v != ""
+                },
             }
             for f in findings
         ],
@@ -6169,6 +6530,1805 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.warning("Sitekey export error: %s", e)
+
+
+
+
+# ══════════════════════════════════════════════════
+# 🗝️  KEY EXTRACTOR ENGINE — Shared Playwright runner
+# ══════════════════════════════════════════════════
+
+def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
+    """
+    Generic Playwright runner:
+    - Launches stealth browser
+    - Intercepts ALL network requests/responses
+    - Executes custom js_eval_code in page context after load
+    - Returns: {html, network_log, console_log, dom_result, page_url, error}
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {"error": "playwright_not_installed", "html": "", "network_log": [],
+                "console_log": [], "dom_result": None, "page_url": url}
+
+    network_log  = []   # list of {url, method, post_data, response_body}
+    console_log  = []
+    page_url_ref = [url]
+
+    with sync_playwright() as pw:
+        _px = proxy_manager.get_proxy()
+        _pw_proxy = None
+        if _px:
+            from urllib.parse import urlparse as _up
+            _pp = _up(_px.get("http") or _px.get("https", ""))
+            _pw_proxy = {"server": f"{_pp.scheme}://{_pp.hostname}:{_pp.port}"}
+            if _pp.username:
+                _pw_proxy["username"] = _pp.username
+                _pw_proxy["password"] = _pp.password or ""
+
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"]
+        )
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 768},
+            ignore_https_errors=True,
+            proxy=_pw_proxy,
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+            }
+        )
+        ctx.add_init_script("""
+            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
+            window.chrome={runtime:{}};
+        """)
+        page = ctx.new_page()
+
+        def _on_request(req):
+            entry = {"url": req.url, "method": req.method, "post_data": "", "response_body": ""}
+            try:
+                if req.post_data:
+                    entry["post_data"] = req.post_data[:2000]
+            except Exception:
+                pass
+            network_log.append(entry)
+
+        def _on_response(resp):
+            for entry in network_log:
+                if entry["url"] == resp.url and not entry["response_body"]:
+                    try:
+                        body = resp.body()
+                        entry["response_body"] = body.decode("utf-8", errors="ignore")[:5000]
+                    except Exception:
+                        pass
+                    break
+
+        page.on("request",  _on_request)
+        page.on("response", _on_response)
+        page.on("console",  lambda m: console_log.append(m.text))
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            page_url_ref[0] = page.url
+        except PWTimeout:
+            page_url_ref[0] = page.url
+        except Exception as e:
+            browser.close()
+            return {"error": str(e), "html": "", "network_log": [],
+                    "console_log": [], "dom_result": None, "page_url": url}
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=7_000)
+        except Exception:
+            pass
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        # Fetch external JS via browser context (bypasses IP/geo blocks)
+        js_urls = []
+        try:
+            js_urls = page.evaluate("""() =>
+                [...document.querySelectorAll('script[src]')]
+                    .map(s=>s.src).filter(s=>s.startsWith('http'))
+            """) or []
+        except Exception:
+            pass
+        for js_url in js_urls[:12]:
+            if not any(e["url"] == js_url and e["response_body"] for e in network_log):
+                try:
+                    r = ctx.request.get(js_url, timeout=8000)
+                    if r.ok:
+                        network_log.append({"url": js_url, "method": "GET",
+                                            "post_data": "", "response_body": r.text()[:80000]})
+                except Exception:
+                    pass
+
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+
+        dom_result = None
+        if js_eval_code:
+            try:
+                dom_result = page.evaluate(js_eval_code)
+            except Exception as e:
+                logger.debug("JS eval error: %s", e)
+
+        browser.close()
+
+    return {
+        "error":       None,
+        "html":        html,
+        "network_log": network_log,
+        "console_log": console_log,
+        "dom_result":  dom_result,
+        "page_url":    page_url_ref[0],
+    }
+
+
+def _static_extract(url: str) -> dict:
+    """Fallback: requests-based HTML + JS fetch (no browser)."""
+    session = requests.Session()
+    session.headers.update(_get_headers())
+    px = proxy_manager.get_proxy()
+    if px:
+        session.proxies.update(px)
+    try:
+        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
+        html = resp.text
+        page_url = resp.url
+    except Exception as e:
+        return {"error": str(e), "html": "", "network_log": [], "page_url": url}
+
+    from urllib.parse import urlparse as _up2
+    fp = _up2(page_url)
+    base = f"{fp.scheme}://{fp.netloc}"
+    soup_s = BeautifulSoup(html, "html.parser")
+    network_log = []
+    for tag in soup_s.find_all("script", src=True):
+        src = tag["src"]
+        if src.startswith("//"): src = fp.scheme + ":" + src
+        elif src.startswith("/"): src = base + src
+        if src.startswith("http"):
+            try:
+                r2 = session.get(src, timeout=8, verify=False)
+                if r2.status_code == 200:
+                    network_log.append({"url": src, "method": "GET",
+                                        "post_data": "", "response_body": r2.text[:80000]})
+            except Exception:
+                pass
+    return {"error": None, "html": html, "network_log": network_log,
+            "console_log": [], "page_url": page_url}
+
+
+def _gather_all_text(data: dict) -> list:
+    """Return list of (text, source_label) from html + all JS."""
+    texts = []
+    if data.get("html"):
+        texts.append((data["html"], "HTML source"))
+    for entry in data.get("network_log", []):
+        if entry.get("response_body"):
+            texts.append((entry["response_body"], f"JS: {entry['url'][:70]}"))
+        if entry.get("post_data"):
+            texts.append((entry["post_data"], f"POST → {entry['url'][:60]}"))
+    if data.get("console_log"):
+        texts.append(("\n".join(data["console_log"]), "Console logs"))
+    return texts
+
+
+def _extract_run(url: str, js_code: str, progress_cb=None) -> dict:
+    """Try Playwright first, fallback to static."""
+    if progress_cb: progress_cb("🌐 Launching browser...")
+    data = _run_playwright_extract(url, js_code, progress_cb)
+    if data.get("error") == "playwright_not_installed":
+        if progress_cb: progress_cb("⚠️ Playwright not found — static scan fallback...")
+        data = _static_extract(url)
+    return data
+
+
+# ══════════════════════════════════════════════════
+# 🔑  1. /apikeys — API Key Extractor
+# ══════════════════════════════════════════════════
+
+_API_KEY_PATTERNS = [
+    # Google
+    ("Google Maps / Places / YouTube",  re.compile(r'\b(AIza[0-9A-Za-z_\-]{35})\b')),
+    # OpenAI
+    ("OpenAI",                           re.compile(r'\b(sk-[A-Za-z0-9]{20,60})\b')),
+    ("OpenAI Project key",               re.compile(r'\b(sk-proj-[A-Za-z0-9\-_]{40,120})\b')),
+    # AWS
+    ("AWS Access Key ID",                re.compile(r'\b(AKIA[0-9A-Z]{16})\b')),
+    ("AWS Secret Access Key",            re.compile(r'(?i)aws.{0,30}secret.{0,10}[=:\s]["\']?([A-Za-z0-9/+=]{40})\b')),
+    # Twilio
+    ("Twilio Account SID",               re.compile(r'\b(AC[a-f0-9]{32})\b')),
+    ("Twilio Auth Token",                re.compile(r'(?i)twilio.{0,30}auth.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
+    # SendGrid
+    ("SendGrid",                         re.compile(r'\b(SG\.[A-Za-z0-9_\-]{22,60}\.[A-Za-z0-9_\-]{22,60})\b')),
+    # Mapbox
+    ("Mapbox Token",                     re.compile(r'\b(pk\.eyJ1[A-Za-z0-9_\-\.]+)\b')),
+    # GitHub
+    ("GitHub Token",                     re.compile(r'\b(gh[pousr]_[A-Za-z0-9]{36,255})\b')),
+    # Slack
+    ("Slack Bot Token",                  re.compile(r'\b(xox[baprs]-[A-Za-z0-9\-]{20,200})\b')),
+    ("Slack Webhook",                    re.compile(r'(https://hooks\.slack\.com/services/T[A-Za-z0-9]+/B[A-Za-z0-9]+/[A-Za-z0-9]+)')),
+    # Mailchimp
+    ("Mailchimp API Key",                re.compile(r'\b([0-9a-f]{32}-us[0-9]{1,2})\b')),
+    # HubSpot
+    ("HubSpot API Key",                  re.compile(r'(?i)hubspot.{0,30}[=:\s]["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b')),
+    # Square
+    ("Square Access Token",              re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,43})\b')),
+    # Shopify
+    ("Shopify Storefront Token",         re.compile(r'(?i)shopify.{0,30}token.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
+    # Generic secret/api key patterns
+    ("Generic API Key",                  re.compile(r'(?i)(?:api[_\-]?key|apikey|api[_\-]?token|access[_\-]?key|secret[_\-]?key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
+]
+
+_APIKEY_JS_EVAL = """() => {
+    const results = {};
+    const kwds = ['apiKey','api_key','apikey','accessKey','secretKey','authToken',
+                  'OPENAI_API_KEY','GOOGLE_API_KEY','MAPBOX_TOKEN','AWS_ACCESS'];
+    kwds.forEach(k => {
+        try {
+            const v = window[k] || (window.__ENV__ && window.__ENV__[k])
+                     || (window._env_ && window._env_[k])
+                     || (window.ENV && window.ENV[k]);
+            if (v && typeof v === 'string' && v.length > 10) results[k] = v;
+        } catch(e) {}
+    });
+    // Also scan meta tags
+    document.querySelectorAll('meta[name*="key"],meta[name*="token"]').forEach(m=>{
+        if (m.content && m.content.length > 10) results['meta:'+m.name] = m.content;
+    });
+    return results;
+}"""
+
+def _apikeys_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _APIKEY_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+
+    findings = []
+    seen = set()
+
+    def _add(key_type, value, source):
+        dedup = key_type + ":" + value[:60]
+        if dedup in seen or len(value) < 10:
+            return
+        seen.add(dedup)
+        findings.append({"type": key_type, "value": value, "source": source})
+
+    if progress_cb: progress_cb("🔍 Scanning all sources for API keys...")
+
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _API_KEY_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip(), label)
+
+    # DOM result
+    for k, v in (data.get("dom_result") or {}).items():
+        for key_type, pat in _API_KEY_PATTERNS:
+            m = pat.search(str(v))
+            if m:
+                _add(key_type, (m.group(1) if m.lastindex else m.group(0)), f"window.{k}")
+        if len(str(v)) > 15:
+            _add("window global", str(v)[:80], f"window.{k}")
+
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/apikeys <url> — Extract Google, OpenAI, AWS, Twilio, Mapbox & more API keys"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/apikeys https://example.com`\n\n"
+            "🔑 *Detects:*\n"
+            "  • Google Maps / Places / YouTube (`AIza...`)\n"
+            "  • OpenAI (`sk-...`)\n"
+            "  • AWS Access Key ID (`AKIA...`)\n"
+            "  • Twilio, SendGrid, Mapbox, Slack\n"
+            "  • GitHub tokens, Mailchimp, HubSpot\n"
+            "  • Generic api\\_key / secret patterns\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔑 *API Key Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔑 *API Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_apikeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]
+    page_url = result["page_url"]
+    reqs = result.get("requests", 0)
+    if not findings:
+        await msg.edit_text(
+            f"🔑 *API Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No API keys found\n🌐 `{page_url}`\n📡 Requests: `{reqs}`",
+            parse_mode='Markdown')
+        return
+    lines = [f"🔑 *API Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"📡 Requests: `{reqs}`",
+             f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*")
+        lines.append(f"  `{f['value'][:80]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    export = {"domain": domain, "page_url": page_url, "scanned_at": datetime.now().isoformat(),
+              "findings": findings}
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode()),
+            filename=f"apikeys_{safe_d}_{ts}.json",
+            caption=f"🔑 API Keys — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("apikeys export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🔥  2. /firebase — Firebase Config Extractor
+# ══════════════════════════════════════════════════
+
+_FIREBASE_JS_EVAL = """() => {
+    const results = {};
+    // Check window.firebaseConfig or similar globals
+    ['firebaseConfig','firebase_config','FIREBASE_CONFIG','__firebase_config',
+     '_firebaseConfig','firebaseOptions'].forEach(k => {
+        try { if (window[k] && typeof window[k]==='object') results[k] = window[k]; } catch(e){}
+    });
+    // Check Firebase app instances
+    try {
+        if (window.firebase && window.firebase.apps && window.firebase.apps.length) {
+            results['firebase_app'] = window.firebase.apps[0].options;
+        }
+    } catch(e) {}
+    // Check __NEXT_DATA__ / __nuxt / window.__env
+    ['__NEXT_DATA__','__nuxt','__ENV__','_env_','ENV','REACT_APP_ENV'].forEach(k=>{
+        try {
+            const v = window[k];
+            if (v && typeof v === 'object') {
+                const s = JSON.stringify(v);
+                if (s.includes('firebaseConfig') || s.includes('apiKey') && s.includes('projectId')) {
+                    results['env:'+k] = v;
+                }
+            }
+        } catch(e) {}
+    });
+    return results;
+}"""
+
+_FIREBASE_PATTERNS = re.compile(
+    r'(?:firebaseConfig|initializeApp)\s*[=({]\s*\{([^}]{50,2000})\}', re.I | re.S)
+_FIREBASE_FIELD = re.compile(
+    r'(?:apiKey|authDomain|projectId|storageBucket|messagingSenderId|appId|measurementId|databaseURL)'
+    r'\s*:\s*["\']([^"\']{4,200})["\']', re.I)
+
+def _firebase_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _FIREBASE_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+
+    configs = []
+    seen = set()
+
+    def _parse_config_block(block: str, source: str):
+        fields = {}
+        for m in _FIREBASE_FIELD.finditer(block):
+            fields[m.group(0).split(":")[0].strip().strip('"\'').strip()] = m.group(1)
+        if fields.get("projectId") or fields.get("apiKey"):
+            key = fields.get("projectId", "") + fields.get("apiKey", "")
+            if key not in seen:
+                seen.add(key)
+                configs.append({"source": source, "config": fields})
+
+    if progress_cb: progress_cb("🔍 Scanning for Firebase config...")
+
+    for text, label in _gather_all_text(data):
+        for m in _FIREBASE_PATTERNS.finditer(text):
+            _parse_config_block(m.group(0), label)
+        # Also scan line by line for firebaseConfig object
+        if "projectId" in text and "apiKey" in text:
+            _parse_config_block(text, label)
+
+    # DOM result
+    dr = data.get("dom_result") or {}
+    for k, v in dr.items():
+        if isinstance(v, dict) and ("projectId" in v or "apiKey" in v):
+            key = str(v.get("projectId","")) + str(v.get("apiKey",""))
+            if key not in seen:
+                seen.add(key)
+                configs.append({"source": f"window.{k}", "config": {str(fk): str(fv) for fk,fv in v.items() if isinstance(fv, str)}})
+        elif isinstance(v, (dict, list)):
+            _parse_config_block(json.dumps(v), f"window.{k}")
+
+    return {"error": None, "findings": configs, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/firebase <url> — Extract Firebase project config (apiKey, projectId, appId, etc.)"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/firebase https://example.com`\n\n"
+            "🔥 *Extracts full Firebase config:*\n"
+            "  • `apiKey` — Firebase API key\n"
+            "  • `authDomain` — Auth domain\n"
+            "  • `projectId` — Project identifier\n"
+            "  • `storageBucket` — Storage bucket\n"
+            "  • `messagingSenderId` — FCM sender\n"
+            "  • `appId` — App identifier\n"
+            "  • `measurementId` — Analytics\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔥 *Firebase Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔥 *Firebase — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_firebase_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]
+    page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"🔥 *Firebase Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No Firebase config found\n🌐 `{page_url}`",
+            parse_mode='Markdown')
+        return
+    lines = [f"🔥 *Firebase Config — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}` config(s)\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] Firebase Config*")
+        lines.append(f"  _📂 {f['source'][:60]}_")
+        for k, v in f["config"].items():
+            lines.append(f"  `{k}`: `{v}`")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"firebase_{safe_d}_{ts}.json",
+            caption=f"🔥 Firebase Config — `{domain}`",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("firebase export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 💳  3. /paykeys — Payment Key Extractor
+# ══════════════════════════════════════════════════
+
+_PAY_PATTERNS = [
+    ("Stripe Publishable Key",  re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Secret Key",       re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Webhook Secret",   re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Restricted Key",   re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("PayPal Client ID",        re.compile(r'(?i)(?:paypal|client.{0,10}id)\s*[=:]\s*["\']?(A[A-Za-z0-9_\-]{50,100})\b')),
+    ("Braintree Tokenization",  re.compile(r'(?i)(?:braintree|tokenization).{0,30}[=:]\s*["\']([A-Za-z0-9]{24,100})\b')),
+    ("Square App ID",           re.compile(r'\b(sq0idp-[A-Za-z0-9_\-]{22,43})\b')),
+    ("Square Access Token",     re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,43})\b')),
+    ("Razorpay Key ID",         re.compile(r'\b(rzp_(?:live|test)_[A-Za-z0-9]{14,20})\b')),
+    ("Adyen Client Key",        re.compile(r'(?i)adyen.{0,30}clientkey.{0,10}[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
+    ("Authorize.net API Login",  re.compile(r'(?i)authorize.{0,30}(?:login|api).{0,10}[=:]\s*["\']([A-Za-z0-9]{6,20})["\']')),
+    ("WooCommerce Consumer Key", re.compile(r'\b(ck_[a-f0-9]{40})\b')),
+    ("WooCommerce Consumer Secret", re.compile(r'\b(cs_[a-f0-9]{40})\b')),
+    ("Paddle Vendor ID",        re.compile(r'(?i)paddle.{0,20}vendor.{0,10}[=:]\s*["\']?(\d{4,10})\b')),
+    ("Mollie API Key",          re.compile(r'\b((?:live|test)_[A-Za-z0-9]{30,45})\b')),
+    ("Klarna API Username",     re.compile(r'(?i)klarna.{0,30}username.{0,10}[=:]\s*["\']([A-Za-z0-9_\-@.]{5,60})["\']')),
+    ("Checkout.com Public Key", re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b')),
+    ("Shopify Store Domain",    re.compile(r'(?i)shopify.{0,30}store.{0,10}[=:]\s*["\']([a-z0-9\-]+\.myshopify\.com)["\']')),
+    ("PaymentIntent client secret", re.compile(r'\b(pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
+]
+
+_PAY_JS_EVAL = """() => {
+    const res = {};
+    ['Stripe','paypal','braintree','square','razorpay','STRIPE_PUBLISHABLE_KEY',
+     'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY','REACT_APP_STRIPE_KEY'].forEach(k => {
+        try {
+            const v = window[k];
+            if (v && (typeof v === 'string' || typeof v === 'object')) {
+                res[k] = typeof v === 'string' ? v : JSON.stringify(v).substring(0,300);
+            }
+        } catch(e) {}
+    });
+    // Stripe on-page initialization
+    try {
+        if (window.Stripe && typeof window.Stripe === 'function') {
+            res['StripeLoaded'] = 'true';
+        }
+    } catch(e) {}
+    return res;
+}"""
+
+def _paykeys_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, v, src):
+        d = t+":"+v[:60]
+        if d not in seen and len(v) >= 6:
+            seen.add(d); findings.append({"type": t, "value": v, "source": src})
+    if progress_cb: progress_cb("🔍 Scanning for payment keys...")
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _PAY_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip(), label)
+    for k, v in (data.get("dom_result") or {}).items():
+        s = str(v)
+        for key_type, pat in _PAY_PATTERNS:
+            mm = pat.search(s)
+            if mm:
+                val = mm.group(1) if mm.lastindex else mm.group(0)
+                _add(key_type, val, f"window.{k}")
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/paykeys <url> — Extract Stripe, PayPal, Braintree, Square, Razorpay payment keys"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/paykeys https://example.com`\n\n"
+            "💳 *Detects:*\n"
+            "  • Stripe publishable/secret/restricted keys\n"
+            "  • PayPal Client ID\n"
+            "  • Braintree tokenization key\n"
+            "  • Square, Razorpay, Klarna, Mollie\n"
+            "  • WooCommerce consumer key/secret\n"
+            "  • Checkout.com, Adyen, Paddle\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"💳 *Payment Key Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"💳 *Payment Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_paykeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"💳 *Payment Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No payment keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"💳 *Payment Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        env = "🔴 LIVE" if ("live" in f["value"].lower() or "prod" in f["value"].lower()) else "🟡 TEST"
+        lines.append(f"*[{i}] {f['type']}* {env}")
+        lines.append(f"  `{f['value'][:80]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"paykeys_{safe_d}_{ts}.json",
+            caption=f"💳 Payment Keys — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("paykeys export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 👤  4. /socialkeys — OAuth & Social Login IDs
+# ══════════════════════════════════════════════════
+
+_SOCIAL_PATTERNS = [
+    ("Google Client ID",        re.compile(r'\b(\d{10,20}-[a-z0-9]{32}\.apps\.googleusercontent\.com)\b')),
+    ("Google OAuth Client ID",  re.compile(r'(?i)(?:google|oauth|client).{0,20}id.{0,10}[=:\s]["\']?(\d{10,20}-[a-z0-9]+\.apps\.googleusercontent\.com)')),
+    ("Facebook App ID",         re.compile(r'(?i)(?:facebook|fb).{0,20}(?:app.{0,5}id|appid).{0,10}[=:\s]["\']?(\d{10,20})\b')),
+    ("Facebook Pixel ID",       re.compile(r'(?i)(?:fbq|fb.{0,10}pixel).{0,30}["\']?(\d{10,20})["\']?')),
+    ("Apple Client ID",         re.compile(r'(?i)apple.{0,20}(?:client.{0,5}id|service.{0,5}id).{0,10}[=:\s]["\']([A-Za-z0-9.]{5,60})["\']')),
+    ("Apple Team ID",           re.compile(r'(?i)apple.{0,20}team.{0,5}id.{0,10}[=:\s]["\']?([A-Z0-9]{10})\b')),
+    ("GitHub OAuth App ID",     re.compile(r'(?i)github.{0,20}client.{0,5}id.{0,10}[=:\s]["\']([A-Za-z0-9]{20})["\']')),
+    ("Twitter/X Consumer Key",  re.compile(r'(?i)twitter.{0,20}(?:consumer|api).{0,5}key.{0,10}[=:\s]["\']([A-Za-z0-9]{25,35})["\']')),
+    ("LinkedIn Client ID",      re.compile(r'(?i)linkedin.{0,20}client.{0,5}id.{0,10}[=:\s]["\']([A-Za-z0-9]{14})["\']')),
+    ("Discord Client ID",       re.compile(r'(?i)discord.{0,20}client.{0,5}id.{0,10}[=:\s]["\']?(\d{17,19})\b')),
+    ("Discord Bot Token",       re.compile(r'\b([A-Za-z0-9_\-]{24}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27,38})\b')),
+    ("Spotify Client ID",       re.compile(r'(?i)spotify.{0,20}client.{0,5}id.{0,10}[=:\s]["\']([a-f0-9]{32})["\']')),
+    ("Amazon Cognito Pool",     re.compile(r'\b([a-z]{2}-[a-z]{4,9}-[12]_[A-Za-z0-9]{9})\b')),
+    ("Auth0 Domain",            re.compile(r'(?i)auth0.{0,20}domain.{0,10}[=:\s]["\']([a-z0-9\-]+\.(?:us|eu|au)\.auth0\.com)["\']')),
+    ("Auth0 Client ID",         re.compile(r'(?i)auth0.{0,20}client.{0,5}id.{0,10}[=:\s]["\']([A-Za-z0-9]{32,64})["\']')),
+    ("Okta Client ID",          re.compile(r'(?i)okta.{0,20}client.{0,5}id.{0,10}[=:\s]["\']([A-Za-z0-9]{20,40})["\']')),
+    ("Microsoft App ID",        re.compile(r'(?i)(?:azure|microsoft|ms).{0,20}(?:client|app).{0,5}id.{0,10}[=:\s]["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']')),
+]
+
+_SOCIAL_JS_EVAL = """() => {
+    const res = {};
+    const srcs = [...document.querySelectorAll('script[src]')].map(s=>s.src);
+    // Google sign-in meta
+    document.querySelectorAll('meta[name="google-signin-client_id"]').forEach(m=>{
+        res['google_signin_meta'] = m.content;
+    });
+    // FB init call
+    try { if (window.FB && window.FB.getLoginStatus) res['FB_loaded'] = 'true'; } catch(e){}
+    // Apple ID
+    try { if (window.AppleID) res['AppleID_loaded'] = 'true'; } catch(e){}
+    // Check __ENV__ objects
+    try {
+        const envs = [window.__ENV__, window._env_, window.ENV, window.__NEXT_DATA__?.props?.pageProps];
+        envs.forEach((e,i) => {
+            if (!e) return;
+            const s = JSON.stringify(e)||'';
+            if (s.includes('CLIENT_ID')||s.includes('APP_ID')||s.includes('OAUTH')) {
+                res['env_'+i] = s.substring(0, 500);
+            }
+        });
+    } catch(e) {}
+    return res;
+}"""
+
+def _socialkeys_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _SOCIAL_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, v, src):
+        d = t+":"+v[:60]
+        if d not in seen and len(v) >= 5:
+            seen.add(d); findings.append({"type": t, "value": v, "source": src})
+    if progress_cb: progress_cb("🔍 Scanning for OAuth / social login IDs...")
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _SOCIAL_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip(), label)
+    for k, v in (data.get("dom_result") or {}).items():
+        s = str(v)
+        for key_type, pat in _SOCIAL_PATTERNS:
+            mm = pat.search(s)
+            if mm:
+                _add(key_type, (mm.group(1) if mm.lastindex else mm.group(0)), f"window.{k}")
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/socialkeys <url> — Extract Google, Facebook, Apple, Discord OAuth IDs"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/socialkeys https://example.com`\n\n"
+            "👤 *Detects:*\n"
+            "  • Google OAuth Client ID\n"
+            "  • Facebook App ID & Pixel ID\n"
+            "  • Apple Client ID / Team ID\n"
+            "  • GitHub, Twitter/X, LinkedIn, Discord\n"
+            "  • Spotify, Amazon Cognito, Auth0, Okta\n"
+            "  • Microsoft Azure App ID\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"👤 *OAuth Key Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"👤 *Social Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_socialkeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"👤 *OAuth Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No social/OAuth keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"👤 *Social / OAuth Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*")
+        lines.append(f"  `{f['value'][:80]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"socialkeys_{safe_d}_{ts}.json",
+            caption=f"👤 Social Keys — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("socialkeys export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 📊  5. /analytics — Analytics ID Extractor
+# ══════════════════════════════════════════════════
+
+_ANALYTICS_PATTERNS = [
+    ("Google Analytics 4",      re.compile(r'\b(G-[A-Z0-9]{8,12})\b')),
+    ("Google Analytics UA",     re.compile(r'\b(UA-\d{5,10}-\d{1,3})\b')),
+    ("Google Tag Manager",      re.compile(r'\b(GTM-[A-Z0-9]{5,8})\b')),
+    ("Facebook Pixel ID",       re.compile(r'(?i)fbq\s*\(["\']init["\']\s*,\s*["\']?(\d{10,20})')),
+    ("Facebook Dataset ID",     re.compile(r'(?i)fb\.{0,5}dataset.{0,10}[=:\s]["\']?(\d{10,20})\b')),
+    ("Hotjar Site ID",          re.compile(r'(?i)hjid\s*[:=]\s*(\d{5,10})\b')),
+    ("Hotjar Version",          re.compile(r'(?i)hjsv\s*[:=]\s*(\d{1,2})\b')),
+    ("Mixpanel Token",          re.compile(r'(?i)mixpanel\.init\s*\(\s*["\']([A-Za-z0-9]{32})["\']')),
+    ("Segment Write Key",       re.compile(r'(?i)analytics\.load\s*\(\s*["\']([A-Za-z0-9]{20,50})["\']')),
+    ("TikTok Pixel ID",         re.compile(r'(?i)ttq\.load\s*\(\s*["\']([A-Za-z0-9]{18,22})["\']')),
+    ("Snapchat Pixel ID",       re.compile(r'(?i)snaptr\s*\(["\']init["\']\s*,\s*\{[^}]*["\'](\b[A-Za-z0-9\-]{30,50}\b)["\']')),
+    ("Pinterest Tag ID",        re.compile(r'(?i)pintrk\s*\(["\']load["\']\s*,\s*["\']?(\d{12,15})["\']?')),
+    ("LinkedIn Insight Tag",    re.compile(r'(?i)_linkedin_partner_id\s*=\s*["\']?(\d{6,10})["\']?\s*;')),
+    ("Clarity Project ID",      re.compile(r'(?i)clarity\s*\(\s*["\']set["\']\s*,\s*["\']([A-Za-z0-9]{10,20})["\']')),
+    ("Amplitude API Key",       re.compile(r'(?i)amplitude\.init\s*\(\s*["\']([A-Za-z0-9]{32})["\']')),
+    ("Heap App ID",             re.compile(r'(?i)heap\.load\s*\(\s*["\'](\d{8,12})["\']')),
+    ("Intercom App ID",         re.compile(r'(?i)intercom\.{0,5}(?:app.{0,3}id|appid).{0,10}[=:\s]["\']([A-Za-z0-9]{8,15})["\']')),
+    ("Crisp Website ID",        re.compile(r'(?i)crisp.{0,20}website.{0,5}id.{0,10}[=:\s]["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']')),
+    ("FullStory Org ID",        re.compile(r'(?i)FS\.identify|_fs_org\s*=\s*["\']([A-Za-z0-9]{5,20})["\']')),
+    ("Clicky Site ID",          re.compile(r'(?i)clicky_site_id\s*=\s*(\d{6,12})\b')),
+]
+
+_ANALYTICS_JS_EVAL = """() => {
+    const res = {};
+    // Google Analytics dataLayer
+    try {
+        if (window.dataLayer && Array.isArray(window.dataLayer)) {
+            res['dataLayer_length'] = window.dataLayer.length;
+            res['dataLayer_sample'] = JSON.stringify(window.dataLayer.slice(0,3)).substring(0,500);
+        }
+    } catch(e) {}
+    // gtag config calls
+    try {
+        if (window.gtag) res['gtag_loaded'] = 'true';
+        if (window.ga) res['ga_loaded'] = 'true';
+    } catch(e) {}
+    // Meta pixel
+    try { if (window.fbq) res['fbq_loaded'] = 'true'; } catch(e) {}
+    return res;
+}"""
+
+def _analytics_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _ANALYTICS_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, v, src):
+        d = t+":"+v
+        if d not in seen and len(v) >= 3:
+            seen.add(d); findings.append({"type": t, "value": v, "source": src})
+    if progress_cb: progress_cb("🔍 Scanning for analytics IDs...")
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _ANALYTICS_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip(), label)
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/analytics <url> — Extract GA4, GTM, FB Pixel, Hotjar, Mixpanel and more"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/analytics https://example.com`\n\n"
+            "📊 *Detects:*\n"
+            "  • Google Analytics 4 (G-XXXXX) & UA\n"
+            "  • Google Tag Manager (GTM-XXXXX)\n"
+            "  • Facebook Pixel ID\n"
+            "  • Hotjar, Mixpanel, Segment, Amplitude\n"
+            "  • TikTok, Snapchat, Pinterest, LinkedIn\n"
+            "  • Microsoft Clarity, Heap, FullStory\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"📊 *Analytics Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"📊 *Analytics — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_analytics_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"📊 *Analytics Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No analytics IDs found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"📊 *Analytics IDs — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*  `{f['value']}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"analytics_{safe_d}_{ts}.json",
+            caption=f"📊 Analytics — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("analytics export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🔐  6. /hiddenkeys — Hidden Tokens & CSRF Extractor
+# ══════════════════════════════════════════════════
+
+_HIDDEN_JS_EVAL = """() => {
+    const res = {tokens: [], localStorage: {}, sessionStorage: {}, cookies: []};
+    // Hidden inputs + CSRF tokens
+    document.querySelectorAll('input[type=hidden]').forEach(el => {
+        if (el.name && el.value && el.value.length > 5) {
+            res.tokens.push({name: el.name, value: el.value.substring(0,200), tag: 'hidden input'});
+        }
+    });
+    // Meta CSRF
+    document.querySelectorAll('meta[name*="csrf"],meta[name*="token"],meta[name*="nonce"]').forEach(m => {
+        if (m.content) res.tokens.push({name: m.name, value: m.content.substring(0,200), tag: 'meta'});
+    });
+    // localStorage (safe subset)
+    try {
+        for (let i=0; i<Math.min(localStorage.length, 30); i++) {
+            const k = localStorage.key(i);
+            if (k) {
+                const v = localStorage.getItem(k)||'';
+                if (v.length > 5 && v.length < 2000) res.localStorage[k] = v.substring(0,200);
+            }
+        }
+    } catch(e) {}
+    // sessionStorage
+    try {
+        for (let i=0; i<Math.min(sessionStorage.length, 30); i++) {
+            const k = sessionStorage.key(i);
+            if (k) {
+                const v = sessionStorage.getItem(k)||'';
+                if (v.length > 5 && v.length < 2000) res.sessionStorage[k] = v.substring(0,200);
+            }
+        }
+    } catch(e) {}
+    // Cookies (non-httpOnly are readable)
+    try {
+        document.cookie.split(';').forEach(c => {
+            const [k,v] = c.trim().split('=');
+            if (k && v && v.length > 3) res.cookies.push({name: k.trim(), value: v.substring(0,200)});
+        });
+    } catch(e) {}
+    return res;
+}"""
+
+_CSRF_PATTERNS = [
+    ("CSRF Token",              re.compile(r'(?i)(?:csrf|xsrf|_token|verification.token)\s*[=:]\s*["\']([A-Za-z0-9_\-+=/]{20,200})["\']')),
+    ("Nonce",                   re.compile(r'(?i)(?:nonce|__nonce__)\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,100})["\']')),
+    ("Laravel CSRF Token",      re.compile(r'(?i)(?:_token|laravel.token)\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,80})["\']')),
+    ("Django CSRF",             re.compile(r'(?i)csrfmiddlewaretoken\s*[=:]\s*["\']([A-Za-z0-9]{40,80})["\']')),
+    ("Rails Authenticity Token",re.compile(r'(?i)authenticity.token\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,100})["\']')),
+    ("WordPress Nonce",         re.compile(r'(?i)wp.{0,5}nonce\s*[=:]\s*["\']([A-Za-z0-9]{10})["\']')),
+    ("JWT Bearer Token",        re.compile(r'(?i)(?:bearer|authorization)\s*[=:]\s*["\']?(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)')),
+]
+
+def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _HIDDEN_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, name, value, src):
+        d = t+":"+name
+        if d not in seen and len(value) >= 5:
+            seen.add(d)
+            findings.append({"type": t, "name": name, "value": value[:200], "source": src})
+    if progress_cb: progress_cb("🔍 Extracting hidden tokens, CSRF, localStorage...")
+    # From DOM eval
+    dr = data.get("dom_result") or {}
+    for tok in dr.get("tokens", []):
+        n, v, tag = tok.get("name",""), tok.get("value",""), tok.get("tag","")
+        if v:
+            t = "CSRF Token" if any(x in n.lower() for x in ["csrf","xsrf","token","nonce","verify"]) else "Hidden Input"
+            _add(t, n, v, f"DOM {tag}")
+    for k, v in dr.get("localStorage", {}).items():
+        ttype = "JWT (localStorage)" if v.startswith("eyJ") else "localStorage value"
+        _add(ttype, k, v, "localStorage")
+    for k, v in dr.get("sessionStorage", {}).items():
+        ttype = "JWT (sessionStorage)" if v.startswith("eyJ") else "sessionStorage value"
+        _add(ttype, k, v, "sessionStorage")
+    for c in dr.get("cookies", []):
+        n, v = c.get("name",""), c.get("value","")
+        ttype = "JWT (cookie)" if v.startswith("eyJ") else "Cookie"
+        _add(ttype, n, v, "Cookie (JS-readable)")
+    # From HTML/JS text
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _CSRF_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, key_type, val.strip(), label)
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hiddenkeys <url> — Extract CSRF tokens, hidden inputs, localStorage, cookies"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/hiddenkeys https://example.com`\n\n"
+            "🔐 *Extracts:*\n"
+            "  • CSRF / XSRF tokens\n"
+            "  • Hidden form inputs\n"
+            "  • WordPress nonces\n"
+            "  • Django / Laravel / Rails tokens\n"
+            "  • JWT tokens from localStorage / sessionStorage\n"
+            "  • JavaScript-readable cookies\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔐 *Hidden Token Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔐 *Hidden Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_hiddenkeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"🔐 *Hidden Token Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No hidden tokens found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"🔐 *Hidden Tokens — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*")
+        lines.append(f"  Name:  `{f['name']}`")
+        lines.append(f"  Value: `{f['value'][:80]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"hiddenkeys_{safe_d}_{ts}.json",
+            caption=f"🔐 Hidden Keys — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("hiddenkeys export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🌐  7. /endpoints — API Endpoint Discoverer
+# ══════════════════════════════════════════════════
+
+_ENDPOINT_PATTERNS = [
+    ("REST API",    re.compile(r'(?i)["\']/(api/v?\d?/?[a-zA-Z0-9_/\-]{3,80})["\']')),
+    ("GraphQL",     re.compile(r'(?i)["\']?((?:https?://[^"\']+)?/graphql(?:/v\d)?)["\']?')),
+    ("WebSocket",   re.compile(r'(wss?://[A-Za-z0-9._\-/:?=&%]{10,200})')),
+    ("REST base URL",re.compile(r'(?i)(?:base.?url|api.?url|api.?endpoint|api.?base)\s*[=:]\s*["\']?(https?://[A-Za-z0-9._\-/:?=&%]{10,150})["\']?')),
+    ("gRPC",        re.compile(r'(?i)(?:grpc|protobuf).{0,20}[=:\s]["\']?(https?://[A-Za-z0-9._\-/:]{10,100})["\']?')),
+    ("Supabase URL",re.compile(r'(https://[a-z0-9]{20}\.supabase\.(?:co|io))')),
+    ("Hasura URL",  re.compile(r'(https://[A-Za-z0-9._\-]+/v1/graphql)')),
+    ("Prismic",     re.compile(r'(https://[a-z0-9\-]+\.prismic\.io/api)')),
+    ("Contentful",  re.compile(r'(https://cdn\.contentful\.com/spaces/[A-Za-z0-9]+)')),
+    ("Sanity",      re.compile(r'(https://[a-z0-9]+\.api\.sanity\.io/v\d+/data/query)')),
+    ("S3 Bucket",   re.compile(r'(https?://[A-Za-z0-9.\-]+\.s3(?:\.[a-z0-9\-]+)?\.amazonaws\.com)')),
+    ("CDN URL",     re.compile(r'(https://[A-Za-z0-9.\-]+\.(?:cloudfront\.net|azureedge\.net|akamaized\.net))')),
+]
+
+_ENDPOINT_JS_EVAL = """() => {
+    const res = {websockets: [], fetch_urls: [], xhr_urls: []};
+    // Intercept WebSocket (if already opened)
+    try {
+        if (window._wsLog) res.websockets = window._wsLog;
+    } catch(e) {}
+    // Scan window env for API URLs
+    ['__NEXT_DATA__','__nuxt','window.__ENV__'].forEach(k => {
+        try {
+            const v = eval(k);
+            if (v) {
+                const s = JSON.stringify(v)||'';
+                const urls = s.match(/https?:\\/\\/[A-Za-z0-9._\\-\\/:?=&%]{10,150}/g)||[];
+                res['env_urls_'+k] = [...new Set(urls)].slice(0,20);
+            }
+        } catch(e) {}
+    });
+    return res;
+}"""
+
+def _endpoints_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _ENDPOINT_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, v, src):
+        d = t+":"+v
+        if d not in seen and len(v) >= 8:
+            seen.add(d); findings.append({"type": t, "endpoint": v, "source": src})
+    if progress_cb: progress_cb("🔍 Mapping API endpoints, WebSockets, GraphQL...")
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _ENDPOINT_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip().rstrip("'\""), label)
+    # From network log — capture actual API calls made by browser
+    for entry in data.get("network_log", []):
+        u = entry.get("url", "")
+        if any(x in u for x in ["/api/", "/graphql", "/v1/", "/v2/", "/v3/"]):
+            _add("Actual API call", u[:150], "Network request")
+        if u.startswith("wss://") or u.startswith("ws://"):
+            _add("WebSocket (live)", u[:150], "Network request")
+    # DOM eval
+    dr = data.get("dom_result") or {}
+    for k, v in dr.items():
+        if isinstance(v, list):
+            for item in v:
+                if isinstance(item, str) and item.startswith("http"):
+                    _add("Env URL", item[:150], f"window env {k}")
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/endpoints <url> — Discover API endpoints, GraphQL, WebSocket, REST base URLs"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/endpoints https://example.com`\n\n"
+            "🌐 *Discovers:*\n"
+            "  • REST API paths (/api/v1/...)\n"
+            "  • GraphQL endpoints\n"
+            "  • WebSocket URLs (wss://)\n"
+            "  • Supabase, Hasura, Prismic, Sanity\n"
+            "  • S3 buckets, CDN URLs\n"
+            "  • Actual API calls made by browser\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🌐 *Endpoint Discoverer — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🌐 *Endpoints — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"🌐 *Endpoint Discoverer — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No notable endpoints found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"🌐 *API Endpoints — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*")
+        lines.append(f"  `{f['endpoint'][:100]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"endpoints_{safe_d}_{ts}.json",
+            caption=f"🌐 Endpoints — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("endpoints export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🔒  8. /jwtlive — Live JWT Extractor from Browser
+# ══════════════════════════════════════════════════
+
+_JWT_LIVE_JS_EVAL = """() => {
+    const res = {tokens: []};
+    const seen = new Set();
+    function addJWT(token, source) {
+        if (!token || seen.has(token)) return;
+        if (!/^eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]*$/.test(token)) return;
+        seen.add(token);
+        let payload = {};
+        try {
+            const b64 = token.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');
+            payload = JSON.parse(atob(b64));
+        } catch(e) {}
+        res.tokens.push({token, source, payload,
+            exp: payload.exp ? new Date(payload.exp*1000).toISOString() : '',
+            sub: payload.sub || payload.user_id || payload.uid || payload.id || '',
+            iss: payload.iss || '', aud: payload.aud || ''});
+    }
+    // localStorage
+    try {
+        for (let i=0;i<localStorage.length;i++) {
+            const k=localStorage.key(i), v=localStorage.getItem(k)||'';
+            if (v.startsWith('eyJ')) addJWT(v, 'localStorage:'+k);
+            try { const o=JSON.parse(v); if(o&&typeof o==='object') {
+                Object.values(o).forEach(x=>{if(typeof x==='string'&&x.startsWith('eyJ'))addJWT(x,'localStorage:'+k+'.value');});
+            }} catch(e){}
+        }
+    } catch(e) {}
+    // sessionStorage
+    try {
+        for (let i=0;i<sessionStorage.length;i++) {
+            const k=sessionStorage.key(i), v=sessionStorage.getItem(k)||'';
+            if (v.startsWith('eyJ')) addJWT(v,'sessionStorage:'+k);
+        }
+    } catch(e) {}
+    // Cookies
+    try {
+        document.cookie.split(';').forEach(c=>{
+            const [k,v]=(c.trim()).split('=');
+            if(v&&v.startsWith('eyJ')) addJWT(decodeURIComponent(v),'cookie:'+k.trim());
+        });
+    } catch(e) {}
+    // window globals
+    ['token','authToken','accessToken','idToken','jwtToken','auth','user','session'].forEach(k=>{
+        try{const v=window[k];if(typeof v==='string'&&v.startsWith('eyJ'))addJWT(v,'window.'+k);}catch(e){}
+        try{const v=window[k];if(v&&typeof v==='object'){
+            ['token','access_token','id_token','jwt'].forEach(f=>{
+                if(v[f]&&typeof v[f]==='string'&&v[f].startsWith('eyJ'))addJWT(v[f],'window.'+k+'.'+f);
+            });
+        }}catch(e){}
+    });
+    return res;
+}"""
+
+def _jwtlive_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _JWT_LIVE_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []
+    dr = data.get("dom_result") or {}
+    for tok in dr.get("tokens", []):
+        findings.append(tok)
+    # Also scan network responses for Bearer tokens
+    seen_net = set()
+    for entry in data.get("network_log", []):
+        for text in [entry.get("response_body",""), entry.get("post_data","")]:
+            for m in re.finditer(r'eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+', text):
+                t = m.group(0)
+                if t not in seen_net:
+                    seen_net.add(t)
+                    payload = {}
+                    try:
+                        import base64
+                        b64 = t.split(".")[1] + "=="
+                        payload = json.loads(base64.b64decode(b64.replace("-","+").replace("_","/")))
+                    except Exception:
+                        pass
+                    findings.append({"token": t, "source": f"Network: {entry['url'][:80]}",
+                                     "payload": payload,
+                                     "exp": payload.get("exp",""), "sub": payload.get("sub",""),
+                                     "iss": payload.get("iss",""), "aud": payload.get("aud","")})
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/jwtlive <url> — Extract live JWT tokens from browser storage & network"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/jwtlive https://app.example.com`\n\n"
+            "🔒 *Extracts live JWTs from:*\n"
+            "  • localStorage / sessionStorage\n"
+            "  • JavaScript-readable cookies\n"
+            "  • window globals (token, authToken, etc.)\n"
+            "  • Network API responses\n\n"
+            "📋 *Decoded payload shows:*\n"
+            "  • `sub` — User/subject ID\n"
+            "  • `exp` — Expiry datetime\n"
+            "  • `iss` — Issuer\n"
+            "  • `aud` — Audience\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔒 *JWT Extractor — `{domain}`*\n\n⏳ Loading page & scanning storage...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔒 *JWT Live — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_jwtlive_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"🔒 *JWT Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No JWT tokens found (may require login)\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"🔒 *JWT Tokens — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        tok = f.get("token","")
+        lines.append(f"*[{i}] JWT Token*")
+        lines.append(f"  `{tok[:60]}...`")
+        lines.append(f"  _📂 {f.get('source','')[:60]}_")
+        if f.get("sub"):  lines.append(f"  👤 `sub` : `{f['sub']}`")
+        if f.get("exp"):  lines.append(f"  ⏰ `exp` : `{f['exp']}`")
+        if f.get("iss"):  lines.append(f"  🏢 `iss` : `{f['iss']}`")
+        if f.get("aud"):  lines.append(f"  🎯 `aud` : `{str(f['aud'])[:50]}`")
+        lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"jwtlive_{safe_d}_{ts}.json",
+            caption=f"🔒 JWT Live — `{domain}` — `{len(findings)}` tokens",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("jwtlive export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 📡  9. /pushkeys — Push / CDN / Notification Keys
+# ══════════════════════════════════════════════════
+
+_PUSH_PATTERNS = [
+    ("VAPID Public Key",        re.compile(r'(?i)(?:vapid|push|applicationServer).{0,30}key.{0,10}[=:\s]["\']?(B[A-Za-z0-9+/=_\-]{80,90})\b')),
+    ("FCM Server Key",          re.compile(r'(?i)(?:fcm|firebase).{0,20}(?:server|sender).{0,10}key.{0,10}[=:\s]["\']?([A-Za-z0-9_\-]{140,200})\b')),
+    ("FCM Sender ID",           re.compile(r'(?i)(?:fcm|firebase|messaging).{0,20}sender.{0,5}id.{0,10}[=:\s]["\']?(\d{10,15})\b')),
+    ("OneSignal App ID",        re.compile(r'(?i)onesignal.{0,20}app.{0,5}id.{0,10}[=:\s]["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']')),
+    ("Pusher App Key",          re.compile(r'(?i)pusher.{0,20}(?:app.{0,3}key|key).{0,10}[=:\s]["\']([a-f0-9]{20})["\']')),
+    ("Pusher Cluster",          re.compile(r'(?i)pusher.{0,20}cluster.{0,10}[=:\s]["\']([a-z]{2,4}\d?)["\']')),
+    ("Ably API Key",            re.compile(r'(?i)ably.{0,20}(?:api.{0,3}key|key).{0,10}[=:\s]["\']([A-Za-z0-9.]+:[A-Za-z0-9_\-]+)["\']')),
+    ("Cloudflare Beacon Token", re.compile(r'(?i)(?:cloudflare|cf).{0,20}beacon.{0,10}[=:\s]["\']([a-f0-9]{32})["\']')),
+    ("Cloudflare Zaraz Token",  re.compile(r'zaraz\.init\s*\(["\']([A-Za-z0-9_\-]{20,60})["\']')),
+    ("AWS SNS ARN",             re.compile(r'(arn:aws:sns:[a-z0-9\-]+:\d{12}:[A-Za-z0-9_\-]{1,256})')),
+    ("Service Worker Scope",    re.compile(r'(?i)service.?worker.{0,30}["\']([^"\']+/sw\.js[^"\']*)["\']')),
+    ("Web Push Auth",           re.compile(r'(?i)push.{0,20}auth.{0,10}[=:\s]["\']([A-Za-z0-9_\-+/=]{20,50})["\']')),
+]
+
+_PUSH_JS_EVAL = """() => {
+    const res = {};
+    // Check service workers
+    if ('serviceWorker' in navigator) {
+        res['sw_supported'] = 'true';
+    }
+    // VAPID key from push manager
+    ['vapidPublicKey','VAPID_PUBLIC_KEY','NEXT_PUBLIC_VAPID_PUBLIC_KEY',
+     'pushPublicKey','WEB_PUSH_PUBLIC_KEY'].forEach(k => {
+        try { if (window[k]) res[k] = window[k]; } catch(e) {}
+    });
+    // OneSignal
+    try { if (window.OneSignal) res['OneSignal_loaded'] = 'true'; } catch(e) {}
+    // Pusher
+    try { if (window.Pusher) res['Pusher_loaded'] = 'true'; } catch(e) {}
+    return res;
+}"""
+
+def _pushkeys_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _PUSH_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, v, src):
+        d = t+":"+v[:60]
+        if d not in seen and len(v) >= 5:
+            seen.add(d); findings.append({"type": t, "value": v, "source": src})
+    if progress_cb: progress_cb("🔍 Scanning for push/CDN keys...")
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _PUSH_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip(), label)
+    for k, v in (data.get("dom_result") or {}).items():
+        s = str(v)
+        for key_type, pat in _PUSH_PATTERNS:
+            mm = pat.search(s)
+            if mm:
+                _add(key_type, (mm.group(1) if mm.lastindex else mm.group(0)), f"window.{k}")
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/pushkeys <url> — Extract VAPID, FCM, OneSignal, Pusher, Ably push keys"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/pushkeys https://example.com`\n\n"
+            "📡 *Detects:*\n"
+            "  • VAPID Public Key (Web Push)\n"
+            "  • FCM Server Key & Sender ID\n"
+            "  • OneSignal App ID\n"
+            "  • Pusher App Key & Cluster\n"
+            "  • Ably API Key\n"
+            "  • Cloudflare Beacon / Zaraz\n"
+            "  • AWS SNS ARN\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"📡 *Push Key Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"📡 *Push Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_pushkeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"📡 *Push Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No push/CDN keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"📡 *Push / CDN Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*")
+        lines.append(f"  `{f['value'][:80]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"pushkeys_{safe_d}_{ts}.json",
+            caption=f"📡 Push Keys — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("pushkeys export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 💬  10. /chatkeys — Chat, Support & Monitoring Keys
+# ══════════════════════════════════════════════════
+
+_CHAT_PATTERNS = [
+    ("Intercom App ID",         re.compile(r'(?i)intercom.{0,20}(?:app.{0,3}id|appid).{0,10}[=:\s]["\']([A-Za-z0-9]{8,15})["\']')),
+    ("Intercom (boot)",         re.compile(r'(?i)Intercom\s*\(\s*["\']boot["\'],\s*\{[^}]*app_id\s*:\s*["\']([A-Za-z0-9]{8,15})["\']')),
+    ("Zendesk Subdomain",       re.compile(r'(?i)(?:zE|zendesk).{0,30}(?:subdomain|key|webwidget).{0,10}[=:\s]["\']([A-Za-z0-9_\-]{5,40})["\']')),
+    ("Zendesk Widget Key",      re.compile(r'(?i)zESettings\s*=\s*\{[^}]*webWidget[^}]*key\s*:\s*["\']([a-f0-9\-]{36})["\']')),
+    ("Crisp Website ID",        re.compile(r'(?i)crisp.{0,20}(?:website.{0,5}id|CRISP_WEBSITE_ID).{0,10}[=:\s]["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']')),
+    ("Drift Embed ID",          re.compile(r'(?i)drift.{0,20}(?:embed|app|id).{0,10}[=:\s]["\']([A-Za-z0-9]{8,20})["\']')),
+    ("Freshdesk Domain",        re.compile(r'(https://[a-z0-9\-]+\.freshdesk\.com)')),
+    ("Freshchat Token",         re.compile(r'(?i)freshchat.{0,20}token.{0,10}[=:\s]["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']')),
+    ("Tawk.to Property ID",     re.compile(r'Tawk_API\.{0,5}(?:onLoad|start).{0,100}([A-Za-z0-9]{20,30}/[A-Za-z0-9]{8,15})')),
+    ("HubSpot Chat",            re.compile(r'(?i)hubspot.{0,30}(?:portal|hub.{0,3}id).{0,10}[=:\s]["\']?(\d{6,12})\b')),
+    ("Sentry DSN",              re.compile(r'(https://[a-f0-9]{32}@(?:o\d+\.ingest\.)?sentry\.io/\d+)')),
+    ("Sentry Organization",     re.compile(r'(?i)sentry.{0,20}(?:org|dsn).{0,10}[=:\s]["\']([A-Za-z0-9\-]{5,40})["\']')),
+    ("LogRocket App ID",        re.compile(r'(?i)logrocket.{0,20}init\s*\(\s*["\']([A-Za-z0-9/_\-]{10,50})["\']')),
+    ("Bugsnag API Key",         re.compile(r'(?i)bugsnag.{0,20}(?:api.{0,3}key|notify).{0,10}[=:\s]["\']([a-f0-9]{32})["\']')),
+    ("Raygun API Key",          re.compile(r'(?i)raygun.{0,20}(?:api.{0,3}key).{0,10}[=:\s]["\']([A-Za-z0-9+/=]{20,44})["\']')),
+    ("Rollbar Token",           re.compile(r'(?i)rollbar.{0,20}(?:access.{0,3}token|token).{0,10}[=:\s]["\']([a-f0-9]{32})["\']')),
+    ("LiveChat License",        re.compile(r'(?i)livechat.{0,20}license.{0,10}[=:\s]["\']?(\d{6,12})\b')),
+    ("Tidio Chat Key",          re.compile(r'(?i)tidioChatCode\s*=\s*["\']([A-Za-z0-9]{20,40})["\']')),
+    ("Olark Site ID",           re.compile(r'(?i)olark.{0,20}(?:site.{0,3}id|identify).{0,10}[=:\s]["\']([A-Za-z0-9\-]{20,40})["\']')),
+    ("Chatwoot Token",          re.compile(r'(?i)chatwoot.{0,20}(?:website.{0,5}token|token).{0,10}[=:\s]["\']([A-Za-z0-9]{20,50})["\']')),
+]
+
+_CHAT_JS_EVAL = """() => {
+    const res = {};
+    ['Intercom','zE','Tawk_API','drift','fcWidget','HubSpotConversations',
+     'Sentry','LogRocket','Bugsnag','Rollbar','LiveChatWidget'].forEach(k => {
+        try { if (window[k]) res[k+'_loaded'] = 'true'; } catch(e) {}
+    });
+    return res;
+}"""
+
+def _chatkeys_sync(url: str, progress_cb=None) -> dict:
+    data = _extract_run(url, _CHAT_JS_EVAL, progress_cb)
+    if data.get("error"):
+        return {"error": data["error"], "findings": [], "page_url": url}
+    findings = []; seen = set()
+    def _add(t, v, src):
+        d = t+":"+v[:60]
+        if d not in seen and len(v) >= 5:
+            seen.add(d); findings.append({"type": t, "value": v, "source": src})
+    if progress_cb: progress_cb("🔍 Scanning for chat & monitoring keys...")
+    for text, label in _gather_all_text(data):
+        for key_type, pat in _CHAT_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1) if m.lastindex else m.group(0)
+                _add(key_type, val.strip(), label)
+    return {"error": None, "findings": findings, "page_url": data["page_url"],
+            "requests": len(data.get("network_log", []))}
+
+
+async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/chatkeys <url> — Extract Intercom, Zendesk, Crisp, Sentry, Bugsnag widget keys"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/chatkeys https://example.com`\n\n"
+            "💬 *Detects:*\n"
+            "  • Intercom App ID\n"
+            "  • Zendesk Widget Key\n"
+            "  • Crisp, Drift, Freshchat, Tawk.to\n"
+            "  • HubSpot, LiveChat, Tidio, Olark\n"
+            "  • Sentry DSN\n"
+            "  • LogRocket, Bugsnag, Raygun, Rollbar\n\n"
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"💬 *Chat Key Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"💬 *Chat Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_chatkeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+    findings = result["findings"]; page_url = result["page_url"]
+    if not findings:
+        await msg.edit_text(
+            f"💬 *Chat Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No chat/monitoring keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+        return
+    lines = [f"💬 *Chat & Monitoring Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings, 1):
+        lines.append(f"*[{i}] {f['type']}*")
+        lines.append(f"  `{f['value'][:80]}`")
+        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
+        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(), "findings": findings},
+                indent=2, ensure_ascii=False).encode()),
+            filename=f"chatkeys_{safe_d}_{ts}.json",
+            caption=f"💬 Chat Keys — `{domain}` — `{len(findings)}` found",
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("chatkeys export error: %s", e)
+
 
 
 # ══════════════════════════════════════════════════
@@ -11134,7 +13294,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
-        await msg.edit_text(f"❌ `{'\\n'.join(result['errors'][:3])}`", parse_mode='Markdown')
+        _err_txt = '\n'.join(result['errors'][:3])
+        await msg.edit_text(f"❌ `{_err_txt}`", parse_mode='Markdown')
         return
 
     stats = result["stats"]
@@ -12045,656 +14206,6 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════
 
 # ── Regex patterns per captcha type ─────────────
-_CAPTCHA_PATTERNS = {
-
-    # ─── reCAPTCHA v2 ────────────────────────────
-    "reCAPTCHA v2": [
-        # data-sitekey attribute
-        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # grecaptcha.render
-        re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # siteKey / site_key object key
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'["\']site_key["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'siteKey\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-    ],
-
-    # ─── reCAPTCHA v3 ────────────────────────────
-    "reCAPTCHA v3": [
-        # grecaptcha.execute(key, {action:...})
-        re.compile(r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # grecaptcha.ready + execute in same script
-        re.compile(r'execute\(["\']([6][A-Za-z0-9_\-]{39})["\']', re.I),
-    ],
-
-    # ─── hCaptcha ────────────────────────────────
-    "hCaptcha": [
-        re.compile(r'data-sitekey=["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-        re.compile(r'hcaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9a-f\-]{36})["\']', re.I),
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-    ],
-
-    # ─── Cloudflare Turnstile ─────────────────────
-    "Cloudflare Turnstile": [
-        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\'].*?turnstile|turnstile.*?data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I | re.S),
-        re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # Turnstile keys start with 0x4A or 1x00
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
-        re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
-    ],
-
-    # ─── FunCaptcha (Arkose Labs) ─────────────────
-    "FunCaptcha": [
-        re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
-        re.compile(r'ArkoseEnforcement\s*\([^)]*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
-    ],
-
-    # ─── GeeTest ─────────────────────────────────
-    "GeeTest": [
-        re.compile(r'gt\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
-        re.compile(r'["\']gt["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
-    ],
-
-    # ─── AWS WAF Captcha ──────────────────────────
-    "AWS WAF Captcha": [
-        re.compile(r'AwsWafIntegration\.getToken\s*\(\s*["\']([^"\']{10,200})["\']', re.I),
-        re.compile(r'jsapi\.token\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
-    ],
-}
-
-# ─── reCAPTCHA action pattern ────────────────────
-_ACTION_PATTERNS = [
-    re.compile(r'action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
-    re.compile(r'["\']action["\']\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
-    re.compile(r'grecaptcha\.execute\s*\([^,]+,\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
-]
-
-# ─── Script src patterns (detect captcha from includes) ─
-_CAPTCHA_SCRIPT_SIGS = {
-    "reCAPTCHA": ["google.com/recaptcha", "recaptcha/api.js", "recaptcha/enterprise.js"],
-    "hCaptcha":  ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
-    "Turnstile": ["challenges.cloudflare.com/turnstile"],
-    "FunCaptcha": ["funcaptcha.com", "arkoselabs.com"],
-    "GeeTest":   ["gt.captcha.com", "static.geetest.com"],
-}
-
-
-def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> list:
-    """
-    Extract all captcha site_key / action / page_url from HTML + JS.
-    Returns list of finding dicts.
-    """
-    findings = []
-    seen_keys = set()
-
-    def _scan_text(text: str, source_label: str):
-        for cap_type, patterns in _CAPTCHA_PATTERNS.items():
-            for pat in patterns:
-                for m in pat.finditer(text):
-                    # Get first non-None group (handles alternation patterns)
-                    if m.lastindex and m.lastindex >= 1:
-                        key = next((g for g in m.groups() if g), None)
-                    else:
-                        try:
-                            key = m.group(1)
-                        except IndexError:
-                            key = m.group(0)
-                    if not key:
-                        continue
-                    key = key.strip()
-                    if len(key) < 10:
-                        continue
-                    dedup = cap_type + ":" + key
-                    if dedup in seen_keys:
-                        continue
-                    seen_keys.add(dedup)
-
-                    # Extract action from surrounding context (±400 chars)
-                    action = ""
-                    ctx_start = max(0, m.start() - 400)
-                    ctx_end   = min(len(text), m.end() + 400)
-                    ctx       = text[ctx_start:ctx_end]
-                    for ap in _ACTION_PATTERNS:
-                        am = ap.search(ctx)
-                        if am:
-                            cand = am.group(1)
-                            # Filter out false-positives (too generic)
-                            if cand not in ('get','set','use','new','add','key','id'):
-                                action = cand
-                                break
-
-                    findings.append({
-                        "type":     cap_type,
-                        "site_key": key,
-                        "page_url": page_url,
-                        "action":   action,
-                        "source":   source_label,
-                    })
-
-    # Scan main HTML
-    _scan_text(html, "HTML source")
-
-    # Scan inline scripts separately for better context
-    soup = BeautifulSoup(html, 'html.parser')
-    for i, script in enumerate(soup.find_all('script')):
-        if script.string and script.string.strip():
-            _scan_text(script.string, f"Inline script #{i}")
-
-    # Scan external JS sources if provided
-    if js_sources:
-        for js_url, js_text in js_sources.items():
-            _scan_text(js_text, f"JS: {js_url[:60]}")
-
-    # ─── Detect captcha type from script src (even without key) ──
-    script_tags = [t.get('src', '') for t in soup.find_all('script', src=True)]
-    detected_via_script = set()
-    for src in script_tags:
-        for cap_type, sigs in _CAPTCHA_SCRIPT_SIGS.items():
-            if any(sig in src for sig in sigs):
-                detected_via_script.add((cap_type, src))
-
-    # Add script-detected types that have no key found yet
-    found_types = {f["type"].split()[0] for f in findings}
-    for cap_type, src in detected_via_script:
-        short = cap_type.split()[0]
-        if short not in found_types:
-            findings.append({
-                "type":     cap_type + " ⚠️ (key not found)",
-                "site_key": "",
-                "page_url": page_url,
-                "action":   "",
-                "source":   f"Script include: {src[:80]}",
-            })
-
-    return findings
-
-
-def _sitekey_playwright(url: str, progress_cb=None) -> dict:
-    """
-    DevTools-style sitekey extraction using Playwright.
-    Intercepts ALL network requests like Chrome DevTools → Network tab.
-    Extracts sitekeys from:
-      - Request URLs  (recaptcha/api2/anchor?k=SITEKEY)
-      - POST bodies   (hcaptcha checksiteconfig)
-      - Console logs  (window.console messages)
-      - Final DOM     (data-sitekey attributes after JS execution)
-    """
-    try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    except ImportError:
-        return {"error": "playwright_not_installed", "findings": [], "page_url": url}
-
-    findings     = []
-    seen_keys    = set()
-    network_log  = []   # all intercepted requests
-    console_log  = []   # all console messages
-    page_url_ref = [url]
-
-    # ── Patterns to extract key from intercepted request URL ──
-    _NET_PATTERNS = [
-        # reCAPTCHA v2 / v3
-        (re.compile(r'google\.com/recaptcha/api2/(?:anchor|bframe|reload)\?[^"\']*[?&]k=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA v2"),
-        (re.compile(r'google\.com/recaptcha/enterprise/(?:anchor|bframe|reload)\?[^"\']*[?&]k=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA Enterprise"),
-        (re.compile(r'recaptcha/api\.js\?render=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA v3"),
-        (re.compile(r'recaptcha/enterprise\.js\?render=([0-9A-Za-z_\-]{20,60})', re.I), "reCAPTCHA Enterprise"),
-        # hCaptcha
-        (re.compile(r'hcaptcha\.com/checksiteconfig\?[^"\']*sitekey=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I), "hCaptcha"),
-        (re.compile(r'hcaptcha\.com/getcaptcha\?s=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I), "hCaptcha"),
-        (re.compile(r'hcaptcha\.com/[^?]*\?[^"\']*sitekey=([0-9a-f\-]{36})', re.I), "hCaptcha"),
-        # Cloudflare Turnstile
-        (re.compile(r'challenges\.cloudflare\.com/turnstile/[^?]+\?[^"\']*sitekey=([0-9A-Za-z_\-]{20,60})', re.I), "Cloudflare Turnstile"),
-        (re.compile(r'challenges\.cloudflare\.com/turnstile/v0/api\.js\?[^"\']*render=([0-9A-Za-z_\-]{20,60})', re.I), "Cloudflare Turnstile"),
-        # FunCaptcha
-        (re.compile(r'(?:funcaptcha\.com|arkoselabs\.com)[^"\']*pk=([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})', re.I), "FunCaptcha"),
-    ]
-
-    # ── POST body patterns ─────────────────────────
-    _BODY_PATTERNS = [
-        (re.compile(r'"sitekey"\s*:\s*"([0-9A-Za-z_\-]{20,60})"', re.I), "From POST body"),
-        (re.compile(r'sitekey=([0-9A-Za-z_\-]{20,60})', re.I), "From POST body"),
-        (re.compile(r'"k"\s*:\s*"([0-9A-Za-z_\-]{20,60})"', re.I), "From POST body"),
-    ]
-
-    def _add_finding(cap_type, key, source, page_url):
-        dedup = cap_type + ":" + key
-        if dedup not in seen_keys and len(key) >= 10:
-            seen_keys.add(dedup)
-            findings.append({
-                "type":     cap_type,
-                "site_key": key,
-                "page_url": page_url,
-                "action":   "",
-                "source":   source,
-            })
-
-    def _scan_url(req_url: str, page_url: str):
-        for pat, cap_type in _NET_PATTERNS:
-            m = pat.search(req_url)
-            if m:
-                _add_finding(cap_type, m.group(1), f"Network request: {req_url[:100]}", page_url)
-
-    def _scan_body(body: str, req_url: str, page_url: str):
-        for pat, label in _BODY_PATTERNS:
-            for m in pat.finditer(body):
-                _add_finding("reCAPTCHA/hCaptcha (POST)", m.group(1),
-                             f"{label} → {req_url[:80]}", page_url)
-
-    with sync_playwright() as pw:
-        if progress_cb: progress_cb("🌐 Launching headless browser...")
-
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-            ]
-        )
-        context_pw = browser.new_context(
-            user_agent=(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-            viewport={"width": 1280, "height": 720},
-            ignore_https_errors=True,
-        )
-        page = context_pw.new_page()
-
-        # ── Intercept every network request ────────
-        def _on_request(request):
-            req_url = request.url
-            network_log.append(req_url)
-            _scan_url(req_url, page_url_ref[0])
-            # Also scan POST body
-            try:
-                body = request.post_data
-                if body and len(body) > 5:
-                    _scan_body(body, req_url, page_url_ref[0])
-            except Exception:
-                pass
-
-        # ── Intercept responses for captcha API JSON ─
-        def _on_response(response):
-            resp_url = response.url
-            try:
-                if any(sig in resp_url for sig in [
-                    'recaptcha', 'hcaptcha', 'turnstile', 'funcaptcha'
-                ]):
-                    body = response.body()
-                    if body:
-                        text = body.decode('utf-8', errors='ignore')
-                        _scan_body(text, resp_url, page_url_ref[0])
-            except Exception:
-                pass
-
-        # ── Capture console messages ────────────────
-        def _on_console(msg):
-            try:
-                console_log.append(msg.text)
-            except Exception:
-                pass
-
-        page.on("request",  _on_request)
-        page.on("response", _on_response)
-        page.on("console",  _on_console)
-
-        if progress_cb: progress_cb("📡 Loading page & intercepting requests...")
-
-        try:
-            resp = page.goto(url, wait_until="networkidle", timeout=30_000)
-            if resp:
-                page_url_ref[0] = page.url
-        except PWTimeout:
-            # networkidle timeout — still extract what we got
-            page_url_ref[0] = page.url
-        except Exception as e:
-            browser.close()
-            return {"error": str(e), "findings": [], "page_url": url}
-
-        # Extra wait for lazy-loaded captcha widgets
-        try:
-            page.wait_for_timeout(3000)
-        except Exception:
-            pass
-
-        # ── Scroll to trigger lazy-load ─────────────
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2000)
-        except Exception:
-            pass
-
-        if progress_cb: progress_cb("🔍 Scanning final DOM + console logs...")
-
-        # ── Scan final rendered HTML (post-JS) ──────
-        try:
-            final_html = page.content()
-        except Exception:
-            final_html = ""
-
-        # ── Extract data-sitekey from DOM via evaluate ──
-        try:
-            dom_keys = page.evaluate("""() => {
-                const results = [];
-                // data-sitekey attributes
-                document.querySelectorAll('[data-sitekey]').forEach(el => {
-                    results.push({key: el.getAttribute('data-sitekey'), tag: el.tagName});
-                });
-                // grecaptcha object
-                try {
-                    if (window.grecaptcha && window.grecaptcha.enterprise) {
-                        results.push({key: 'grecaptcha.enterprise detected', tag: 'JS'});
-                    }
-                } catch(e) {}
-                return results;
-            }""")
-            for item in (dom_keys or []):
-                key = (item.get("key") or "").strip()
-                if key and len(key) >= 10:
-                    # Determine type from key format
-                    if re.match(r'[0-9a-f]{8}-[0-9a-f]{4}', key, re.I):
-                        cap_type = "hCaptcha"
-                    elif re.match(r'[01]x[0-9A-Fa-f]', key):
-                        cap_type = "Cloudflare Turnstile"
-                    else:
-                        cap_type = "reCAPTCHA"
-                    _add_finding(cap_type, key, f"DOM data-sitekey ({item.get('tag','')})", page_url_ref[0])
-        except Exception:
-            pass
-
-        browser.close()
-
-    # ── Also scan final HTML with existing extractor ─
-    if final_html:
-        js_sources_extra = {}
-        existing = _extract_captcha_info(final_html, page_url_ref[0], js_sources_extra)
-        for f in existing:
-            dedup = f["type"] + ":" + f["site_key"]
-            if dedup not in seen_keys and f["site_key"]:
-                seen_keys.add(dedup)
-                f["source"] = "Rendered HTML — " + f["source"]
-                findings.append(f)
-
-    # ── Scan console logs for leaked keys ───────────
-    console_text = "\n".join(console_log)
-    if console_text:
-        for pat, cap_type in _CAPTCHA_PATTERNS.items():
-            for p in _CAPTCHA_PATTERNS[pat] if isinstance(pat, str) else []:
-                for m in p.finditer(console_text):
-                    try:
-                        key = m.group(1)
-                        _add_finding(pat, key, "Console log", page_url_ref[0])
-                    except Exception:
-                        pass
-
-    return {
-        "findings":      findings,
-        "page_url":      page_url_ref[0],
-        "js_fetched":    len(network_log),   # total intercepted requests
-        "network_log":   network_log[:50],   # first 50 for debug
-        "error":         None,
-    }
-
-
-def _sitekey_sync(url: str, progress_cb=None) -> dict:
-    """
-    Try Playwright (DevTools-style) first.
-    Falls back to requests-based static scan if Playwright not available.
-    """
-    # ── Try Playwright ─────────────────────────────
-    result = _sitekey_playwright(url, progress_cb)
-    if result.get("error") == "playwright_not_installed":
-        if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan သို့ fallback...")
-        return _sitekey_static(url, progress_cb)
-    return result
-
-
-def _sitekey_static(url: str, progress_cb=None) -> dict:
-    """Fallback: requests-based static HTML + JS scan (no browser)."""
-    session = requests.Session()
-    session.headers.update(_get_headers())
-
-    if progress_cb: progress_cb("⬇️ Fetching page HTML (static)...")
-    try:
-        resp = session.get(url, timeout=15, verify=False, allow_redirects=True)
-        resp.raise_for_status()
-        html     = resp.text
-        page_url = resp.url
-    except Exception as e:
-        return {"error": str(e), "findings": [], "page_url": url}
-
-    final_parsed = urlparse(page_url)
-    base_origin  = f"{final_parsed.scheme}://{final_parsed.netloc}"
-
-    def _resolve(src):
-        if not src: return None
-        src = src.strip()
-        if src.startswith('//'): return final_parsed.scheme + ':' + src
-        if src.startswith('http'): return src
-        if src.startswith('/'): return base_origin + src
-        base_path = final_parsed.path.rsplit('/', 1)[0]
-        return f"{base_origin}{base_path}/{src}"
-
-    soup = BeautifulSoup(html, 'html.parser')
-    js_seen, js_ordered = set(), []
-
-    def _add_js(u):
-        if u and u.startswith('http') and u not in js_seen:
-            js_seen.add(u); js_ordered.append(u)
-
-    for tag in soup.find_all('script', src=True):
-        _add_js(_resolve(tag['src']))
-
-    captcha_sigs_flat = [s for sigs in _CAPTCHA_SCRIPT_SIGS.values() for s in sigs]
-    def _prio(u):
-        n = u.lower()
-        if any(s in n for s in captcha_sigs_flat): return 0
-        if any(k in n for k in ('main','app','index','chunk','bundle','vendor','runtime')): return 1
-        return 2
-
-    fetch_list = sorted(js_ordered, key=_prio)[:15]
-
-    if progress_cb: progress_cb(f"📦 Fetching {len(fetch_list)} JS files...")
-    js_sources = {}
-    for js_url in fetch_list:
-        try:
-            r = session.get(js_url, timeout=10, verify=False)
-            if r.status_code == 200 and len(r.text) > 50:
-                js_sources[js_url] = r.text[:800_000]
-        except Exception:
-            pass
-
-    if progress_cb: progress_cb(f"🔍 Scanning {len(js_sources)} JS files...")
-    findings = _extract_captcha_info(html, page_url, js_sources)
-    return {"findings": findings, "page_url": page_url, "js_fetched": len(js_sources), "error": None}
-
-
-async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
-    if not await check_force_join(update, context):
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/sitekey https://example.com`\n\n"
-            "🔑 *Extracts:*\n"
-            "  • `site_key` — Captcha public key\n"
-            "  • `page_url` — Final URL (after redirects)\n"
-            "  • `action`   — reCAPTCHA v3 action name\n\n"
-            "🛡️ *Supported Captcha Types:*\n"
-            "  • reCAPTCHA v2 _(data-sitekey / grecaptcha.render)_\n"
-            "  • reCAPTCHA v3 _(grecaptcha.execute + action)_\n"
-            "  • reCAPTCHA Enterprise\n"
-            "  • hCaptcha _(UUID format key)_\n"
-            "  • Cloudflare Turnstile _(0x4A... / 1x00...)_\n"
-            "  • FunCaptcha / Arkose Labs\n"
-            "  • GeeTest\n"
-            "  • AWS WAF Captcha\n\n"
-            "📦 HTML source + JS bundles ကို scan မည်\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🔑 *Site Key Extractor*\n🌐 `{domain}`\n\n"
-        "🌐 Launching headless browser...\n"
-        "📡 Intercepting network requests...\n"
-        "🔍 Scanning DOM + console logs...\n⏳",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🔑 *Scanning `{domain}`*\n\n{txt}",
-                        parse_mode='Markdown')
-                except BadRequest:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        result = await asyncio.to_thread(
-            _sitekey_sync, url, lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    if result.get("error"):
-        await msg.edit_text(
-            f"❌ *Fetch error*\n`{result['error']}`",
-            parse_mode='Markdown'
-        )
-        return
-
-    findings  = result["findings"]
-    page_url  = result["page_url"]
-    js_count  = result["js_fetched"]
-
-    # ─── No captcha found ───────────────────────
-    if not findings:
-        await msg.edit_text(
-            f"🔑 *Site Key Extractor — `{domain}`*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 *Captcha မတွေ့ပါ*\n\n"
-            f"🌐 Page URL: `{page_url}`\n"
-            f"📡 Requests intercepted: `{js_count}`\n\n"
-            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
-            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
-            parse_mode='Markdown'
-        )
-        return
-
-    # ─── Build report ────────────────────────────
-    lines = [
-        f"🔑 *Site Key Extractor — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 Page URL: `{page_url}`",
-        f"📡 Requests intercepted: `{js_count}`",
-        f"✅ Found: `{len(findings)}` captcha instance(s)",
-        "",
-    ]
-
-    # Type icons
-    _TYPE_ICON = {
-        "reCAPTCHA v2":          "🔵",
-        "reCAPTCHA v3":          "🟣",
-        "reCAPTCHA Enterprise":  "🟤",
-        "hCaptcha":              "🟡",
-        "Cloudflare Turnstile":  "🟠",
-        "FunCaptcha":            "🔴",
-        "GeeTest":               "🟢",
-        "AWS WAF Captcha":       "⚪",
-    }
-
-    for i, f in enumerate(findings, 1):
-        icon = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
-        lines.append(f"*{icon} [{i}] {f['type']}*")
-        lines.append(f"  🔑 `site_key` : `{f['site_key'] or 'N/A'}`")
-        lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
-        if f["action"]:
-            lines.append(f"  ⚡ `action`    : `{f['action']}`")
-        lines.append(f"  📂 Source     : _{f['source'][:70]}_")
-        lines.append("")
-
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized testing only_")
-
-    report = "\n".join(lines)
-
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-            await update.effective_message.reply_text(report[4000:8000], parse_mode='Markdown')
-    except BadRequest:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-    # ─── Export JSON ─────────────────────────────
-    import io as _io
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d    = re.sub(r'[^\w\-]', '_', domain)
-    export    = {
-        "domain":      domain,
-        "page_url":    page_url,
-        "scanned_at":  datetime.now().isoformat(),
-        "js_scanned":  js_count,
-        "findings": [
-            {
-                "type":     f["type"],
-                "site_key": f["site_key"],
-                "page_url": f["page_url"],
-                "action":   f["action"],
-                "source":   f["source"],
-            }
-            for f in findings
-        ],
-    }
-    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=json_buf,
-            filename=f"sitekey_{safe_d}_{ts}.json",
-            caption=(
-                f"🔑 *Site Key Report — `{domain}`*\n"
-                f"Found: `{len(findings)}` | JS: `{js_count}`"
-            ),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("Sitekey export error: %s", e)
-
-
 # ══════════════════════════════════════════════════
 # 🤖  BOT — USER COMMANDS
 # ══════════════════════════════════════════════════
@@ -14065,6 +15576,17 @@ def main():
     app.add_handler(CommandHandler("smartfuzz",      cmd_smartfuzz))
     app.add_handler(CommandHandler("jwtattack",      cmd_jwtattack))
     app.add_handler(CommandHandler("sitekey",        cmd_sitekey))
+    # ── Key Extractor commands ────────────────────────
+    app.add_handler(CommandHandler("apikeys",         cmd_apikeys))
+    app.add_handler(CommandHandler("firebase",        cmd_firebase))
+    app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
+    app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
+    app.add_handler(CommandHandler("analytics",       cmd_analytics))
+    app.add_handler(CommandHandler("hiddenkeys",      cmd_hiddenkeys))
+    app.add_handler(CommandHandler("endpoints",       cmd_endpoints))
+    app.add_handler(CommandHandler("jwtlive",         cmd_jwtlive))
+    app.add_handler(CommandHandler("pushkeys",        cmd_pushkeys))
+    app.add_handler(CommandHandler("chatkeys",        cmd_chatkeys))
     # ── Account commands ──────────────────────────────
     app.add_handler(CommandHandler("mystats",        cmd_mystats))
     # ── Admin commands ────────────────────────────────
