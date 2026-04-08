@@ -14,11 +14,11 @@
 # ║  ✅ /subdomains Enum        ✅ /fuzz Path+Param Fuzzer      ║
 # ╚══════════════════════════════════════════════════════════════╝
 #
-# Termux Setup:
-#   pkg update && pkg upgrade -y
-#   pkg install python nodejs -y
-#   pip install python-telegram-bot requests beautifulsoup4 python-dotenv
-#   npm install puppeteer
+# Server Setup:
+#   apt update && apt install -y python3 python3-pip
+#   pip install python-telegram-bot requests beautifulsoup4 python-dotenv playwright
+#   playwright install chromium
+#   playwright install-deps chromium
 #   cp .env.example .env   # ပြီးရင် .env ထဲ token ထည့်ပါ
 #   python web_downloader_bot.py
 # ══════════════════════════════════════════════════════════════
@@ -60,7 +60,6 @@ DB_FILE         = os.path.expanduser("~/downloads/bot_db.json")
 RESUME_DIR      = os.path.expanduser("~/downloads/resume_states")
 APP_ANALYZE_DIR = os.path.expanduser("~/downloads/app_analysis")
 APP_MAX_MB      = int(os.getenv("APP_MAX_MB", "150"))   # max upload size
-JS_RENDER       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js_render.js")
 
 DAILY_LIMIT      = int(os.getenv("DAILY_LIMIT", "5"))
 MAX_WORKERS      = 5
@@ -120,16 +119,15 @@ HEADERS = {
     )
 }
 
-# ── Puppeteer check ───────────────────────────────
-def _check_puppeteer() -> bool:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return (
-        os.path.exists(JS_RENDER) and
-        os.path.exists(os.path.join(script_dir, "node_modules", "puppeteer")) and
-        shutil.which("node") is not None
-    )
+# ── Playwright check ──────────────────────────────
+def _check_playwright() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+        return True
+    except ImportError:
+        return False
 
-PUPPETEER_OK = _check_puppeteer()
+PLAYWRIGHT_OK = _check_playwright()
 
 
 # ══════════════════════════════════════════════════
@@ -883,51 +881,66 @@ def pbar(done: int, total: int, width: int = 18) -> str:
     return f"│{bar}│ {pct_str}"
 
 # ══════════════════════════════════════════════════
-# 🌐  JS RENDERER  (Puppeteer via subprocess)
+# 🌐  JS RENDERER  (Playwright — Python native)
 # ══════════════════════════════════════════════════
 
-def fetch_with_puppeteer(url: str) -> str | None:
+def fetch_with_playwright(url: str) -> str | None:
     """
-    SECURITY: URL ကို sanitize + validate ပြီးမှသာ subprocess pass
-    shell=False (default) ဖြစ်တဲ့အတွက် shell injection မဖြစ်နိုင်
+    Playwright ဖြင့် JS render လုပ်ပြီး HTML ထုတ်ပေးသည်။
+    SECURITY: URL validate ပြီးမှသာ browser ဖွင့်သည်။
     """
-    if not PUPPETEER_OK:
+    if not PLAYWRIGHT_OK:
         return None
 
-    # ── Subprocess injection fix ──────────────────
     safe, reason = is_safe_url(url)
     if not safe:
-        logger.warning(f"Puppeteer blocked unsafe URL: {reason}")
+        logger.warning(f"Playwright blocked unsafe URL: {reason}")
         return None
 
-    # Strict URL chars whitelist (extra layer)
     if not re.match(r'^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+$', url):
-        logger.warning("Puppeteer blocked URL with invalid characters")
+        logger.warning("Playwright blocked URL with invalid characters")
         return None
 
     try:
-        result = subprocess.run(
-            ["node", JS_RENDER, url],  # list → no shell injection possible
-            capture_output=True,
-            timeout=45,
-            text=True,
-            shell=False                # explicit: False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
-        logger.warning(f"Puppeteer stderr: {result.stderr[:100]}")
-        return None
-    except subprocess.TimeoutExpired:
-        log_warn(url, "puppeteer timeout")
-        return None
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled", "--disable-gpu"]
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True,
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=40_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="load", timeout=25_000)
+                except Exception:
+                    pass
+            html = page.content()
+            browser.close()
+            return html if html and html.strip() else None
     except Exception as e:
-        logger.warning(f"Puppeteer exception: {type(e).__name__}")
+        logger.warning(f"Playwright exception: {type(e).__name__}: {e}")
         return None
 
 def fetch_page(url: str, use_js: bool = False) -> tuple:
     """Returns: (html | None, js_used: bool)"""
     if use_js:
-        html = fetch_with_puppeteer(url)
+        html = fetch_with_playwright(url)
         if html:
             return html, True
         log_info(f"JS fallback to requests: {sanitize_log_url(url)}")
@@ -4917,7 +4930,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 # ══════════════════════════════════════════════════
 
 async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/antibot <url> — Cloudflare/hCaptcha bypass via human-like Puppeteer"""
+    """/antibot <url> — Cloudflare/hCaptcha bypass via Playwright Stealth"""
     if not await check_force_join(update, context):
         return
 
@@ -4928,11 +4941,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  ① Human-like mouse movement + delay simulation\n"
             "  ② Random viewport + timezone spoofing\n"
             "  ③ Canvas/WebGL fingerprint randomization\n"
-            "  ④ Stealth Puppeteer (navigator.webdriver=false)\n"
+            "  ④ Stealth Playwright (navigator.webdriver=false)\n"
             "  ⑤ Cloudflare Turnstile passive challenge wait\n"
             "  ⑥ hCaptcha detection + fallback screenshot\n\n"
             "⚙️ *Requirements:*\n"
-            "  `node js_antibot.js` script + puppeteer-extra-plugin-stealth\n\n"
+            "  `pip install playwright && playwright install chromium`\n\n"
             "⚠️ _Authorized testing only_",
             parse_mode='Markdown'
         )
@@ -4953,11 +4966,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
         return
 
-    if not PUPPETEER_OK:
+    if not PLAYWRIGHT_OK:
         await update.effective_message.reply_text(
-            "❌ *Puppeteer မရှိသေးပါ*\n\n"
+            "❌ *Playwright မရှိသေးပါ*\n\n"
             "Setup:\n"
-            "```\nnpm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth\n```",
+            "```\npip install playwright\nplaywright install chromium\n```",
             parse_mode='Markdown'
         )
         return
@@ -4971,37 +4984,61 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-    antibot_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js_antibot.js")
-
     def _run_antibot():
-        if not os.path.exists(antibot_script):
-            # Inline fallback — use existing js_render with stealth hint
-            return _run_antibot_fallback(url)
+        """Playwright stealth — navigator.webdriver hidden, human-like timing"""
+        if not PLAYWRIGHT_OK:
+            return {"success": False, "error": "Playwright not available"}
         try:
-            result = subprocess.run(
-                ["node", antibot_script, url],
-                capture_output=True, timeout=90, text=True, shell=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"success": True, "html": result.stdout, "method": "stealth_puppeteer"}
-            return {"success": False, "error": result.stderr[:200] or "Empty response"}
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Timeout (90s) — challenge too complex"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    def _run_antibot_fallback(url: str) -> dict:
-        """Fallback — try puppeteer with delay headers if no antibot script"""
-        if not PUPPETEER_OK:
-            return {"success": False, "error": "Puppeteer not available"}
-        try:
-            result = subprocess.run(
-                ["node", JS_RENDER, url],
-                capture_output=True, timeout=60, text=True, shell=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"success": True, "html": result.stdout, "method": "js_render_fallback"}
-            return {"success": False, "error": "JS render failed"}
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled", "--disable-gpu"]
+                )
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    ignore_https_errors=True,
+                )
+                ctx.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = {runtime: {}};
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                    const orig = HTMLCanvasElement.prototype.toDataURL;
+                    HTMLCanvasElement.prototype.toDataURL = function(...args) {
+                        const ctx2 = this.getContext('2d');
+                        if (ctx2) {
+                            const d = ctx2.getImageData(0,0,1,1);
+                            d.data[0] = Math.floor(Math.random()*10);
+                            ctx2.putImageData(d,0,0);
+                        }
+                        return orig.apply(this, args);
+                    };
+                """)
+                page = ctx.new_page()
+                # Human-like mouse movement
+                page.mouse.move(300 + int(200 * 0.5), 200 + int(100 * 0.5))
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=60_000)
+                except Exception:
+                    try:
+                        page.goto(url, wait_until="load", timeout=40_000)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2500)
+                html = page.content()
+                browser.close()
+                if html and html.strip():
+                    return {"success": True, "html": html, "method": "stealth_playwright"}
+                return {"success": False, "error": "Empty response"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -8983,7 +9020,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         get_user(db2, uid, uname)
         _save_db_sync(db2)
 
-    js_status   = "✅ JS Ready" if PUPPETEER_OK else "⚠️ JS Off"
+    js_status   = "✅ JS Ready" if PLAYWRIGHT_OK else "⚠️ JS Off"
     adm_line     = "\n\n🔧 *Admin Panel:* /admin" if uid in ADMIN_IDS else ""
 
     await update.effective_message.reply_text(
@@ -9025,7 +9062,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid     = update.effective_user.id
     is_adm  = uid in ADMIN_IDS
-    js_st    = "✅ Ready" if PUPPETEER_OK else "❌ `npm install puppeteer`"
+    js_st    = "✅ Ready" if PLAYWRIGHT_OK else "❌ `pip install playwright && playwright install chromium`"
     base = (
         "📖 *Commands Guide — v17.0*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -9396,7 +9433,7 @@ async def _send_admin_panel(target, db: dict):
         f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
         f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
         f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PUPPETEER_OK else '❌'}"
+        f"JS: {'✅' if PLAYWRIGHT_OK else '❌'}"
     )
     markup = InlineKeyboardMarkup(kb)
     try:
@@ -9858,51 +9895,66 @@ def pbar(done: int, total: int, width: int = 18) -> str:
     return f"│{bar}│ {pct_str}"
 
 # ══════════════════════════════════════════════════
-# 🌐  JS RENDERER  (Puppeteer via subprocess)
+# 🌐  JS RENDERER  (Playwright — Python native)
 # ══════════════════════════════════════════════════
 
-def fetch_with_puppeteer(url: str) -> str | None:
+def fetch_with_playwright(url: str) -> str | None:
     """
-    SECURITY: URL ကို sanitize + validate ပြီးမှသာ subprocess pass
-    shell=False (default) ဖြစ်တဲ့အတွက် shell injection မဖြစ်နိုင်
+    Playwright ဖြင့် JS render လုပ်ပြီး HTML ထုတ်ပေးသည်။
+    SECURITY: URL validate ပြီးမှသာ browser ဖွင့်သည်။
     """
-    if not PUPPETEER_OK:
+    if not PLAYWRIGHT_OK:
         return None
 
-    # ── Subprocess injection fix ──────────────────
     safe, reason = is_safe_url(url)
     if not safe:
-        logger.warning(f"Puppeteer blocked unsafe URL: {reason}")
+        logger.warning(f"Playwright blocked unsafe URL: {reason}")
         return None
 
-    # Strict URL chars whitelist (extra layer)
     if not re.match(r'^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+$', url):
-        logger.warning("Puppeteer blocked URL with invalid characters")
+        logger.warning("Playwright blocked URL with invalid characters")
         return None
 
     try:
-        result = subprocess.run(
-            ["node", JS_RENDER, url],  # list → no shell injection possible
-            capture_output=True,
-            timeout=45,
-            text=True,
-            shell=False                # explicit: False
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout
-        logger.warning(f"Puppeteer stderr: {result.stderr[:100]}")
-        return None
-    except subprocess.TimeoutExpired:
-        log_warn(url, "puppeteer timeout")
-        return None
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled", "--disable-gpu"]
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True,
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=40_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="load", timeout=25_000)
+                except Exception:
+                    pass
+            html = page.content()
+            browser.close()
+            return html if html and html.strip() else None
     except Exception as e:
-        logger.warning(f"Puppeteer exception: {type(e).__name__}")
+        logger.warning(f"Playwright exception: {type(e).__name__}: {e}")
         return None
 
 def fetch_page(url: str, use_js: bool = False) -> tuple:
     """Returns: (html | None, js_used: bool)"""
     if use_js:
-        html = fetch_with_puppeteer(url)
+        html = fetch_with_playwright(url)
         if html:
             return html, True
         log_info(f"JS fallback to requests: {sanitize_log_url(url)}")
@@ -13667,7 +13719,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 # ══════════════════════════════════════════════════
 
 async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/antibot <url> — Cloudflare/hCaptcha bypass via human-like Puppeteer"""
+    """/antibot <url> — Cloudflare/hCaptcha bypass via Playwright Stealth"""
     if not await check_force_join(update, context):
         return
 
@@ -13678,11 +13730,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  ① Human-like mouse movement + delay simulation\n"
             "  ② Random viewport + timezone spoofing\n"
             "  ③ Canvas/WebGL fingerprint randomization\n"
-            "  ④ Stealth Puppeteer (navigator.webdriver=false)\n"
+            "  ④ Stealth Playwright (navigator.webdriver=false)\n"
             "  ⑤ Cloudflare Turnstile passive challenge wait\n"
             "  ⑥ hCaptcha detection + fallback screenshot\n\n"
             "⚙️ *Requirements:*\n"
-            "  `node js_antibot.js` script + puppeteer-extra-plugin-stealth\n\n"
+            "  `pip install playwright && playwright install chromium`\n\n"
             "⚠️ _Authorized testing only_",
             parse_mode='Markdown'
         )
@@ -13703,11 +13755,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
         return
 
-    if not PUPPETEER_OK:
+    if not PLAYWRIGHT_OK:
         await update.effective_message.reply_text(
-            "❌ *Puppeteer မရှိသေးပါ*\n\n"
+            "❌ *Playwright မရှိသေးပါ*\n\n"
             "Setup:\n"
-            "```\nnpm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth\n```",
+            "```\npip install playwright\nplaywright install chromium\n```",
             parse_mode='Markdown'
         )
         return
@@ -13721,37 +13773,61 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
-    antibot_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "js_antibot.js")
-
     def _run_antibot():
-        if not os.path.exists(antibot_script):
-            # Inline fallback — use existing js_render with stealth hint
-            return _run_antibot_fallback(url)
+        """Playwright stealth — navigator.webdriver hidden, human-like timing"""
+        if not PLAYWRIGHT_OK:
+            return {"success": False, "error": "Playwright not available"}
         try:
-            result = subprocess.run(
-                ["node", antibot_script, url],
-                capture_output=True, timeout=90, text=True, shell=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"success": True, "html": result.stdout, "method": "stealth_puppeteer"}
-            return {"success": False, "error": result.stderr[:200] or "Empty response"}
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Timeout (90s) — challenge too complex"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
-
-    def _run_antibot_fallback(url: str) -> dict:
-        """Fallback — try puppeteer with delay headers if no antibot script"""
-        if not PUPPETEER_OK:
-            return {"success": False, "error": "Puppeteer not available"}
-        try:
-            result = subprocess.run(
-                ["node", JS_RENDER, url],
-                capture_output=True, timeout=60, text=True, shell=False
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return {"success": True, "html": result.stdout, "method": "js_render_fallback"}
-            return {"success": False, "error": "JS render failed"}
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled", "--disable-gpu"]
+                )
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    ignore_https_errors=True,
+                )
+                ctx.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = {runtime: {}};
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                    const orig = HTMLCanvasElement.prototype.toDataURL;
+                    HTMLCanvasElement.prototype.toDataURL = function(...args) {
+                        const ctx2 = this.getContext('2d');
+                        if (ctx2) {
+                            const d = ctx2.getImageData(0,0,1,1);
+                            d.data[0] = Math.floor(Math.random()*10);
+                            ctx2.putImageData(d,0,0);
+                        }
+                        return orig.apply(this, args);
+                    };
+                """)
+                page = ctx.new_page()
+                # Human-like mouse movement
+                page.mouse.move(300 + int(200 * 0.5), 200 + int(100 * 0.5))
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=60_000)
+                except Exception:
+                    try:
+                        page.goto(url, wait_until="load", timeout=40_000)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2500)
+                html = page.content()
+                browser.close()
+                if html and html.strip():
+                    return {"success": True, "html": html, "method": "stealth_playwright"}
+                return {"success": False, "error": "Empty response"}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -14856,7 +14932,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         get_user(db2, uid, uname)
         _save_db_sync(db2)
 
-    js_status   = "✅ JS Ready" if PUPPETEER_OK else "⚠️ JS Off"
+    js_status   = "✅ JS Ready" if PLAYWRIGHT_OK else "⚠️ JS Off"
     adm_line     = "\n\n🔧 *Admin Panel:* /admin" if uid in ADMIN_IDS else ""
 
     await update.effective_message.reply_text(
@@ -14898,7 +14974,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid     = update.effective_user.id
     is_adm  = uid in ADMIN_IDS
-    js_st    = "✅ Ready" if PUPPETEER_OK else "❌ `npm install puppeteer`"
+    js_st    = "✅ Ready" if PLAYWRIGHT_OK else "❌ `pip install playwright && playwright install chromium`"
     base = (
         "📖 *Commands Guide — v17.0*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -15269,7 +15345,7 @@ async def _send_admin_panel(target, db: dict):
         f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
         f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
         f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PUPPETEER_OK else '❌'}"
+        f"JS: {'✅' if PLAYWRIGHT_OK else '❌'}"
     )
     markup = InlineKeyboardMarkup(kb)
     try:
@@ -16146,89 +16222,12 @@ def _fetch_source_maps(js_sources: list, base_url: str) -> list:
             pass
     return found
 
-# ─── Puppeteer-based dynamic scan (network request capture) ──
-_KD_INTERCEPT_JS = """
-const puppeteer = require('puppeteer');
+# ─── Playwright-based dynamic scan (network request capture) ──
 
-(async () => {
-    const url = process.argv[2];
-    const browser = await puppeteer.launch({
-        headless: 'new',
-        args: ['--no-sandbox','--disable-setuid-sandbox',
-               '--disable-dev-shm-usage','--disable-gpu']
-    });
-    const page = await browser.newPage();
-
-    const findings = {requests: [], storage: {}, cookies: []};
-
-    // Intercept all outgoing requests for auth headers
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-        const hdrs = req.headers();
-        const interestingHdrs = {};
-        for (const [k,v] of Object.entries(hdrs)) {
-            const kl = k.toLowerCase();
-            if (kl === 'authorization' || kl === 'x-api-key' ||
-                kl === 'x-auth-token' || kl.includes('token') || kl.includes('key')) {
-                interestingHdrs[k] = v;
-            }
-        }
-        if (Object.keys(interestingHdrs).length > 0) {
-            findings.requests.push({url: req.url().substring(0,120), headers: interestingHdrs});
-        }
-        req.continue();
-    });
-
-    try {
-        await page.goto(url, {waitUntil:'networkidle2', timeout:25000});
-    } catch(e) {}
-
-    // Extract localStorage + sessionStorage
-    const storage = await page.evaluate(() => {
-        const ls = {}, ss = {};
-        for(let i=0;i<localStorage.length;i++){
-            const k=localStorage.key(i);
-            ls[k]=localStorage.getItem(k);
-        }
-        for(let i=0;i<sessionStorage.length;i++){
-            const k=sessionStorage.key(i);
-            ss[k]=sessionStorage.getItem(k);
-        }
-        return {localStorage: ls, sessionStorage: ss};
-    });
-    findings.storage = storage;
-
-    // Cookies
-    findings.cookies = (await page.cookies()).map(c=>({name:c.name,value:c.value.substring(0,80)}));
-
-    await browser.close();
-    process.stdout.write(JSON.stringify(findings));
-})();
-"""
-
-def _run_puppeteer_keydump(url: str) -> dict:
-    """Run dynamic analysis via Puppeteer (Node.js) or Playwright (Python fallback)."""
-    # ── Try Puppeteer (Node.js) first ────────────────────────
-    if PUPPETEER_OK:
-        try:
-            import tempfile, os as _os
-            tmp = tempfile.NamedTemporaryFile(suffix=".js", delete=False, mode="w")
-            tmp.write(_KD_INTERCEPT_JS)
-            tmp.close()
-            result = subprocess.run(
-                ["node", tmp.name, url],
-                capture_output=True, timeout=35, text=True, shell=False
-            )
-            _os.unlink(tmp.name)
-            if result.returncode == 0 and result.stdout.strip():
-                data = json.loads(result.stdout)
-                data["_engine"] = "puppeteer"
-                return data
-        except Exception as e:
-            logger.debug("Puppeteer keydump error: %s", e)
-
-    # ── Fallback: Playwright (Python) ────────────────────────
+def _run_playwright_dynamic_keydump(url: str) -> dict:
+    """Dynamic keydump via Playwright (Python native)."""
     return _run_playwright_keydump(url)
+
 
 
 def _run_playwright_keydump(url: str) -> dict:
@@ -16337,7 +16336,7 @@ def _run_keydump_sync(url: str) -> dict:
     1. Static HTML + JS bundles scan
     2. Source map extraction
     3. High-entropy analysis
-    4. Cookie/storage via Puppeteer (if available)
+    4. Cookie/storage via Playwright
     Returns structured results dict.
     """
     out = {
@@ -16433,9 +16432,9 @@ def _run_keydump_sync(url: str) -> dict:
     except Exception as e:
         out["errors"].append(f"Sourcemap: {e}")
 
-    # ── 5. Dynamic via Puppeteer ───────────────────────────────
+    # ── 5. Dynamic via Playwright ───────────────────────────────
     try:
-        dyn = _run_puppeteer_keydump(url)
+        dyn = _run_playwright_dynamic_keydump(url)
         out["dynamic"] = dyn
 
         # Scan localStorage/sessionStorage values for keys
@@ -16480,7 +16479,7 @@ def _format_keydump_report(result: dict) -> tuple:
     )
 
     # ── Header ─────────────────────────────────────────────────
-    js_mode      = "⚡ JS+Static+Dynamic" if PUPPETEER_OK else "📄 Static+JS"
+    js_mode      = "⚡ JS+Static+Dynamic" if PLAYWRIGHT_OK else "📄 Static+JS"
     inline_cnt   = result.get("inline_scripts", 0)
     lines = [
         f"🔑 *KeyDump v18 — Full Scan*",
@@ -16598,7 +16597,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "*Categories scanned:*\n"
             "☁️ Cloud  🔥 Firebase  💳 Payment  🧬 JWT\n"
             "📱 Social  📊 Analytics  🔒 Secrets  📨 Comms\n\n"
-            f"⚡ Dynamic mode: {'✅ Puppeteer ready' if PUPPETEER_OK else '⚠️ Static only (npm install puppeteer)'}",
+            f"⚡ Dynamic mode: {'✅ Playwright ready' if PLAYWRIGHT_OK else '⚠️ Static only (pip install playwright)'}",
             parse_mode="Markdown"
         )
         return
@@ -16629,7 +16628,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"② Pattern matching (`{len(_KD_PATTERNS)}` rules)...\n"
         f"③ Entropy analysis...\n"
         f"④ Source map check...\n"
-        f"{'⑤ Dynamic intercept (Puppeteer)...' if PUPPETEER_OK else '⑤ Dynamic intercept (Playwright fallback)...'}",
+        "⑤ Dynamic intercept (Playwright)...",
         parse_mode="Markdown"
     )
 
@@ -17259,8 +17258,8 @@ def main():
         print("3. ID မသိရင်: @userinfobot → /start")
         print()
         print("JS Support:")
-        print("  pkg install nodejs -y")
-        print("  npm install puppeteer")
+        print("  pip install playwright")
+        print("  playwright install chromium")
         print("═"*55)
         return
 
@@ -17364,7 +17363,7 @@ def main():
     print(f"║  Auto-Delete Files:   ✅ ({FILE_EXPIRY_HOURS}h)       ║")
     print(f"║  Admin Cmd Hidden:    ✅             ║")
     print(f"║  File Log:            ✅ bot.log     ║")
-    print(f"║  JS (Puppeteer):      {'✅' if PUPPETEER_OK else '❌ npm install puppeteer'}  ║")
+    print(f"║  JS (Playwright):     {'✅' if PLAYWRIGHT_OK else '❌ pip install playwright'}  ║")
     print(f"║  Concurrent:          {MAX_WORKERS} users           ║")
     print(f"║  /tech fingerprint:   ✅             ║")
     print(f"║  /extract secrets:    ✅             ║")
