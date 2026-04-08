@@ -580,7 +580,7 @@ def user_guard(func):
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id
-        db  = read_db()
+        db  = await db_read()
         if uid not in ADMIN_IDS:
             if not db.get("settings", {}).get("bot_enabled", True):
                 await update.effective_message.reply_text(
