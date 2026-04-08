@@ -6025,6 +6025,20 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         (re.compile(r'geo\.captcha\.com[^"\']*gt=([0-9a-f]{32})', re.I), "GeeTest"),
         # Generic sitekey in any captcha-related URL
         (re.compile(r'(?:recaptcha|hcaptcha|captcha|turnstile)[^"\']*[?&](?:sitekey|k|key)=([0-9A-Za-z_\-]{20,60})', re.I), "Captcha (generic)"),
+        # ── v18: Additional captcha providers ─────────────────────────────
+        # FriendlyCaptcha: puzzle endpoint contains sitekey param
+        (re.compile(r'friendlycaptcha\.(?:com|eu)/api/v1/puzzle[^"\']*[?&]sitekey=([A-Za-z0-9_\-]{10,60})', re.I), "FriendlyCaptcha"),
+        # FriendlyCaptcha generic pattern
+        (re.compile(r'friendlycaptcha[^"\']*[?&](?:sitekey|site_key)=([A-Za-z0-9_\-]{10,60})', re.I), "FriendlyCaptcha"),
+        # AWS WAF Captcha: token endpoint
+        (re.compile(r'(?:captcha\.us-east-1\.amazonaws\.com|token\.awswaf\.com)[^"\']*[?&](?:token|key|jsapi)=([A-Za-z0-9_\-./]{10,120})', re.I), "AWS WAF Captcha"),
+        # DataDome: tag.datadome.co device check URL
+        (re.compile(r'(?:tag\.datadome\.co|js\.datadome\.com)[^"\']*', re.I), "DataDome"),
+        # DataDome: device check with token
+        (re.compile(r'api\.datadome\.co/[^"\']*[?&](?:dd_device_id|jsv|jc)=([A-Za-z0-9_\-]{10,80})', re.I), "DataDome"),
+        # PerimeterX: px.js or collector endpoint
+        (re.compile(r'(?:client\.px-cloud\.net|px-cdn\.net|sactechrisk\.com)/[A-Za-z0-9]+/main\.min\.js', re.I), "PerimeterX"),
+        (re.compile(r'(?:collector(?:-[a-z]+)?\.px-cdn\.net|sactechrisk\.com)/[^"\']*appId=([A-Za-z0-9_\-]{8,40})', re.I), "PerimeterX"),
     ]
 
     _BODY_PATTERNS = [
@@ -6337,6 +6351,23 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                             cData:  el.getAttribute('data-cdata') || '',
                         });
                     });
+                    // ── v18: FriendlyCaptcha widget ──────────────────────────────
+                    root.querySelectorAll('.frc-captcha[data-sitekey]').forEach(el => {
+                        const k = el.getAttribute('data-sitekey');
+                        if (k) add(k, '.frc-captcha[data-sitekey]', 'FriendlyCaptcha', {
+                            lang:     el.getAttribute('data-lang') || '',
+                            callback: el.getAttribute('data-callback') || '',
+                        });
+                    });
+                    root.querySelectorAll('friendly-captcha[puzzle-endpoint],[start="auto"][data-sitekey]').forEach(el => {
+                        const k = el.getAttribute('data-sitekey') || el.getAttribute('sitekey');
+                        if (k) add(k, 'friendly-captcha element', 'FriendlyCaptcha', {});
+                    });
+                    // ── v18: AWS WAF Captcha token container ─────────────────────
+                    root.querySelectorAll('[data-aws-waf-token],[id*="awswaf"],[class*="awswaf"]').forEach(el => {
+                        const tok = el.getAttribute('data-aws-waf-token') || el.textContent;
+                        if (tok && tok.length > 10) add(tok.substring(0,120), '[data-aws-waf-token]', 'AWS WAF Captcha', {});
+                    });
                     // Shadow DOM
                     root.querySelectorAll('*').forEach(el => {
                         if (el.shadowRoot) scanDOM(el.shadowRoot);
@@ -6574,6 +6605,44 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     return result
 
 
+def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
+    """
+    v18: Wrap _sitekey_sync with sub-page fallback.
+    If main URL yields no captcha findings, scan common sub-pages
+    (/contact, /donate, /checkout, /payment, /register, /signup)
+    and return the first result that has findings.
+    """
+    # ── Main URL scan ────────────────────────────────────────────
+    if progress_cb: progress_cb(f"🌐 Scanning main URL...")
+    result = _sitekey_sync(url, progress_cb)
+    if result.get("error") or result.get("findings"):
+        return result
+
+    # ── Sub-page fallback ────────────────────────────────────────
+    parsed      = urlparse(url)
+    base_origin = f"{parsed.scheme}://{parsed.netloc}"
+    sub_paths   = [
+        "/contact", "/donate", "/checkout", "/payment",
+        "/register", "/signup", "/login", "/cart",
+        "/get-involved", "/give", "/contribute",
+    ]
+    for sub in sub_paths:
+        sub_url = base_origin + sub
+        if progress_cb: progress_cb(f"🔍 Sub-page scan: `{sub}`...")
+        try:
+            sub_result = _sitekey_sync(sub_url, progress_cb)
+            if sub_result.get("findings"):
+                # Tag each finding with the sub-page it was found on
+                for f in sub_result["findings"]:
+                    f["source"] = f"[sub-page {sub}] " + f.get("source", "")
+                return sub_result
+        except Exception:
+            pass
+
+    # Return the (empty) main-URL result if nothing found anywhere
+    return result
+
+
 def _sitekey_static(url: str, progress_cb=None) -> dict:
     """Fallback: requests-based static HTML + JS scan (no browser)."""
     session = requests.Session()
@@ -6702,7 +6771,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = asyncio.create_task(_prog())
     try:
         result = await asyncio.to_thread(
-            _sitekey_sync, url, lambda t: progress_q.append(t)
+            _sitekey_with_subpages, url, lambda t: progress_q.append(t)
         )
     except Exception as e:
         prog.cancel()
@@ -7734,7 +7803,7 @@ _PAY_JS_EVAL = """() => {
         }
     } catch(e) {}
 
-    // ── Payment SDK globals ──
+    // ── Payment SDK globals (v18: added Klarna, Adyen, Checkout, Mollie, Gatsby/Vue/Nuxt variants) ──
     const sdkKeys = [
         'stripePublishableKey', 'STRIPE_PUBLISHABLE_KEY',
         'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY', 'REACT_APP_STRIPE_KEY',
@@ -7746,6 +7815,22 @@ _PAY_JS_EVAL = """() => {
         'checkoutPublicKey', 'CHECKOUT_PUBLIC_KEY',
         'mollieProfileId', 'MOLLIE_PROFILE_ID',
         'paddleVendorId', 'PADDLE_VENDOR_ID',
+        // v18: Klarna
+        'klarnaClientId', 'KLARNA_CLIENT_ID', 'klarna_client_id',
+        'klarnaPublicKey', 'KLARNA_PUBLIC_KEY',
+        // v18: Adyen
+        'adyenClientKey', 'ADYEN_CLIENT_KEY', 'adyen_client_key',
+        'adyenOriginKey', 'ADYEN_ORIGIN_KEY',
+        // v18: Checkout.com
+        'checkoutComPublicKey', 'CHECKOUT_COM_PUBLIC_KEY',
+        // v18: Mollie
+        'MOLLIE_API_KEY', 'mollie_api_key',
+        // v18: Gatsby / Vue / Nuxt env variants
+        'GATSBY_STRIPE_PUBLIC_KEY', 'GATSBY_PAYPAL_CLIENT_ID',
+        'VUE_APP_STRIPE_KEY', 'VUE_APP_STRIPE_PUBLISHABLE_KEY',
+        'VUE_APP_PAYPAL_CLIENT_ID',
+        'NUXT_STRIPE_KEY', 'NUXT_PUBLIC_STRIPE_KEY',
+        'NUXT_PAYPAL_CLIENT_ID',
     ];
     sdkKeys.forEach(k => {
         try {
@@ -7764,9 +7849,9 @@ _PAY_JS_EVAL = """() => {
         ['appConfig', window.appConfig],
         ['siteConfig', window.siteConfig],
         ['wpApiSettings', window.wpApiSettings],
-        ['give_global_vars', window.give_global_vars],   // GiveWP donation plugin
+        ['give_global_vars', window.give_global_vars],
         ['giveVars', window.giveVars],
-        ['wc_stripe_params', window.wc_stripe_params],   // WooCommerce Stripe
+        ['wc_stripe_params', window.wc_stripe_params],
         ['wc_square_params', window.wc_square_params],
         ['wc_braintree_cart_params', window.wc_braintree_cart_params],
     ];
@@ -7778,6 +7863,46 @@ _PAY_JS_EVAL = """() => {
         } catch(e) {}
     });
 
+    // ── v18: __NEXT_DATA__ element parse — extract env object for payment keys ──
+    try {
+        const ndEl = document.getElementById('__NEXT_DATA__');
+        if (ndEl && ndEl.textContent) {
+            const nd = JSON.parse(ndEl.textContent);
+            const envObj = (nd && nd.props && nd.props.pageProps && nd.props.pageProps.env)
+                        || (nd && nd.runtimeConfig)
+                        || (nd && nd.env)
+                        || {};
+            Object.entries(envObj).forEach(([k, v]) => {
+                const kl = k.toLowerCase();
+                if ((kl.includes('stripe') || kl.includes('paypal') || kl.includes('pay') ||
+                     kl.includes('klarna') || kl.includes('adyen') || kl.includes('checkout') ||
+                     kl.includes('mollie') || kl.includes('publishable') || kl.includes('client_id')) &&
+                     typeof v === 'string' && v.length > 5) {
+                    res['__NEXT_DATA__.env:' + k] = v;
+                }
+            });
+        }
+    } catch(e) {}
+
+    // ── v18: window.__ENV__ / window._env_ / window.ENV / window.APP_CONFIG / window.appConfig / window.config / window.settings ──
+    const configKeys = ['__ENV__', '_env_', 'ENV', 'APP_CONFIG', 'appConfig', 'config', 'settings'];
+    configKeys.forEach(ck => {
+        try {
+            const obj = window[ck];
+            if (!obj || typeof obj !== 'object') return;
+            Object.entries(obj).forEach(([k, v]) => {
+                const kl = k.toLowerCase();
+                if ((kl.includes('stripe') || kl.includes('paypal') || kl.includes('pay') ||
+                     kl.includes('klarna') || kl.includes('adyen') || kl.includes('checkout') ||
+                     kl.includes('mollie') || kl.includes('publishable') || kl.includes('client_id') ||
+                     kl.includes('braintree') || kl.includes('square') || kl.includes('razorpay')) &&
+                     typeof v === 'string' && v.length > 5 && v.length < 300) {
+                    res[ck + ':' + k] = v;
+                }
+            });
+        } catch(e) {}
+    });
+
     // ── Scan all window keys for payment-related strings ──
     Object.keys(window).forEach(k => {
         try {
@@ -7785,7 +7910,8 @@ _PAY_JS_EVAL = """() => {
             if (kl.includes('stripe') || kl.includes('paypal') ||
                 kl.includes('payment') || kl.includes('checkout') ||
                 kl.includes('razorpay') || kl.includes('braintree') ||
-                kl.includes('publishable') || kl.includes('client_id')) {
+                kl.includes('publishable') || kl.includes('client_id') ||
+                kl.includes('klarna') || kl.includes('adyen') || kl.includes('mollie')) {
                 const v = window[k];
                 if (typeof v === 'string' && v.length > 5 && v.length < 500)
                     res['win:' + k] = v;
@@ -7805,10 +7931,11 @@ _PAY_JS_EVAL = """() => {
     });
     if (iframeData.length) res['__iframes__'] = JSON.stringify(iframeData);
 
-    // ── data attributes on page (data-key, data-publishable-key) ──
+    // ── v18: data attributes on page (added [data-stripe] and [data-publishable-key]) ──
     const dataAttrs = {};
-    document.querySelectorAll('[data-key],[data-publishable-key],[data-client-id],[data-stripe-key],[data-paypal-client-id]').forEach(el => {
-        ['data-key','data-publishable-key','data-client-id','data-stripe-key','data-paypal-client-id'].forEach(attr => {
+    document.querySelectorAll('[data-key],[data-publishable-key],[data-client-id],[data-stripe-key],[data-paypal-client-id],[data-stripe],[data-publishable-key]').forEach(el => {
+        ['data-key','data-publishable-key','data-client-id','data-stripe-key',
+         'data-paypal-client-id','data-stripe','data-publishable-key'].forEach(attr => {
             const v = el.getAttribute(attr);
             if (v && v.length > 5) dataAttrs[attr + ':' + el.tagName] = v;
         });
@@ -7817,6 +7944,176 @@ _PAY_JS_EVAL = """() => {
 
     return res;
 }"""
+
+# ── v18: Playwright-based dynamic payment key interceptor ─────────────────
+def _paykeys_playwright(url: str, progress_cb=None) -> dict:
+    """
+    v18: Dedicated Playwright payment key detector.
+    - Intercepts js.stripe.com and paypal.com/sdk/js requests
+    - Scans Stripe response bodies for pk_live_/pk_test_ keys
+    - Focuses payment-related elements (no form submit)
+    - Returns {"stripe_keys": [...], "paypal_client_ids": [...],
+               "response_hits": [...], "_engine": str}
+    """
+    result = {
+        "stripe_keys":      [],
+        "paypal_client_ids": [],
+        "response_hits":    [],
+        "_engine":          "none",
+    }
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        result["_engine"] = "playwright_not_installed"
+        return result
+
+    _PAY_KEY_RE  = re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,120})\b')
+    _PAYPAL_RE   = re.compile(r'[?&]client-id=([A-Za-z0-9_\-]{10,120})')
+    _stripe_seen = set()
+    _paypal_seen = set()
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                ]
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True,
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3]});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+
+            # ── Hook: Request interception ──────────────────────────────────
+            def _on_request(req):
+                ru = req.url
+                # Detect Stripe JS load
+                if "js.stripe.com" in ru:
+                    if progress_cb: progress_cb("💳 Stripe JS detected in network...")
+                # PayPal SDK: extract client-id from src URL
+                if "paypal.com/sdk/js" in ru:
+                    m = _PAYPAL_RE.search(ru)
+                    if m and m.group(1) not in _paypal_seen:
+                        _paypal_seen.add(m.group(1))
+                        result["paypal_client_ids"].append({
+                            "value":  m.group(1),
+                            "source": f"PayPal SDK request URL: {ru[:120]}",
+                        })
+                        if progress_cb: progress_cb(f"💳 PayPal client-id found: {m.group(1)[:20]}...")
+
+            # ── Hook: Response body scan ────────────────────────────────────
+            def _on_response(resp):
+                ru = resp.url
+                ct = resp.headers.get("content-type", "").lower()
+                if not any(x in ct for x in ("javascript", "json", "text/plain")):
+                    return
+                if resp.status != 200:
+                    return
+                try:
+                    body = resp.body().decode("utf-8", errors="ignore")
+                    # Stripe pk_ key in any response body
+                    for m in _PAY_KEY_RE.finditer(body):
+                        key = m.group(1)
+                        if key not in _stripe_seen:
+                            _stripe_seen.add(key)
+                            result["stripe_keys"].append({
+                                "value":  key,
+                                "source": f"Response body: {ru[:120]}",
+                                "env":    "🔴 LIVE" if "pk_live_" in key else "🟡 TEST",
+                            })
+                            if progress_cb: progress_cb(f"💳 Stripe key found in response: {key[:20]}...")
+                    # Collect body snippet if it has any payment keyword
+                    if any(kw in body for kw in (
+                        "pk_live_", "pk_test_", "client-id", "braintree",
+                        "squareup", "rzp_live_", "adyenClientKey",
+                    )):
+                        result["response_hits"].append({
+                            "url":  ru[:120],
+                            "body": body[:1500],
+                        })
+                except Exception:
+                    pass
+
+            page.on("request",  _on_request)
+            page.on("response", _on_response)
+
+            if progress_cb: progress_cb("🌐 Loading page for payment key interception...")
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            except PWTimeout:
+                pass
+            except Exception:
+                pass
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+
+            # Scroll to trigger lazy-loaded payment widgets
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                page.wait_for_timeout(1000)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+            # ── Focus payment-related elements (NO submit) ──────────────────
+            focus_selectors = [
+                '[data-testid*="pay"]',
+                '.payment-button',
+                '#place-order',
+                'button[name="commit"]',
+                '[class*="payment"]',
+                '[id*="payment"]',
+                '[class*="checkout"]',
+                '[id*="checkout"]',
+                'button[class*="pay"]',
+                '.stripe-button-el',
+                '#stripe-button',
+                '[data-stripe]',
+            ]
+            for sel in focus_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        page.wait_for_timeout(300)
+                        el.focus()   # focus only — no click/submit
+                        page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
+            # Final wait for any deferred Stripe/PayPal init
+            try:
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            browser.close()
+
+    except Exception as e:
+        result["_engine"] = f"error: {e}"
+        return result
+
+    result["_engine"] = "playwright_v18"
+    return result
+
 
 def _paykeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
@@ -7879,12 +8176,30 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
                     val = mm.group(1) if mm.lastindex else mm.group(0)
                     _add(key_type, val, f"{env_key} (framework config)")
 
+    # ── 5. v18: Dynamic Playwright interception (Stripe response + PayPal SDK URL) ──
+    dyn = {"stripe_keys": [], "paypal_client_ids": [], "_engine": "none"}
+    if PLAYWRIGHT_OK:
+        if progress_cb: progress_cb("🌐 Dynamic payment interception (Playwright)...")
+        try:
+            dyn = _paykeys_playwright(url, progress_cb)
+        except Exception as _dyn_err:
+            logger.debug("_paykeys_playwright error: %s", _dyn_err)
+
+    # Merge Stripe keys from dynamic scan
+    for sk in dyn.get("stripe_keys", []):
+        _add("Stripe Publishable Key (dynamic)", sk["value"], sk.get("source", "Playwright"))
+
+    # Merge PayPal client-ids from dynamic scan
+    for pp in dyn.get("paypal_client_ids", []):
+        _add("PayPal Client ID (SDK URL)", pp["value"], pp.get("source", "Playwright"))
+
     return {
         "error":    None,
         "findings": findings,
         "page_url": data["page_url"],
         "requests": len(data.get("network_log", [])),
         "js_count": sum(1 for e in data.get("network_log",[]) if ".js" in e["url"]),
+        "dynamic":  dyn,
     }
 
 
@@ -16565,15 +16880,27 @@ def _entropy(s: str) -> float:
     return -sum((count / length) * math.log2(count / length) for count in freq.values())
 
 # ─── High-entropy string finder ───────────────────────────────
-def _find_high_entropy(text: str, threshold: float = 4.5) -> list:
-    """Find high-entropy strings (> threshold) — likely secrets."""
+def _find_high_entropy(text: str, threshold: float = 4.2) -> list:
+    """Find high-entropy strings (> threshold) — likely secrets. v18: threshold 4.2, hex patterns, limit 30."""
     candidates = []
     # Scan quoted strings
     for m in re.finditer(r'["\']([A-Za-z0-9+/=_\-]{20,120})["\']', text):
         s = m.group(1)
         ent = _entropy(s)
         if ent >= threshold:
-            candidates.append({"value": s, "entropy": round(ent, 2)})
+            candidates.append({"value": s, "entropy": round(ent, 2), "type": "quoted_string"})
+    # v18: bare hex-32 (API keys, tokens, MD5 hashes with secrets)
+    for m in re.finditer(r'\b([0-9a-f]{32})\b', text, re.I):
+        s = m.group(1)
+        ent = _entropy(s)
+        if ent >= threshold:
+            candidates.append({"value": s, "entropy": round(ent, 2), "type": "hex32"})
+    # v18: bare hex-64 (SHA-256 secrets, long tokens)
+    for m in re.finditer(r'\b([0-9a-f]{64})\b', text, re.I):
+        s = m.group(1)
+        ent = _entropy(s)
+        if ent >= threshold:
+            candidates.append({"value": s, "entropy": round(ent, 2), "type": "hex64"})
     # Deduplicate
     seen = set()
     out  = []
@@ -16581,7 +16908,7 @@ def _find_high_entropy(text: str, threshold: float = 4.5) -> list:
         if c["value"] not in seen:
             seen.add(c["value"])
             out.append(c)
-    return sorted(out, key=lambda x: -x["entropy"])[:20]
+    return sorted(out, key=lambda x: -x["entropy"])[:30]
 
 # ─── Source map fetcher ───────────────────────────────────────
 def _fetch_source_maps(js_sources: list, base_url: str) -> list:
@@ -16693,20 +17020,46 @@ def _run_playwright_keydump(url: str) -> dict:
 
             def _on_response(resp):
                 ct = resp.headers.get("content-type", "").lower()
-                if any(x in ct for x in ("json","javascript","text")) and resp.status == 200:
-                    try:
-                        body = resp.body().decode("utf-8", errors="ignore")
-                        if any(kw in body for kw in (
-                            "token","api_key","apikey","secret","bearer",
-                            "pk_live","sk_live","pk_test","sk_test",
-                            "authorization","credential","firebase"
-                        )):
-                            findings["response_bodies"].append({
-                                "url":  resp.url[:150],
-                                "body": body[:3000],
-                            })
-                    except Exception:
-                        pass
+                if not any(x in ct for x in ("json", "javascript", "text/plain", "text/html")):
+                    return
+                if resp.status != 200:
+                    return
+                try:
+                    body = resp.body().decode("utf-8", errors="ignore")
+                    if not body or len(body) < 10:
+                        return
+                    # ── v18: Match _KD_PATTERNS against response body ──────────
+                    kd_hits = {}
+                    for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                        try:
+                            raw = re.findall(pat, body, re.IGNORECASE)
+                        except Exception:
+                            continue
+                        flat = []
+                        for m in raw:
+                            if isinstance(m, tuple):
+                                flat.extend([x.strip() for x in m if x and len(x) > 4])
+                            else:
+                                if m and len(m) > 4:
+                                    flat.append(m.strip())
+                        if flat:
+                            kd_hits[label] = list(dict.fromkeys(flat))[:4]
+                    if kd_hits:
+                        if "response_hits" not in findings:
+                            findings["response_hits"] = {}
+                        findings["response_hits"][resp.url[:120]] = kd_hits
+                    # ── Original keyword check for full body storage ───────────
+                    if any(kw in body for kw in (
+                        "token", "api_key", "apikey", "secret", "bearer",
+                        "pk_live", "sk_live", "pk_test", "sk_test",
+                        "authorization", "credential", "firebase"
+                    )):
+                        findings["response_bodies"].append({
+                            "url":  resp.url[:150],
+                            "body": body[:3000],
+                        })
+                except Exception:
+                    pass
 
             page.on("request",  _on_request)
             page.on("response", _on_response)
@@ -16817,6 +17170,50 @@ def _run_playwright_keydump(url: str) -> dict:
     return findings
 
 
+# ── v18: Framework globals extractor ──────────────────────────────────────
+def _extract_framework_globals(html: str) -> str:
+    """
+    Extract window/framework state blobs from HTML:
+    __NEXT_DATA__, __NUXT__, pageData, __INITIAL_STATE__,
+    __REDUX_STATE__, __APP_STATE__, _env_, ENV, config, APP_CONFIG.
+    Returns all found JSON/value strings joined into one string.
+    """
+    parts = []
+    patterns = [
+        # __NEXT_DATA__ script tag
+        re.compile(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.{20,}?\})\s*</script>', re.S | re.I),
+        # window assignments (inline script vars)
+        re.compile(r'window\.__NEXT_DATA__\s*=\s*(\{.{10,50000}?\})\s*;', re.S),
+        re.compile(r'window\.__NUXT__\s*=\s*(\{.{10,50000}?\})\s*;', re.S),
+        re.compile(r'window\.pageData\s*=\s*(\{.{10,20000}?\})\s*;', re.S),
+        re.compile(r'window\.__INITIAL_STATE__\s*=\s*(\{.{10,50000}?\})\s*;', re.S),
+        re.compile(r'window\.__REDUX_STATE__\s*=\s*(\{.{10,50000}?\})\s*;', re.S),
+        re.compile(r'window\.__APP_STATE__\s*=\s*(\{.{10,50000}?\})\s*;', re.S),
+        re.compile(r'window\._env_\s*=\s*(\{.{10,10000}?\})\s*;', re.S),
+        re.compile(r'window\.ENV\s*=\s*(\{.{10,10000}?\})\s*;', re.S),
+        re.compile(r'window\.config\s*=\s*(\{.{10,10000}?\})\s*;', re.S),
+        re.compile(r'window\.APP_CONFIG\s*=\s*(\{.{10,10000}?\})\s*;', re.S),
+        re.compile(r'window\.appConfig\s*=\s*(\{.{10,10000}?\})\s*;', re.S),
+        # var/const/let assignments at top level in script tags
+        re.compile(r'(?:var|let|const)\s+__NEXT_DATA__\s*=\s*(\{.{10,50000}?\})\s*;', re.S),
+    ]
+    for pat in patterns:
+        for m in pat.finditer(html):
+            blob = m.group(1).strip()
+            if blob and len(blob) > 10:
+                parts.append(blob[:20000])  # cap per-blob at 20KB
+    return "\n".join(parts)
+
+
+def _extract_html_comments(html: str) -> str:
+    """
+    Extract all HTML comments <!-- ... --> with content length > 10.
+    Useful for finding dev notes, debug info, API keys left in comments.
+    """
+    comments = re.findall(r'<!--([\s\S]*?)-->', html)
+    return "\n".join(c.strip() for c in comments if len(c.strip()) > 10)
+
+
 # ─── Master keydump engine ────────────────────────────────────
 def _run_keydump_sync(url: str) -> dict:
     """
@@ -16862,9 +17259,16 @@ def _run_keydump_sync(url: str) -> dict:
         pass
 
     # Build full corpus: HTML + inline scripts + all JS bundle text
+    # v18: also include framework globals and HTML comments
+    fw_globals   = _extract_framework_globals(data["html"])
+    html_comments = _extract_html_comments(data["html"])
     corpus_parts = [data["html"]] + inline_scripts + [
         js for _, js in data["js_sources"]
     ]
+    if fw_globals:
+        corpus_parts.append(fw_globals)
+    if html_comments:
+        corpus_parts.append(html_comments)
     corpus        = "\n".join(corpus_parts)
     out["js_count"] = len(data["js_sources"])
     out["inline_scripts"] = len(inline_scripts)
