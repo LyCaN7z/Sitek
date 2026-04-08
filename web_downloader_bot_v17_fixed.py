@@ -575,6 +575,28 @@ def admin_only(func):
         return await func(update, context)
     return wrapper
 
+def user_guard(func):
+    """Decorator — bot enabled check + banned check for regular user commands."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = update.effective_user.id
+        db  = read_db()
+        if uid not in ADMIN_IDS:
+            if not db.get("settings", {}).get("bot_enabled", True):
+                await update.effective_message.reply_text(
+                    "🚫 Bot ကို ယာယီပိတ်ထားသည်။ နောက်မှ ထပ်ကြိုးစားပါ။"
+                )
+                return
+            user = get_user(db, uid)
+            if user.get("banned", False):
+                await update.effective_message.reply_text(
+                    "🚫 သင့် account ကို ပိတ်ထားသည်။"
+                )
+                return
+        return await func(update, context)
+    return wrapper
+
+
 
 # ══════════════════════════════════════════════════
 # 🚨  ADMIN ERROR NOTIFY — Unhandled error → Admin DM
