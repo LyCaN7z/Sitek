@@ -6890,11 +6890,14 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
     """
-    Generic Playwright runner:
-    - Launches stealth browser
-    - Intercepts ALL network requests/responses
-    - Executes custom js_eval_code in page context after load
-    - Returns: {html, network_log, console_log, dom_result, page_url, error}
+    v19 UPGRADED Core Engine:
+    - networkidle wait (JS SDK တွေ fully load ဖြစ်မှ scan)
+    - response body 120KB (JS bundle တွေ အပြည့်ဖမ်း)
+    - JS files 25 ခု fetch (lazy-loaded chunks ပါ)
+    - disable-web-security: iframe cross-origin request ဖမ်းနိုင်
+    - Interactive simulation: scroll + payment button click
+    - window globals deep scan: __NEXT_DATA__, __nuxt__, Stripe, etc.
+    - All frames (including payment iframes) traversal
     """
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -6902,9 +6905,10 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         return {"error": "playwright_not_installed", "html": "", "network_log": [],
                 "console_log": [], "dom_result": None, "page_url": url}
 
-    network_log  = []   # list of {url, method, post_data, response_body}
+    network_log  = []
     console_log  = []
     page_url_ref = [url]
+    _seen_urls   = set()
 
     with sync_playwright() as pw:
         _px = proxy_manager.get_proxy()
@@ -6919,53 +6923,94 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
 
         browser = pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",                          # iframe cross-origin ဖမ်းနိုင်
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--allow-running-insecure-content",
+                "--disable-gpu",
+            ]
         )
         ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"),
-            viewport={"width": 1366, "height": 768},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 900},
             ignore_https_errors=True,
             proxy=_pw_proxy,
+            java_script_enabled=True,
             extra_http_headers={
                 "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
             }
         )
+        # Advanced stealth init
         ctx.add_init_script("""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-            window.chrome={runtime:{}};
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+            Object.defineProperty(navigator, 'permissions', {
+                get: () => ({query: () => Promise.resolve({state: 'granted'})})
+            });
         """)
         page = ctx.new_page()
 
+        def _add_network(url_str, method, post_data, response_body):
+            if url_str not in _seen_urls:
+                _seen_urls.add(url_str)
+                network_log.append({
+                    "url": url_str,
+                    "method": method,
+                    "post_data": post_data[:3000] if post_data else "",
+                    "response_body": response_body[:120000] if response_body else "",
+                })
+
         def _on_request(req):
-            entry = {"url": req.url, "method": req.method, "post_data": "", "response_body": ""}
             try:
-                if req.post_data:
-                    entry["post_data"] = req.post_data[:2000]
+                pd = req.post_data or ""
             except Exception:
-                pass
-            network_log.append(entry)
+                pd = ""
+            _add_network(req.url, req.method, pd, "")
 
         def _on_response(resp):
+            # ── Body ကို JS / JSON / text response တွေမှာ ဖမ်းသည် ──
+            ct = resp.headers.get("content-type", "").lower()
+            is_js   = any(x in ct for x in ("javascript", "ecmascript"))
+            is_json = "json" in ct
+            is_text = "text" in ct
+            if not (is_js or is_json or is_text):
+                return
+            if resp.status not in (200, 201):
+                return
+            try:
+                body = resp.body().decode("utf-8", errors="ignore")
+            except Exception:
+                return
+            # Update existing entry or add new
             for entry in network_log:
-                if entry["url"] == resp.url and not entry["response_body"]:
-                    try:
-                        body = resp.body()
-                        entry["response_body"] = body.decode("utf-8", errors="ignore")[:5000]
-                    except Exception:
-                        pass
-                    break
+                if entry["url"] == resp.url:
+                    if not entry["response_body"]:
+                        entry["response_body"] = body[:120000]
+                    return
+            _add_network(resp.url, "GET", "", body)
 
         page.on("request",  _on_request)
         page.on("response", _on_response)
-        page.on("console",  lambda m: console_log.append(m.text))
+        page.on("console",  lambda m: console_log.append(m.text[:500]))
 
+        # ── Step 1: Initial page load — wait for networkidle ──
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            page.goto(url, wait_until="load", timeout=30_000)
             page_url_ref[0] = page.url
         except PWTimeout:
             page_url_ref[0] = page.url
@@ -6974,46 +7019,261 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
             return {"error": str(e), "html": "", "network_log": [],
                     "console_log": [], "dom_result": None, "page_url": url}
 
+        # Wait for JS SDKs to fully initialize
         try:
-            page.wait_for_load_state("networkidle", timeout=7_000)
+            page.wait_for_load_state("networkidle", timeout=12_000)
         except Exception:
             pass
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
+        page.wait_for_timeout(2000)
 
-        # Fetch external JS via browser context (bypasses IP/geo blocks)
-        js_urls = []
+        # ── Step 2: Interactive simulation — trigger lazy-load JS ──
         try:
-            js_urls = page.evaluate("""() =>
-                [...document.querySelectorAll('script[src]')]
-                    .map(s=>s.src).filter(s=>s.startsWith('http'))
-            """) or []
-        except Exception:
-            pass
-        for js_url in js_urls[:12]:
-            if not any(e["url"] == js_url and e["response_body"] for e in network_log):
+            # Scroll in steps (trigger IntersectionObserver lazy loads)
+            for pct in [0.25, 0.5, 0.75, 1.0]:
+                page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {pct})")
+                page.wait_for_timeout(600)
+            page.evaluate("window.scrollTo(0, 0)")
+            page.wait_for_timeout(400)
+
+            # Click payment / donate triggers to load payment SDKs
+            _payment_selectors = [
+                # Donation forms (GiveWP, Stripe Checkout, PayPal)
+                "input[name='give-amount']", "input[name='amount']",
+                "button[data-amount]", ".give-btn-level",
+                "[class*='donate']", "[id*='donate']",
+                "[class*='payment']", "[id*='payment']",
+                # Generic checkout / submit
+                "button[type='submit']", "input[type='submit']",
+                "button[class*='checkout']", "button[class*='pay']",
+                # Form fields (focus triggers captcha widget init)
+                "input[type='email']", "input[type='text']:first-of-type",
+                # Card number fields (Stripe Elements)
+                ".__PrivateStripeElement", "[class*='StripeElement']",
+                "iframe[name*='__privateStripeFrame']",
+            ]
+            for sel in _payment_selectors:
                 try:
-                    r = ctx.request.get(js_url, timeout=8000)
-                    if r.ok:
-                        network_log.append({"url": js_url, "method": "GET",
-                                            "post_data": "", "response_body": r.text()[:80000]})
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        page.wait_for_timeout(200)
+                        try:
+                            el.click(timeout=1500)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(300)
                 except Exception:
                     pass
 
+            # Wait for SDK network activity after interactions
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(1500)
+
+        except Exception:
+            pass
+
+        # ── Step 3: Fetch external JS bundles not yet captured ──
+        try:
+            js_urls_on_page = page.evaluate("""() =>
+                [...document.querySelectorAll('script[src]')]
+                    .map(s => s.src)
+                    .filter(s => s.startsWith('http'))
+            """) or []
+        except Exception:
+            js_urls_on_page = []
+
+        # Also probe common manifest endpoints for chunk discovery
+        from urllib.parse import urlparse as _up_js
+        _base_parsed = _up_js(page_url_ref[0])
+        _origin = f"{_base_parsed.scheme}://{_base_parsed.netloc}"
+        _manifest_paths = [
+            "/asset-manifest.json", "/webpack-manifest.json",
+            "/__manifest__", "/static/js/main.chunk.js",
+            "/js/app.js", "/js/main.js",
+        ]
+        for mp in _manifest_paths:
+            murl = _origin + mp
+            if murl not in _seen_urls:
+                try:
+                    r = ctx.request.get(murl, timeout=5000)
+                    if r.ok and "json" in r.headers.get("content-type",""):
+                        body = r.text()
+                        _add_network(murl, "GET", "", body)
+                        # Extract chunk URLs from manifest
+                        import re as _re
+                        for chunk_url in _re.findall(r'"(https?://[^"]+\.js)"', body):
+                            if chunk_url not in _seen_urls:
+                                js_urls_on_page.append(chunk_url)
+                except Exception:
+                    pass
+
+        # Fetch uncaptured JS files (up to 25)
+        fetched = 0
+        for js_url in js_urls_on_page:
+            if fetched >= 25:
+                break
+            if js_url in _seen_urls:
+                existing = next((e for e in network_log if e["url"] == js_url), None)
+                if existing and existing["response_body"]:
+                    continue
+            try:
+                r = ctx.request.get(js_url, timeout=10000)
+                if r.ok:
+                    body = r.text()
+                    _add_network(js_url, "GET", "", body)
+                    fetched += 1
+            except Exception:
+                pass
+
+        # ── Step 4: Deep window globals scan ──
+        _DEEP_GLOBALS_JS = """() => {
+            const out = {};
+            // Payment SDK globals
+            const payGlobals = [
+                'Stripe', 'stripe', 'stripePublishableKey',
+                'STRIPE_PUBLISHABLE_KEY', 'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY',
+                'REACT_APP_STRIPE_KEY', 'STRIPE_KEY',
+                'paypal', 'PayPal', 'PAYPAL_CLIENT_ID',
+                'braintree', 'square', 'razorpay',
+                'Adyen', 'adyen', 'klarna', 'Klarna',
+            ];
+            payGlobals.forEach(k => {
+                try {
+                    const v = window[k];
+                    if (v !== undefined && v !== null) {
+                        if (typeof v === 'string') out[k] = v;
+                        else if (typeof v === 'function' && v._apiKey) out[k+'._apiKey'] = v._apiKey;
+                        else if (typeof v === 'object') {
+                            try { out[k] = JSON.stringify(v).substring(0, 400); } catch(e) {}
+                        }
+                    }
+                } catch(e) {}
+            });
+
+            // Framework env objects
+            const envObjects = {
+                '__NEXT_DATA__': window.__NEXT_DATA__,
+                '__NUXT__': window.__NUXT__,
+                '__APP_CONFIG__': window.__APP_CONFIG__,
+                '__ENV__': window.__ENV__,
+                '_env_': window._env_,
+                'ENV': window.ENV,
+                'appConfig': window.appConfig,
+                'siteConfig': window.siteConfig,
+                'wpApiSettings': window.wpApiSettings,
+                'woocommerce_params': window.woocommerce_params,
+                'give_global_vars': window.give_global_vars,
+            };
+            Object.entries(envObjects).forEach(([k,v]) => {
+                if (!v) return;
+                try {
+                    const s = typeof v === 'string' ? v : JSON.stringify(v);
+                    if (s && s.length > 5) out[k] = s.substring(0, 2000);
+                } catch(e) {}
+            });
+
+            // Scan all window keys for anything key/token/secret-like
+            Object.keys(window).forEach(k => {
+                try {
+                    const kl = k.toLowerCase();
+                    if (kl.includes('key') || kl.includes('token') ||
+                        kl.includes('secret') || kl.includes('stripe') ||
+                        kl.includes('paypal') || kl.includes('api')) {
+                        const v = window[k];
+                        if (typeof v === 'string' && v.length > 8 && v.length < 300) {
+                            out['win:'+k] = v;
+                        }
+                    }
+                } catch(e) {}
+            });
+
+            // localStorage + sessionStorage
+            try {
+                const ls = {};
+                for (let i=0; i<localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    const v = localStorage.getItem(k) || '';
+                    if (v.length > 5 && v.length < 500) ls[k] = v;
+                }
+                if (Object.keys(ls).length) out['__localStorage__'] = JSON.stringify(ls);
+            } catch(e) {}
+
+            // Meta tags (publishable keys often here)
+            const metaKeys = {};
+            document.querySelectorAll('meta').forEach(m => {
+                const n = m.name || m.getAttribute('property') || '';
+                const c = m.content || '';
+                if (c.length > 5 && (n.includes('key') || n.includes('token') ||
+                    n.includes('stripe') || n.includes('paypal') || n.includes('id'))) {
+                    metaKeys[n] = c;
+                }
+            });
+            if (Object.keys(metaKeys).length) out['__meta__'] = JSON.stringify(metaKeys);
+
+            // All iframe srcs (payment iframes)
+            const iframes = [];
+            document.querySelectorAll('iframe').forEach(f => {
+                const src = f.src || f.getAttribute('src') || '';
+                const name = f.name || '';
+                if (src) iframes.push({src: src.substring(0,300), name});
+            });
+            if (iframes.length) out['__iframes__'] = JSON.stringify(iframes);
+
+            return out;
+        }"""
+
+        html = ""
         try:
             html = page.content()
         except Exception:
-            html = ""
+            pass
 
         dom_result = None
+        try:
+            dom_result = page.evaluate(_DEEP_GLOBALS_JS)
+        except Exception as e:
+            logger.debug("Deep globals JS eval error: %s", e)
+
+        # Run caller-provided js_eval_code on top
         if js_eval_code:
             try:
-                dom_result = page.evaluate(js_eval_code)
+                extra = page.evaluate(js_eval_code)
+                if extra and isinstance(extra, dict) and dom_result:
+                    dom_result.update(extra)
+                elif extra:
+                    dom_result = extra
             except Exception as e:
-                logger.debug("JS eval error: %s", e)
+                logger.debug("Custom JS eval error: %s", e)
+
+        # ── Step 5: Traverse all frames for payment data ──
+        frame_data = []
+        try:
+            for frame in page.frames:
+                if frame == page.main_frame:
+                    continue
+                frame_url = frame.url or ""
+                if not frame_url or frame_url == "about:blank":
+                    continue
+                frame_data.append(frame_url)
+                # Scan frame URL for keys
+                try:
+                    frame_html = frame.content()
+                    if frame_html and len(frame_html) > 100:
+                        network_log.append({
+                            "url": f"[frame] {frame_url}",
+                            "method": "FRAME",
+                            "post_data": "",
+                            "response_body": frame_html[:60000],
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        if frame_data and dom_result is not None:
+            dom_result["__frames__"] = json.dumps(frame_data)
 
         browser.close()
 
@@ -7464,21 +7724,97 @@ _PAY_PATTERNS = [
 
 _PAY_JS_EVAL = """() => {
     const res = {};
-    ['Stripe','paypal','braintree','square','razorpay','STRIPE_PUBLISHABLE_KEY',
-     'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY','REACT_APP_STRIPE_KEY'].forEach(k => {
+
+    // ── Stripe: extract publishable key from internal state ──
+    try {
+        if (window.Stripe) {
+            res['Stripe_loaded'] = 'true';
+            // Stripe.js v3 stores key here after init
+            if (window.Stripe._apiKey) res['Stripe._apiKey'] = window.Stripe._apiKey;
+        }
+    } catch(e) {}
+
+    // ── Payment SDK globals ──
+    const sdkKeys = [
+        'stripePublishableKey', 'STRIPE_PUBLISHABLE_KEY',
+        'NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY', 'REACT_APP_STRIPE_KEY',
+        'stripe_publishable_key', 'stripe_key', 'stripeKey',
+        'paypal_client_id', 'PAYPAL_CLIENT_ID', 'paypalClientId',
+        'braintreeToken', 'braintree_token', 'clientToken',
+        'squareAppId', 'square_app_id', 'SQUARE_APP_ID',
+        'razorpayKeyId', 'razorpay_key_id', 'RAZORPAY_KEY_ID',
+        'checkoutPublicKey', 'CHECKOUT_PUBLIC_KEY',
+        'mollieProfileId', 'MOLLIE_PROFILE_ID',
+        'paddleVendorId', 'PADDLE_VENDOR_ID',
+    ];
+    sdkKeys.forEach(k => {
         try {
             const v = window[k];
-            if (v && (typeof v === 'string' || typeof v === 'object')) {
-                res[k] = typeof v === 'string' ? v : JSON.stringify(v).substring(0,300);
+            if (v && typeof v === 'string' && v.length > 5)
+                res[k] = v;
+        } catch(e) {}
+    });
+
+    // ── Framework configs: __NEXT_DATA__, __NUXT__, etc. ──
+    const envSources = [
+        ['__NEXT_DATA__', window.__NEXT_DATA__],
+        ['__NUXT__', window.__NUXT__],
+        ['__ENV__', window.__ENV__],
+        ['_env_', window._env_],
+        ['appConfig', window.appConfig],
+        ['siteConfig', window.siteConfig],
+        ['wpApiSettings', window.wpApiSettings],
+        ['give_global_vars', window.give_global_vars],   // GiveWP donation plugin
+        ['giveVars', window.giveVars],
+        ['wc_stripe_params', window.wc_stripe_params],   // WooCommerce Stripe
+        ['wc_square_params', window.wc_square_params],
+        ['wc_braintree_cart_params', window.wc_braintree_cart_params],
+    ];
+    envSources.forEach(([k, v]) => {
+        if (!v) return;
+        try {
+            const s = typeof v === 'string' ? v : JSON.stringify(v);
+            if (s && s.length > 5) res[k] = s.substring(0, 3000);
+        } catch(e) {}
+    });
+
+    // ── Scan all window keys for payment-related strings ──
+    Object.keys(window).forEach(k => {
+        try {
+            const kl = k.toLowerCase();
+            if (kl.includes('stripe') || kl.includes('paypal') ||
+                kl.includes('payment') || kl.includes('checkout') ||
+                kl.includes('razorpay') || kl.includes('braintree') ||
+                kl.includes('publishable') || kl.includes('client_id')) {
+                const v = window[k];
+                if (typeof v === 'string' && v.length > 5 && v.length < 500)
+                    res['win:' + k] = v;
+                else if (typeof v === 'object' && v !== null) {
+                    try { res['win:' + k] = JSON.stringify(v).substring(0, 500); } catch(e) {}
+                }
             }
         } catch(e) {}
     });
-    // Stripe on-page initialization
-    try {
-        if (window.Stripe && typeof window.Stripe === 'function') {
-            res['StripeLoaded'] = 'true';
-        }
-    } catch(e) {}
+
+    // ── iframe srcs (Stripe Elements, PayPal iframe) ──
+    const iframeData = [];
+    document.querySelectorAll('iframe').forEach(f => {
+        const src = f.src || '';
+        const name = f.name || f.id || '';
+        if (src.length > 5) iframeData.push(src.substring(0, 300) + '||' + name);
+    });
+    if (iframeData.length) res['__iframes__'] = JSON.stringify(iframeData);
+
+    // ── data attributes on page (data-key, data-publishable-key) ──
+    const dataAttrs = {};
+    document.querySelectorAll('[data-key],[data-publishable-key],[data-client-id],[data-stripe-key],[data-paypal-client-id]').forEach(el => {
+        ['data-key','data-publishable-key','data-client-id','data-stripe-key','data-paypal-client-id'].forEach(attr => {
+            const v = el.getAttribute(attr);
+            if (v && v.length > 5) dataAttrs[attr + ':' + el.tagName] = v;
+        });
+    });
+    if (Object.keys(dataAttrs).length) res['__data_attrs__'] = JSON.stringify(dataAttrs);
+
     return res;
 }"""
 
@@ -7486,26 +7822,70 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
-    findings = []; seen = set()
+
+    findings = []
+    seen = set()
+
     def _add(t, v, src):
-        d = t+":"+v[:60]
+        v = v.strip()
+        d = t + ":" + v[:80]
         if d not in seen and len(v) >= 6:
-            seen.add(d); findings.append({"type": t, "value": v, "source": src})
-    if progress_cb: progress_cb("🔍 Scanning for payment keys...")
+            seen.add(d)
+            findings.append({"type": t, "value": v, "source": src})
+
+    if progress_cb: progress_cb("🔍 Scanning HTML + JS bundles...")
+
+    # ── 1. HTML + all JS bundle bodies ──
     for text, label in _gather_all_text(data):
         for key_type, pat in _PAY_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+
+    if progress_cb: progress_cb("🔍 Scanning window globals + DOM...")
+
+    # ── 2. window globals (flat string scan) ──
     for k, v in (data.get("dom_result") or {}).items():
         s = str(v)
         for key_type, pat in _PAY_PATTERNS:
-            mm = pat.search(s)
-            if mm:
+            for mm in pat.finditer(s):
                 val = mm.group(1) if mm.lastindex else mm.group(0)
-                _add(key_type, val, f"window.{k}")
-    return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+                _add(key_type, val, f"window/{k}")
+
+    # ── 3. iframe src URL query params ──
+    if progress_cb: progress_cb("🔍 Scanning iframe payment URLs...")
+    dom = data.get("dom_result") or {}
+    iframe_json = dom.get("__iframes__", "[]")
+    try:
+        iframes = json.loads(iframe_json) if isinstance(iframe_json, str) else []
+        for entry in iframes:
+            src = entry.split("||")[0] if "||" in entry else entry
+            # Stripe Elements iframe: ?publishableKey=pk_live_xxx
+            import re as _re2
+            for key_type, pat in _PAY_PATTERNS:
+                for mm in pat.finditer(src):
+                    val = mm.group(1) if mm.lastindex else mm.group(0)
+                    _add(key_type, val, f"iframe src: {src[:80]}")
+    except Exception:
+        pass
+
+    # ── 4. __NEXT_DATA__ / __NUXT__ deep JSON scan ──
+    for env_key in ("__NEXT_DATA__", "__NUXT__", "__ENV__", "_env_",
+                    "give_global_vars", "wc_stripe_params", "wc_square_params"):
+        env_str = str((data.get("dom_result") or {}).get(env_key, ""))
+        if env_str and len(env_str) > 10:
+            for key_type, pat in _PAY_PATTERNS:
+                for mm in pat.finditer(env_str):
+                    val = mm.group(1) if mm.lastindex else mm.group(0)
+                    _add(key_type, val, f"{env_key} (framework config)")
+
+    return {
+        "error":    None,
+        "findings": findings,
+        "page_url": data["page_url"],
+        "requests": len(data.get("network_log", [])),
+        "js_count": sum(1 for e in data.get("network_log",[]) if ".js" in e["url"]),
+    }
 
 
 async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -16231,33 +16611,55 @@ def _run_playwright_dynamic_keydump(url: str) -> dict:
 
 
 def _run_playwright_keydump(url: str) -> dict:
-    """Playwright-based dynamic keydump — fallback when Puppeteer unavailable."""
+    """
+    v19 Upgraded keydump dynamic engine:
+    - Auth headers from ALL requests + response body token scan
+    - localStorage/sessionStorage full dump
+    - window globals: auth tokens, API keys, firebase config
+    - Source map URL discovery
+    - Cookie full capture with domain info
+    """
     try:
-        from playwright.sync_api import sync_playwright
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except ImportError:
         return {"requests": [], "storage": {}, "cookies": [], "_engine": "none"}
 
-    findings = {"requests": [], "storage": {}, "cookies": [], "_engine": "playwright"}
+    findings = {
+        "requests":        [],
+        "storage":         {},
+        "cookies":         [],
+        "window_globals":  {},
+        "response_bodies": [],
+        "_engine":         "playwright_v19",
+    }
 
-    # ── Interesting header names ──────────────────────────────
-    _HDR_KEYS = {"authorization", "x-api-key", "x-auth-token", "x-access-token",
-                 "x-client-id", "x-client-secret", "x-app-key", "api-key"}
+    _HDR_INTERESTING = {
+        "authorization", "x-api-key", "x-auth-token", "x-access-token",
+        "x-client-id", "x-client-secret", "x-app-key", "api-key",
+        "x-amz-security-token", "x-firebase-auth", "x-csrf-token",
+        "x-session-token", "x-user-token",
+    }
 
-    def _interesting_headers(hdrs: dict) -> dict:
+    def _filter_headers(hdrs: dict) -> dict:
         out = {}
         for k, v in hdrs.items():
             kl = k.lower()
-            if kl in _HDR_KEYS or "token" in kl or "key" in kl or "secret" in kl:
-                out[k] = v[:120]
+            if kl in _HDR_INTERESTING or any(
+                kw in kl for kw in ("token","key","secret","auth","bearer","session","credential")
+            ):
+                out[k] = v[:200]
         return out
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled",
-                      "--disable-gpu"]
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ]
             )
             ctx = browser.new_context(
                 user_agent=(
@@ -16265,47 +16667,84 @@ def _run_playwright_keydump(url: str) -> dict:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/122.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1366, "height": 768},
+                viewport={"width": 1440, "height": 900},
                 ignore_https_errors=True,
             )
             ctx.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                "window.chrome={runtime:{}};"
+                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+                "window.chrome={runtime:{},loadTimes:function(){},csi:function(){}};"
             )
             page = ctx.new_page()
 
-            # ── Request interception ──────────────────────
-            def _on_req(req):
-                hdrs = _interesting_headers(req.headers)
+            def _on_request(req):
+                hdrs = _filter_headers(req.headers)
+                entry = {"url": req.url[:200], "method": req.method}
                 if hdrs:
-                    findings["requests"].append({
-                        "url":     req.url[:120],
-                        "headers": hdrs
-                    })
-
-            page.on("request", _on_req)
-
-            try:
-                page.goto(url, wait_until="networkidle", timeout=28_000)
-            except Exception:
+                    entry["headers"] = hdrs
                 try:
-                    page.goto(url, wait_until="load", timeout=20_000)
+                    pd = req.post_data
+                    if pd and len(pd) > 3:
+                        entry["post_data"] = pd[:500]
                 except Exception:
                     pass
+                if hdrs or entry.get("post_data"):
+                    findings["requests"].append(entry)
 
-            page.wait_for_timeout(3000)
+            def _on_response(resp):
+                ct = resp.headers.get("content-type", "").lower()
+                if any(x in ct for x in ("json","javascript","text")) and resp.status == 200:
+                    try:
+                        body = resp.body().decode("utf-8", errors="ignore")
+                        if any(kw in body for kw in (
+                            "token","api_key","apikey","secret","bearer",
+                            "pk_live","sk_live","pk_test","sk_test",
+                            "authorization","credential","firebase"
+                        )):
+                            findings["response_bodies"].append({
+                                "url":  resp.url[:150],
+                                "body": body[:3000],
+                            })
+                    except Exception:
+                        pass
 
-            # ── localStorage + sessionStorage ─────────────
+            page.on("request",  _on_request)
+            page.on("response", _on_response)
+
+            try:
+                page.goto(url, wait_until="load", timeout=30_000)
+            except PWTimeout:
+                pass
+            except Exception:
+                pass
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+
+            # Scroll to trigger lazy-loaded auth requests
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                page.wait_for_timeout(1200)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
+
+            # ── localStorage + sessionStorage ──
             try:
                 storage = page.evaluate("""() => {
                     const ls = {}, ss = {};
                     for(let i=0;i<localStorage.length;i++){
                         const k=localStorage.key(i);
-                        ls[k]=localStorage.getItem(k);
+                        const v=localStorage.getItem(k)||'';
+                        if(v.length < 2000) ls[k]=v;
                     }
                     for(let i=0;i<sessionStorage.length;i++){
                         const k=sessionStorage.key(i);
-                        ss[k]=sessionStorage.getItem(k);
+                        const v=sessionStorage.getItem(k)||'';
+                        if(v.length < 2000) ss[k]=v;
                     }
                     return {localStorage: ls, sessionStorage: ss};
                 }""")
@@ -16313,18 +16752,67 @@ def _run_playwright_keydump(url: str) -> dict:
             except Exception:
                 pass
 
-            # ── Cookies ───────────────────────────────────
+            # ── window globals deep scan ──
+            try:
+                wg = page.evaluate("""() => {
+                    const out = {};
+                    const authKeys = [
+                        'token','apiKey','api_key','authToken','accessToken',
+                        'access_token','userToken','sessionToken','jwtToken',
+                        'bearerToken','credential','firebaseConfig',
+                        '__FIREBASE_CONFIG__','__AUTH_TOKEN__','currentUser',
+                    ];
+                    authKeys.forEach(k => {
+                        try {
+                            const v = window[k];
+                            if (v !== undefined && v !== null) {
+                                out[k] = typeof v === 'string'
+                                    ? v.substring(0,300)
+                                    : JSON.stringify(v).substring(0,500);
+                            }
+                        } catch(e) {}
+                    });
+                    Object.keys(window).forEach(k => {
+                        try {
+                            const kl = k.toLowerCase();
+                            if ((kl.includes('token') || kl.includes('auth') ||
+                                 kl.includes('session') || kl.includes('credential') ||
+                                 kl.includes('firebase') || kl.includes('jwt')) && !out[k]) {
+                                const v = window[k];
+                                if (typeof v === 'string' && v.length > 10 && v.length < 500)
+                                    out[k] = v;
+                            }
+                        } catch(e) {}
+                    });
+                    return out;
+                }""")
+                findings["window_globals"] = wg or {}
+            except Exception:
+                pass
+
+            # ── Cookies with domain info ──
             try:
                 findings["cookies"] = [
-                    {"name": c["name"], "value": c["value"][:80]}
+                    {"name": c["name"], "value": c["value"][:200], "domain": c.get("domain","")}
                     for c in ctx.cookies()
                 ]
             except Exception:
                 pass
 
+            # ── Source map candidates ──
+            try:
+                sm = page.evaluate("""() =>
+                    [...document.querySelectorAll('script[src]')]
+                        .map(s => s.src + '.map').slice(0,5)
+                """)
+                findings["source_map_candidates"] = sm or []
+            except Exception:
+                pass
+
             browser.close()
+
     except Exception as e:
-        logger.debug("Playwright keydump error: %s", e)
+        logger.debug("Playwright keydump v19 error: %s", e)
 
     return findings
 
