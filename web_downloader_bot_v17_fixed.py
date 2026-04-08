@@ -6188,10 +6188,22 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 'input[name="amount"]', 'input[name="give-amount"]',
                 'input[name="donation_amount"]', 'input[type="number"]',
                 'textarea',
+                # Donation form amount buttons (GiveWP, Stripe, PayPal)
+                '.give-donation-amount-wrapper button',
+                '.give-btn-level', '.give-btn-level-default',
+                'button[data-amount]', 'input[data-amount]',
+                '[class*="amount"]', '[class*="donation"]',
+                # Submit-like buttons
                 'button[type="submit"]', 'input[type="submit"]',
                 '.give-submit', '#give-purchase-button', '.wpcf7-submit',
+                'button[id*="submit"]', 'button[id*="donate"]',
+                'button[class*="donate"]', 'button[class*="submit"]',
+                # Captcha widget containers
                 '.g-recaptcha', '[data-sitekey]',
                 '#contact', '.contact-form', 'form',
+                # Payment step triggers
+                '[class*="payment"]', '[class*="checkout"]',
+                '[class*="give-"]', '[id*="give-"]',
             ]:
                 try:
                     el = page.query_selector(selector)
@@ -6220,6 +6232,18 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                     pass
 
             page.wait_for_timeout(3000)
+
+            # ── Extra: scan all iframe srcs AFTER interaction ──────────
+            try:
+                iframe_srcs = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('iframe'))
+                         .map(f => f.src || f.getAttribute('src') || '')
+                         .filter(Boolean)
+                """)
+                for src in (iframe_srcs or []):
+                    _scan_url(src)
+            except Exception:
+                pass
 
             # Final networkidle after interaction
             try:
@@ -16072,6 +16096,18 @@ _KD_CATEGORIES = {
     "🔔": "Push Notifications",
 }
 
+# ─── Shannon entropy calculator ───────────────────────────────
+def _entropy(s: str) -> float:
+    """Calculate Shannon entropy of a string."""
+    import math
+    if not s:
+        return 0.0
+    freq = {}
+    for c in s:
+        freq[c] = freq.get(c, 0) + 1
+    length = len(s)
+    return -sum((count / length) * math.log2(count / length) for count in freq.values())
+
 # ─── High-entropy string finder ───────────────────────────────
 def _find_high_entropy(text: str, threshold: float = 4.5) -> list:
     """Find high-entropy strings (> threshold) — likely secrets."""
@@ -16171,26 +16207,127 @@ const puppeteer = require('puppeteer');
 """
 
 def _run_puppeteer_keydump(url: str) -> dict:
-    """Run Puppeteer-based dynamic analysis. Returns findings dict."""
-    if not PUPPETEER_OK:
-        return {"requests": [], "storage": {}, "cookies": []}
-    try:
-        import tempfile, os as _os
-        # Write intercept script to temp file
-        tmp = tempfile.NamedTemporaryFile(suffix=".js", delete=False, mode="w")
-        tmp.write(_KD_INTERCEPT_JS)
-        tmp.close()
+    """Run dynamic analysis via Puppeteer (Node.js) or Playwright (Python fallback)."""
+    # ── Try Puppeteer (Node.js) first ────────────────────────
+    if PUPPETEER_OK:
+        try:
+            import tempfile, os as _os
+            tmp = tempfile.NamedTemporaryFile(suffix=".js", delete=False, mode="w")
+            tmp.write(_KD_INTERCEPT_JS)
+            tmp.close()
+            result = subprocess.run(
+                ["node", tmp.name, url],
+                capture_output=True, timeout=35, text=True, shell=False
+            )
+            _os.unlink(tmp.name)
+            if result.returncode == 0 and result.stdout.strip():
+                data = json.loads(result.stdout)
+                data["_engine"] = "puppeteer"
+                return data
+        except Exception as e:
+            logger.debug("Puppeteer keydump error: %s", e)
 
-        result = subprocess.run(
-            ["node", tmp.name, url],
-            capture_output=True, timeout=35, text=True, shell=False
-        )
-        _os.unlink(tmp.name)
-        if result.returncode == 0 and result.stdout.strip():
-            return json.loads(result.stdout)
+    # ── Fallback: Playwright (Python) ────────────────────────
+    return _run_playwright_keydump(url)
+
+
+def _run_playwright_keydump(url: str) -> dict:
+    """Playwright-based dynamic keydump — fallback when Puppeteer unavailable."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"requests": [], "storage": {}, "cookies": [], "_engine": "none"}
+
+    findings = {"requests": [], "storage": {}, "cookies": [], "_engine": "playwright"}
+
+    # ── Interesting header names ──────────────────────────────
+    _HDR_KEYS = {"authorization", "x-api-key", "x-auth-token", "x-access-token",
+                 "x-client-id", "x-client-secret", "x-app-key", "api-key"}
+
+    def _interesting_headers(hdrs: dict) -> dict:
+        out = {}
+        for k, v in hdrs.items():
+            kl = k.lower()
+            if kl in _HDR_KEYS or "token" in kl or "key" in kl or "secret" in kl:
+                out[k] = v[:120]
+        return out
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--disable-gpu"]
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True,
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+
+            # ── Request interception ──────────────────────
+            def _on_req(req):
+                hdrs = _interesting_headers(req.headers)
+                if hdrs:
+                    findings["requests"].append({
+                        "url":     req.url[:120],
+                        "headers": hdrs
+                    })
+
+            page.on("request", _on_req)
+
+            try:
+                page.goto(url, wait_until="networkidle", timeout=28_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="load", timeout=20_000)
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(3000)
+
+            # ── localStorage + sessionStorage ─────────────
+            try:
+                storage = page.evaluate("""() => {
+                    const ls = {}, ss = {};
+                    for(let i=0;i<localStorage.length;i++){
+                        const k=localStorage.key(i);
+                        ls[k]=localStorage.getItem(k);
+                    }
+                    for(let i=0;i<sessionStorage.length;i++){
+                        const k=sessionStorage.key(i);
+                        ss[k]=sessionStorage.getItem(k);
+                    }
+                    return {localStorage: ls, sessionStorage: ss};
+                }""")
+                findings["storage"] = storage
+            except Exception:
+                pass
+
+            # ── Cookies ───────────────────────────────────
+            try:
+                findings["cookies"] = [
+                    {"name": c["name"], "value": c["value"][:80]}
+                    for c in ctx.cookies()
+                ]
+            except Exception:
+                pass
+
+            browser.close()
     except Exception as e:
-        logger.debug("Puppeteer keydump error: %s", e)
-    return {"requests": [], "storage": {}, "cookies": []}
+        logger.debug("Playwright keydump error: %s", e)
+
+    return findings
 
 
 # ─── Master keydump engine ────────────────────────────────────
@@ -16492,7 +16629,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"② Pattern matching (`{len(_KD_PATTERNS)}` rules)...\n"
         f"③ Entropy analysis...\n"
         f"④ Source map check...\n"
-        f"{'⑤ Dynamic intercept (Puppeteer)...' if PUPPETEER_OK else '⑤ Dynamic: skipped (no Puppeteer)'}",
+        f"{'⑤ Dynamic intercept (Puppeteer)...' if PUPPETEER_OK else '⑤ Dynamic intercept (Playwright fallback)...'}",
         parse_mode="Markdown"
     )
 
