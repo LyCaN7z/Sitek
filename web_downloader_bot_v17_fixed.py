@@ -6156,7 +6156,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         if progress_cb: progress_cb("📡 Loading page (intercepting all network traffic)...")
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=25_000)
+            page.goto(url, wait_until="load", timeout=30_000)
             page_url_ref[0] = page.url
         except PWTimeout:
             page_url_ref[0] = page.url
@@ -6164,9 +6164,9 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
             browser.close()
             return {"error": str(e), "findings": [], "page_url": url}
 
-        # Wait for networkidle with shorter timeout (don't block forever)
+        # Wait for networkidle — give JS time to execute and inject widgets
         try:
-            page.wait_for_load_state("networkidle", timeout=8_000)
+            page.wait_for_load_state("networkidle", timeout=15_000)
         except Exception:
             pass
 
@@ -6174,23 +6174,59 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
 
         # ── Simulate user interaction ─────────────────
         try:
-            # Scroll down to trigger lazy-load
+            # Scroll slowly to trigger lazy-load captchas
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 3)")
+            page.wait_for_timeout(1200)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1200)
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
-            # Click on forms/buttons to trigger captcha widgets
-            for selector in ['form', 'button[type="submit"]', '.g-recaptcha',
-                              '[data-sitekey]', '#contact', '.contact-form', 'input[type="submit"]']:
+            page.wait_for_timeout(1200)
+
+            # Click/focus on form fields and buttons to trigger captcha widgets
+            for selector in [
+                'input[type="email"]', 'input[type="text"]',
+                'input[name="amount"]', 'input[name="give-amount"]',
+                'input[name="donation_amount"]', 'input[type="number"]',
+                'textarea',
+                'button[type="submit"]', 'input[type="submit"]',
+                '.give-submit', '#give-purchase-button', '.wpcf7-submit',
+                '.g-recaptcha', '[data-sitekey]',
+                '#contact', '.contact-form', 'form',
+            ]:
                 try:
                     el = page.query_selector(selector)
                     if el and el.is_visible():
                         el.scroll_into_view_if_needed()
-                        page.wait_for_timeout(500)
-                        break
+                        page.wait_for_timeout(300)
+                        try:
+                            el.click(timeout=2000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(300)
                 except Exception:
                     pass
-            page.wait_for_timeout(2000)
+
+            # Wait for captcha iframes to appear after interaction
+            for captcha_frame_sel in [
+                'iframe[src*="recaptcha"]',
+                'iframe[src*="hcaptcha"]',
+                'iframe[src*="turnstile"]',
+                'iframe[src*="challenges.cloudflare"]',
+            ]:
+                try:
+                    page.wait_for_selector(captcha_frame_sel, timeout=5_000)
+                    break
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(3000)
+
+            # Final networkidle after interaction
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+
         except Exception:
             pass
 
