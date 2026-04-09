@@ -6607,25 +6607,84 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
 
 def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     """
-    v18: Wrap _sitekey_sync with sub-page fallback.
-    If main URL yields no captcha findings, scan common sub-pages
-    (/contact, /donate, /checkout, /payment, /register, /signup)
-    and return the first result that has findings.
+    v18.1: Scan main URL + all sub-pages concurrently.
+    Merges all findings, tagged with source path. Main URL findings first.
     """
-    # ── Main URL scan ────────────────────────────────────────────
-    if progress_cb: progress_cb(f"🌐 Scanning main URL...")
-    result = _sitekey_sync(url, progress_cb)
-    if result.get("error") or result.get("findings"):
-        return result
-
-    # ── Sub-page fallback ────────────────────────────────────────
     parsed      = urlparse(url)
     base_origin = f"{parsed.scheme}://{parsed.netloc}"
-    sub_paths   = [
+
+    sub_paths = [
         "/contact", "/donate", "/checkout", "/payment",
         "/register", "/signup", "/login", "/cart",
         "/get-involved", "/give", "/contribute",
+        # v18.1 additions
+        "/pricing", "/plans", "/subscribe", "/membership",
+        "/join", "/support", "/help", "/feedback",
+        "/order", "/pay", "/billing", "/upgrade",
     ]
+
+    all_findings = []
+    seen_keys    = set()
+    total        = 1 + len(sub_paths)   # main + sub-pages
+    scanned      = [0]
+
+    def _scan_one(scan_url: str, label: str) -> list:
+        """Scan a single URL; return tagged findings list."""
+        try:
+            res = _sitekey_sync(scan_url)
+        except Exception:
+            return []
+        hits = []
+        for f in (res.get("findings") or []):
+            dedup = f.get("type","") + ":" + f.get("site_key","")
+            if dedup in seen_keys:
+                continue
+            seen_keys.add(dedup)
+            tagged = dict(f)
+            tagged["source"] = f"[{label}] " + f.get("source", "")
+            hits.append(tagged)
+        scanned[0] += 1
+        if progress_cb:
+            progress_cb(f"🔍 Scanning {scanned[0]}/{total} pages... ({label})")
+        return hits
+
+    # ── Main URL (serial, first) ──────────────────────────────────────────
+    if progress_cb:
+        progress_cb(f"🔍 Scanning 1/{total} pages... (main URL)")
+    main_hits = _scan_one(url, "main")
+    scanned[0] = 1
+    all_findings.extend(main_hits)
+
+    # ── Sub-pages (concurrent, max 4 workers, 12s timeout each) ──────────
+    def _scan_sub(path: str) -> list:
+        return _scan_one(base_origin + path, path)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_scan_sub, p): p for p in sub_paths}
+        sub_results = {}
+        try:
+            for fut in concurrent.futures.as_completed(futures, timeout=12 * len(sub_paths)):
+                path = futures[fut]
+                try:
+                    sub_results[path] = fut.result(timeout=12)
+                except Exception:
+                    sub_results[path] = []
+        except concurrent.futures.TimeoutError:
+            for fut in futures:
+                fut.cancel()
+
+    # ── Merge sub-page findings in path order ─────────────────────────────
+    for path in sub_paths:
+        all_findings.extend(sub_results.get(path, []))
+
+    # ── Build combined result ─────────────────────────────────────────────
+    base_result = _sitekey_sync.__doc__ and {}   # dummy; we build manually
+    return {
+        "findings":   all_findings,
+        "page_url":   url,
+        "js_fetched": len(all_findings),
+        "error":      None,
+    }
     for sub in sub_paths:
         sub_url = base_origin + sub
         if progress_cb: progress_cb(f"🔍 Sub-page scan: `{sub}`...")
