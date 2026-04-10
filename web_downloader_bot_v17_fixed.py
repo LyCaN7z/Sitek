@@ -17144,6 +17144,133 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════
+# ══════════════════════════════════════════════════
+# 🔐  FORCE-JOIN GATE
+# ══════════════════════════════════════════════════
+
+async def check_force_join(update: Update, context) -> bool:
+    """
+    Returns True if the user may proceed.
+    Returns False (and sends a join prompt) if force_join is enabled
+    and the user is not yet a member of the required channel.
+    Admins always pass through.
+    """
+    uid = update.effective_user.id
+    if uid in ADMIN_IDS:
+        return True
+
+    db = await db_read()
+    channel = db.get("settings", {}).get("force_join")
+    if not channel:
+        return True  # force-join not configured
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=uid)
+        if member.status in ("member", "administrator", "creator"):
+            return True
+    except Exception:
+        pass  # channel not found or bot not admin — fail open
+
+    # User not in channel — send prompt
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel.lstrip('@')}"),
+        InlineKeyboardButton("✅ I Joined", callback_data="fj_check"),
+    ]])
+    await update.effective_message.reply_text(
+        f"🔒 ဒီ Bot ကို သုံးဖို့ *{channel}* Channel ကို Join လုပ်ပါ။\n\n"
+        "Join လုပ်ပြီးရင် *✅ I Joined* ကို နှိပ်ပါ။",
+        reply_markup=kb,
+        parse_mode='Markdown'
+    )
+    return False
+
+
+async def force_join_callback(update: Update, context) -> None:
+    """Handles the '✅ I Joined' button — re-checks membership."""
+    query = update.callback_query
+    await query.answer()
+
+    uid  = query.from_user.id
+    db   = await db_read()
+    channel = db.get("settings", {}).get("force_join")
+
+    if not channel:
+        await query.edit_message_text("✅ Bot ကို အသုံးပြုနိုင်ပါပြီ။")
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=uid)
+        joined = member.status in ("member", "administrator", "creator")
+    except Exception:
+        joined = False
+
+    if joined:
+        await query.edit_message_text(
+            f"✅ *{channel}* Channel Join လုပ်ပြီးပါပြီ!\n\n"
+            "Bot command တွေကို အသုံးပြုနိုင်ပါပြီ။",
+            parse_mode='Markdown'
+        )
+    else:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{channel.lstrip('@')}"),
+            InlineKeyboardButton("✅ I Joined", callback_data="fj_check"),
+        ]])
+        await query.edit_message_text(
+            f"❌ *{channel}* Channel ကို မတွေ့သေးပါ။\n\n"
+            "Join လုပ်ပြီးမှ ထပ်ကြိုးစားပါ။",
+            reply_markup=kb,
+            parse_mode='Markdown'
+        )
+
+
+# ══════════════════════════════════════════════════
+# 📦  APP ASSETS CATEGORY CALLBACK
+# ══════════════════════════════════════════════════
+
+async def appassets_cat_callback(update: Update, context) -> None:
+    """Handles apa_<category> inline button selections from /appassets."""
+    query = update.callback_query
+    await query.answer()
+
+    uid  = query.from_user.id
+    data = query.data  # e.g. "apa_images" or "apa_all"
+
+    async with db_lock:
+        db = _load_db_sync()
+    u        = get_user(db, uid)
+    last_app = u.get("last_uploaded_app")
+
+    if not last_app or not os.path.exists(last_app):
+        await query.edit_message_text(
+            "❌ Upload file ကို မတွေ့တော့ပါ။\n"
+            "ဖိုင်ကို ပြန် Upload လုပ်ပြီး `/appassets` ကို ထပ်ရိုက်ပါ။",
+            parse_mode='Markdown'
+        )
+        return
+
+    cat_key = data[4:]  # strip "apa_"
+    valid_cats = set(_ASSET_CATEGORIES.keys())
+
+    if cat_key == "all":
+        wanted_cats = valid_cats
+    elif cat_key in valid_cats:
+        wanted_cats = {cat_key}
+    else:
+        await query.answer("Unknown category.", show_alert=True)
+        return
+
+    # Acknowledge the selection by editing the menu message
+    try:
+        await query.edit_message_text(
+            f"📦 Category: `{cat_key}` — Extracting...",
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+
+    await _do_appassets_extract(query.message, context, last_app, wanted_cats)
+
+
 # 🛡️  MISSING COMMAND HANDLERS
 # ══════════════════════════════════════════════════
 
