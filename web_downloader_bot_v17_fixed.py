@@ -5747,9 +5747,9 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     Falls back to requests-based static scan if Playwright not available.
     Option A: Playwright constructor hooks (grecaptcha/hcaptcha/turnstile).
     Option B: Deep asset fetch for additional JS bundles.
+    Phase 2: Real-time network stream intercept for confidence classification.
     """
     # ── Option A: Playwright dynamic hooks (sitekey category) ─────────
-    # Run alongside main playwright scan via _playwright_dynamic_scan
     if PLAYWRIGHT_OK:
         if progress_cb: progress_cb("🌐 Dynamic captcha hook intercept...")
         dyn = _playwright_dynamic_scan(url, "sitekey", progress_cb)
@@ -5784,7 +5784,7 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
 
     # ── Option B: deep asset fetch → re-scan with captcha patterns ─────
     if progress_cb: progress_cb("📦 Deep asset fetch for captcha keys...")
-    existing_log = []  # sitekey result doesn't expose network_log directly
+    existing_log = []
     new_assets   = _deep_asset_fetch(url, existing_log, progress_cb)
 
     if new_assets:
@@ -5798,6 +5798,28 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                 result.setdefault("findings", []).append(f)
                 existing_keys.add(sk)
 
+    # ── Phase 2: Real-time network stream intercept ───────────────────
+    if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
+    live_result = _stream_intercept_sync(url, progress_cb, extra_patterns=_LIVE_SITEKEY_PATTERNS)
+
+    # Scan live response bodies for captcha keys too
+    live_all_js = {}
+    for req in live_result.get("live_requests", []):
+        body = req.get("body", "") or req.get("post_data", "")
+        u    = req.get("url", "live")
+        if body and len(body) > 20:
+            live_all_js[u] = body[:500_000]
+    if live_all_js:
+        live_extra = _extract_captcha_info("", url, live_all_js)
+        for f in live_extra:
+            sk = f.get("site_key", "")
+            if sk and sk not in existing_keys:
+                f["source"] = f.get("source", "") + " [live stream]"
+                f["confidence"] = "CONFIRMED ✅"
+                result.setdefault("findings", []).append(f)
+                existing_keys.add(sk)
+
+    result["live_result"] = live_result
     return result
 
 
@@ -6042,9 +6064,29 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    findings  = result["findings"]
-    page_url  = result["page_url"]
-    js_count  = result["js_fetched"]
+    raw_findings = result.get("findings", [])
+    live_result  = result.get("live_result") or {"live_requests": [], "live_findings": [], "sse_frames": []}
+    page_url     = result["page_url"]
+    js_count     = result.get("js_fetched", 0)
+    live_reqs    = len(live_result.get("live_requests", []))
+
+    # Cross-reference: use site_key as the "value" field for confidence scoring
+    for f in raw_findings:
+        if "value" not in f:
+            f["value"] = f.get("site_key", "")
+    findings_xref = _confidence_crossref(raw_findings, live_result)
+    # Restore site_key field
+    for orig, f in zip(raw_findings, findings_xref[:len(raw_findings)]):
+        f["site_key"] = orig.get("site_key", f.get("value", ""))
+        for k in ("page_url","action","invisible","min_score","enterprise",
+                  "theme","size","badge","s_param","hl","co","callback","user_agent"):
+            if k in orig:
+                f[k] = orig[k]
+
+    confirmed   = [f for f in findings_xref if "CONFIRMED" in f.get("confidence","")]
+    high_live   = [f for f in findings_xref if f.get("confidence","").startswith("HIGH")]
+    static_only = [f for f in findings_xref if "STATIC" in f.get("confidence","")]
+    findings    = findings_xref
 
     # ─── No captcha found ───────────────────────
     if not findings:
@@ -6053,7 +6095,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 *Captcha မတွေ့ပါ*\n\n"
             f"🌐 Page URL: `{page_url}`\n"
-            f"📡 Requests intercepted: `{js_count}`\n\n"
+            f"📡 Static: `{js_count}` | Live: `{live_reqs}`\n\n"
             "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
             "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
             parse_mode='Markdown'
@@ -6065,8 +6107,9 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 *Site Key Extractor — `{domain}`*",
         f"━━━━━━━━━━━━━━━━━━━━",
         f"🌐 Page URL: `{page_url}`",
-        f"📡 Requests intercepted: `{js_count}`",
-        f"✅ Found: `{len(findings)}` captcha instance(s)",
+        f"📡 Static: `{js_count}` | Live: `{live_reqs}` requests",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live-only: `{len(high_live)}` | ⚠️ Static-only: `{len(static_only)}`",
+        f"🔑 Found: `{len(findings)}` captcha instance(s)",
         "",
     ]
 
@@ -6083,8 +6126,9 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
 
     for i, f in enumerate(findings, 1):
-        icon = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
-        lines.append(f"*{icon} [{i}] {f['type']}*")
+        icon   = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
+        badge  = f.get("confidence", "⚠️ STATIC")
+        lines.append(f"*{icon} [{i}]* {badge} *{f['type']}*")
         lines.append(f"  🔑 `site_key`  : `{f['site_key'] or 'N/A'}`")
         lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
         if f.get("action"):
@@ -6154,6 +6198,10 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "page_url":   page_url,
         "scanned_at": datetime.now().isoformat(),
         "js_scanned": js_count,
+        "live_requests_captured": live_reqs,
+        "sse_frames_captured": len(live_result.get("sse_frames", [])),
+        "confirmed": len(confirmed),
+        "static_only": len(static_only),
         "findings": [
             {
                 "type":       f["type"],
@@ -6882,6 +6930,158 @@ _LIVE_BODY_PATTERNS = [
     ("Live OpenAI key",   re.compile(r'\b(sk-[A-Za-z0-9]{20,60})\b')),
 ]
 
+# ── /paykeys specialized live patterns ───────────────────────────────────────
+_LIVE_PAY_PATTERNS = _LIVE_BODY_PATTERNS + [
+    # Stripe — all key variants
+    ("Live Stripe pk_live",          re.compile(r'\b(pk_live_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe pk_test",          re.compile(r'\b(pk_test_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe sk_live",          re.compile(r'\b(sk_live_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe sk_test",          re.compile(r'\b(sk_test_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe rk_live",          re.compile(r'\b(rk_live_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe whsec",            re.compile(r'\b(whsec_[A-Za-z0-9]{32,120})\b')),
+    ("Live Stripe ephemeral key",    re.compile(r'\b(ek_live_[A-Za-z0-9]{24,120})\b')),
+    # Stripe in JSON response fields
+    ("Live Stripe publishableKey",   re.compile(r'["\']publishableKey["\']\s*:\s*["\']([A-Za-z0-9_]{24,120})["\']')),
+    ("Live Stripe clientSecret",     re.compile(r'["\']client_secret["\']\s*:\s*["\']([A-Za-z0-9_]{20,120})["\']')),
+    # PayPal
+    ("Live PayPal Client ID",        re.compile(r'(?i)(?:paypal|braintree).{0,30}client.{0,10}id.{0,5}[=:&"\' ]+([A-Za-z0-9_\-]{20,80})')),
+    ("Live PayPal access_token",     re.compile(r'["\']access_token["\']\s*:\s*["\']([A-Za-z0-9\-._~+/]{20,200})["\']')),
+    ("Live PayPal token_type",       re.compile(r'(?i)bearer\s+([A-Z0-9]{10,60})')),
+    # Braintree
+    ("Live Braintree token",         re.compile(r'\b(sandbox_[a-z0-9]{8}_[a-z0-9]{16}|production_[a-z0-9]{8}_[a-z0-9]{16})\b')),
+    ("Live Braintree client token",  re.compile(r'["\']clientToken["\']\s*:\s*["\']([A-Za-z0-9+/=]{40,300})["\']')),
+    # Square
+    ("Live Square access token",     re.compile(r'\b(sq0atp-[A-Za-z0-9_\-]{22,50})\b')),
+    ("Live Square app ID",           re.compile(r'\b(sq0idp-[A-Za-z0-9_\-]{22,50})\b')),
+    ("Live Square sandbox token",    re.compile(r'\b(EAAAEarq[A-Za-z0-9_\-]{20,60})\b')),
+    # Razorpay
+    ("Live Razorpay key_id",         re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,30})\b')),
+    ("Live Razorpay test key",       re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,30})\b')),
+    # Adyen
+    ("Live Adyen origin key",        re.compile(r'\b(pub\.[A-Za-z0-9]{5,10}\.[A-Za-z0-9]{10,20}\.[A-Za-z0-9+/]{40,100})\b')),
+    ("Live Adyen client key",        re.compile(r'\b(test_[A-Z0-9]{10,40}|live_[A-Z0-9]{10,40})\b')),
+    # Klarna / Mollie / Checkout.com
+    ("Live Klarna API key",          re.compile(r'(?i)klarna.{0,20}["\']([A-Za-z0-9_\-]{20,80})["\']')),
+    ("Live Mollie API key",          re.compile(r'\b(live_[A-Za-z0-9]{30,60}|test_[A-Za-z0-9]{30,60})\b')),
+    ("Live Checkout.com key",        re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,60})\b')),
+    # WooCommerce
+    ("Live WooCommerce ck",          re.compile(r'\b(ck_[a-f0-9]{40})\b')),
+    ("Live WooCommerce cs",          re.compile(r'\b(cs_[a-f0-9]{40})\b')),
+    # Paddle
+    ("Live Paddle vendor auth",      re.compile(r'(?i)paddle.{0,20}auth.{0,10}[=:&"\' ]+([A-Za-z0-9]{20,60})')),
+    # Generic payment response tokens
+    ("Live payment token (JSON)",    re.compile(r'["\'](?:token|payment_token|nonce|card_token)["\']\s*:\s*["\']([A-Za-z0-9_\-+/=]{16,200})["\']')),
+    ("Live payment intent",          re.compile(r'["\'](?:id)["\']\s*:\s*["\'](pi_[A-Za-z0-9_]{20,80})["\']')),
+    ("Live setup intent",            re.compile(r'["\'](?:id)["\']\s*:\s*["\'](seti_[A-Za-z0-9_]{20,80})["\']')),
+]
+
+# ── /sitekey specialized live patterns ───────────────────────────────────────
+_LIVE_SITEKEY_PATTERNS = _LIVE_BODY_PATTERNS + [
+    # reCAPTCHA v2/v3 — JS call intercept
+    ("Live reCAPTCHA sitekey",       re.compile(r'grecaptcha\.(?:render|execute|ready)\s*\(\s*["\']?([A-Za-z0-9_\-]{20,60})["\']?')),
+    ("Live reCAPTCHA data-sitekey",  re.compile(r'data-sitekey[="\' ]+([A-Za-z0-9_\-]{20,60})')),
+    ("Live reCAPTCHA JSON key",      re.compile(r'["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_\-]{20,60})["\']')),
+    ("Live reCAPTCHA v3 token",      re.compile(r'(?i)recaptcha.{0,30}token["\' =:]+([A-Za-z0-9_\-\.]{80,600})')),
+    # hCaptcha
+    ("Live hCaptcha sitekey",        re.compile(r'hcaptcha\.(?:render|execute)\s*\(\s*["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']?')),
+    ("Live hCaptcha data-sitekey",   re.compile(r'(?i)hcaptcha.{0,20}sitekey[="\' :]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')),
+    # Cloudflare Turnstile
+    ("Live Turnstile sitekey",       re.compile(r'turnstile\.render\s*\(\s*[^,]+,\s*\{[^}]*sitekey["\' :]+([A-Za-z0-9_\-]{10,60})')),
+    ("Live Turnstile data-sitekey",  re.compile(r'(?:0x4A|1x00)[A-Za-z0-9_\-]{20,60}')),
+    # FunCaptcha / Arkose Labs
+    ("Live FunCaptcha public key",   re.compile(r'(?i)(?:arkose|funcaptcha).{0,30}public.{0,10}key["\' =:]+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')),
+    # GeeTest
+    ("Live GeeTest gt key",          re.compile(r'["\']gt["\']\s*:\s*["\']([a-f0-9]{32})["\']')),
+    ("Live GeeTest challenge",       re.compile(r'["\']challenge["\']\s*:\s*["\']([a-f0-9]{32,40})["\']')),
+    # AWS WAF
+    ("Live AWS WAF token",           re.compile(r'(?i)awswaf.{0,20}token["\' =:]+([A-Za-z0-9+/=]{40,200})')),
+    # Captcha solution token in response
+    ("Live captcha solution token",  re.compile(r'["\'](?:g-recaptcha-response|h-captcha-response|cf-turnstile-response)["\']\s*:\s*["\']([A-Za-z0-9_\-\.]{80,600})["\']')),
+]
+
+# ── /hiddenkeys specialized live patterns ─────────────────────────────────────
+_LIVE_HIDDEN_PATTERNS = _LIVE_BODY_PATTERNS + [
+    # CSRF / XSRF tokens
+    ("Live CSRF token",              re.compile(r'(?i)(?:csrf|xsrf)[_\-]?token["\' =:&]+([A-Za-z0-9+/=_\-]{16,200})')),
+    ("Live X-CSRF-Token header",     re.compile(r'(?i)x-csrf-token["\' =:]+([A-Za-z0-9+/=_\-]{16,200})')),
+    ("Live X-XSRF-TOKEN header",     re.compile(r'(?i)x-xsrf-token["\' =:]+([A-Za-z0-9+/=_\-]{16,200})')),
+    # Meta token / nonce
+    ("Live meta csrf",               re.compile(r'<meta[^>]+name=["\']csrf[_\-]?token["\'][^>]+content=["\']([^"\']{10,200})["\']')),
+    ("Live CSP nonce",               re.compile(r'nonce-([A-Za-z0-9+/=]{8,100})')),
+    # Session / auth tokens in JSON
+    ("Live session token (JSON)",    re.compile(r'["\'](?:session_token|sessionid|session_key)["\']\s*:\s*["\']([A-Za-z0-9_\-]{16,200})["\']')),
+    ("Live auth token (JSON)",       re.compile(r'["\'](?:auth_token|authtoken|token)["\']\s*:\s*["\']([A-Za-z0-9_\-\.]{20,500})["\']')),
+    # Cookie values in XHR
+    ("Live cookie token",            re.compile(r'(?i)(?:set-cookie|cookie):\s*[^=]+=([A-Za-z0-9+/=_\-\.]{16,300})')),
+    # Hidden form input values
+    ("Live hidden input (JSON)",     re.compile(r'["\'](?:_token|__token|_csrf|authenticity_token)["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{16,200})["\']')),
+    # localStorage / sessionStorage tokens sent in requests
+    ("Live storage JWT",             re.compile(r'(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)')),
+    # OAuth state / code
+    ("Live OAuth state",             re.compile(r'["\']state["\']\s*:\s*["\']([A-Za-z0-9_\-]{16,128})["\']')),
+    ("Live OAuth code",              re.compile(r'["\']code["\']\s*:\s*["\']([A-Za-z0-9_\-\.]{10,200})["\']')),
+    # Service worker / push notification keys
+    ("Live push auth key",           re.compile(r'["\'](?:auth|authKey)["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{16,100})["\']')),
+    ("Live VAPID public key",        re.compile(r'["\'](?:p256dh|vapidKey|applicationServerKey)["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{40,200})["\']')),
+    # GraphQL persisted query tokens
+    ("Live GraphQL extensions token",re.compile(r'"extensions"\s*:\s*\{[^}]*"(?:token|auth)":\s*"([A-Za-z0-9_\-\.]{16,200})"')),
+    # WebSocket upgrade auth
+    ("Live WebSocket auth",          re.compile(r'(?i)(?:Sec-WebSocket-Protocol|Authorization):\s*([A-Za-z0-9_\-\.+/=]{16,300})')),
+]
+
+# ── /apikeys + /keydump specialized live patterns ─────────────────────────────
+_LIVE_API_PATTERNS = _LIVE_BODY_PATTERNS + [
+    # Stripe sk/pk (explicit)
+    ("Live Stripe pk_live",          re.compile(r'\b(pk_live_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe pk_test",          re.compile(r'\b(pk_test_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe sk_live",          re.compile(r'\b(sk_live_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe sk_test",          re.compile(r'\b(sk_test_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe rk_live",          re.compile(r'\b(rk_live_[A-Za-z0-9]{24,120})\b')),
+    ("Live Stripe whsec",            re.compile(r'\b(whsec_[A-Za-z0-9]{32,120})\b')),
+    # OpenAI / Anthropic
+    ("Live OpenAI sk-",              re.compile(r'\b(sk-[A-Za-z0-9]{20,80})\b')),
+    ("Live Anthropic sk-ant",        re.compile(r'\b(sk-ant-[A-Za-z0-9_\-]{20,100})\b')),
+    # AWS
+    ("Live AWS Access Key",          re.compile(r'\b(AKIA[0-9A-Z]{16})\b')),
+    ("Live AWS Secret Key",          re.compile(r'(?i)aws.{0,20}secret.{0,10}[=:"\' ]+([A-Za-z0-9+/]{40})\b')),
+    ("Live AWS Session Token",       re.compile(r'(?i)aws.{0,20}session.{0,10}token[=:"\' ]+([A-Za-z0-9+/=]{50,400})')),
+    # GCP / Firebase
+    ("Live GCP API key",             re.compile(r'\b(AIza[0-9A-Za-z_\-]{35})\b')),
+    ("Live Firebase DB URL",         re.compile(r'(https://[a-zA-Z0-9\-]+\.firebaseio\.com)')),
+    # GitHub / GitLab
+    ("Live GitHub PAT",              re.compile(r'\b(ghp_[A-Za-z0-9]{36,40})\b')),
+    ("Live GitHub Actions",          re.compile(r'\b(ghs_[A-Za-z0-9]{36,40})\b')),
+    ("Live GitLab token",            re.compile(r'\b(glpat-[A-Za-z0-9_\-]{20,40})\b')),
+    # Slack
+    ("Live Slack bot token",         re.compile(r'\b(xoxb-[0-9]+-[0-9]+-[A-Za-z0-9]{24})\b')),
+    ("Live Slack user token",        re.compile(r'\b(xoxp-[0-9]+-[0-9]+-[0-9]+-[A-Za-z0-9]{64})\b')),
+    # Twilio
+    ("Live Twilio SID",              re.compile(r'\b(AC[a-z0-9]{32})\b')),
+    ("Live Twilio auth token",       re.compile(r'(?i)twilio.{0,20}auth.{0,10}token[=:"\' ]+([a-z0-9]{32})')),
+    # SendGrid
+    ("Live SendGrid key",            re.compile(r'\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b')),
+    # Mailchimp
+    ("Live Mailchimp key",           re.compile(r'\b([a-f0-9]{32}-us[0-9]{1,2})\b')),
+    # HuggingFace
+    ("Live HuggingFace token",       re.compile(r'\b(hf_[A-Za-z0-9]{30,50})\b')),
+    # Mapbox
+    ("Live Mapbox token",            re.compile(r'\b(pk\.eyJ1[A-Za-z0-9_\-\.]{40,200})\b')),
+    # npm
+    ("Live npm token",               re.compile(r'\b(npm_[A-Za-z0-9]{36})\b')),
+    # DigitalOcean
+    ("Live DigitalOcean token",      re.compile(r'\b(dop_v1_[a-f0-9]{64})\b')),
+    # Generic sk_ / pk_ patterns (catch-all)
+    ("Live sk_ key (generic)",       re.compile(r'\b(sk_[a-zA-Z0-9_]{10,120})\b')),
+    ("Live pk_ key (generic)",       re.compile(r'\b(pk_[a-zA-Z0-9_]{10,120})\b')),
+    # DB connection strings
+    ("Live MongoDB URI",             re.compile(r'(mongodb(?:\+srv)?://[^\s"\'<>]{10,300})')),
+    ("Live Postgres URI",            re.compile(r'(postgres(?:ql)?://[^\s"\'<>]{10,200})')),
+    ("Live Redis URI",               re.compile(r'(rediss?://[^\s"\'<>]{10,200})')),
+    # Generic high-value patterns in JSON responses
+    ("Live secret (JSON)",           re.compile(r'["\'](?:secret|secret_key|private_key|app_secret)["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{16,200})["\']')),
+    ("Live private key PEM",         re.compile(r'(-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[A-Za-z0-9+/=\r\n]{40,}-----END)')),
+]
+
 # Sensitive header names — any value is HIGH confidence
 _SENSITIVE_HEADERS = {
     "authorization", "x-api-key", "x-auth-token", "x-access-token",
@@ -6890,11 +7090,14 @@ _SENSITIVE_HEADERS = {
 }
 
 
-def _stream_intercept_sync(url: str, progress_cb=None) -> dict:
+def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | None = None) -> dict:
     """
     Inject fetch/XHR/SSE hooks into a live Playwright session.
     Captures real-time network credentials — HIGH confidence findings only.
 
+    Args:
+        extra_patterns: command-specific pattern list (e.g. _LIVE_PAY_PATTERNS).
+                        If None, falls back to _LIVE_BODY_PATTERNS.
     Returns:
         {
           "live_requests":  [...],   # all intercepted fetch/XHR entries
@@ -6904,6 +7107,7 @@ def _stream_intercept_sync(url: str, progress_cb=None) -> dict:
           "error":          str|None,
         }
     """
+    _patterns = extra_patterns if extra_patterns is not None else _LIVE_BODY_PATTERNS
     if not PLAYWRIGHT_OK:
         return {"error": "playwright_not_installed", "live_requests": [],
                 "live_findings": [], "sse_frames": [], "page_url": url}
@@ -7113,7 +7317,7 @@ def _stream_intercept_sync(url: str, progress_cb=None) -> dict:
                 if not text:
                     continue
                 src = f"{req.get('type','req').upper()} body → {req.get('url','')[:60]}"
-                for label, pat in _LIVE_BODY_PATTERNS:
+                for label, pat in _patterns:
                     for m in pat.finditer(text):
                         val = m.group(1) if m.lastindex else m.group(0)
                         _add_live(label, val.strip(), src)
@@ -7122,7 +7326,7 @@ def _stream_intercept_sync(url: str, progress_cb=None) -> dict:
         for frame in sse_frames:
             data = frame.get("data", "")
             src  = f"SSE → {frame.get('url','')[:60]}"
-            for label, pat in _LIVE_BODY_PATTERNS:
+            for label, pat in _patterns:
                 for m in pat.finditer(data):
                     val = m.group(1) if m.lastindex else m.group(0)
                     _add_live(label, val.strip(), src, confidence="MEDIUM")
@@ -8324,7 +8528,7 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await asyncio.to_thread(_apikeys_sync, url, lambda t: progress_q.append(t))
         progress_q.append("\U0001f534 Phase 2: real-time network stream intercept...")
         live_result = await asyncio.to_thread(
-            _stream_intercept_sync, url, lambda t: progress_q.append(t)
+            _stream_intercept_sync, url, lambda t: progress_q.append(t), _LIVE_API_PATTERNS
         )
     except Exception as e:
         prog.cancel()
@@ -9187,15 +9391,20 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
 
-    # ── Option B: Deep asset fetch (Option A handled by _paykeys_playwright) ─
-    if progress_cb: progress_cb("📦 Deep asset fetch for payment keys...")
+    # ── Option A: Dynamic intercept + Option B: Deep asset fetch ─────────────
+    if progress_cb: progress_cb("🌐 Dynamic intercept + deep asset fetch...")
+    dyn        = _playwright_dynamic_scan(url, "paykeys", progress_cb)
     new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
-    data       = _merge_dynamic_into_data(data, {}, new_assets)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # ── Phase 2: Real-time network stream intercept ───────────────────────────
+    if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
+    live_result = _stream_intercept_sync(url, progress_cb, extra_patterns=_LIVE_PAY_PATTERNS)
 
     findings = []
     seen = set()
 
-    def _add(t, v, src):
+    def _add(t, v, src, confidence=None):
         """Add finding with validation to reduce false positives."""
         v = v.strip()
         d = t + ":" + v[:80]
@@ -9203,12 +9412,15 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             if not _validate_payment_key(t, v):
                 return  # filtered by post-match validation
             seen.add(d)
-            findings.append({"type": t, "value": v, "source": src})
+            entry = {"type": t, "value": v, "source": src}
+            if confidence:
+                entry["confidence"] = confidence
+            findings.append(entry)
 
-    if progress_cb: progress_cb("🔍 Scanning HTML + JS bundles...")
+    if progress_cb: progress_cb("🔍 Scanning HTML + JS bundles + live stream bodies...")
 
-    # ── 1. HTML + all JS bundle bodies ──
-    for text, label in _gather_all_text(data):
+    # ── 1. HTML + all JS bundle bodies + live response bodies ──
+    for text, label in _gather_all_text_v2(data, live_result):
         for key_type, pat in _PAY_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
@@ -9274,6 +9486,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         "requests": len(data.get("network_log", [])),
         "js_count": sum(1 for e in data.get("network_log",[]) if ".js" in e["url"]),
         "dynamic":  dyn,
+        "live_result": live_result,
     }
 
 
@@ -9326,19 +9539,38 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result.get("error"):
         await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
-    findings = result["findings"]; page_url = result["page_url"]
+    raw_findings = result["findings"]
+    live_result  = result.get("live_result") or {"live_requests": [], "live_findings": [], "sse_frames": []}
+    findings     = _confidence_crossref(raw_findings, live_result)
+    page_url     = result["page_url"]
+    reqs         = result.get("requests", 0)
+    live_reqs    = len(live_result.get("live_requests", []))
+    confirmed    = [f for f in findings if "CONFIRMED" in f.get("confidence", "")]
+    high_live    = [f for f in findings if f.get("confidence", "").startswith("HIGH")]
+    static_only  = [f for f in findings if "STATIC" in f.get("confidence", "")]
     if not findings:
         await msg.edit_text(
             f"💳 *Payment Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No payment keys found\n🌐 `{page_url}`", parse_mode='Markdown')
+            f"📭 No payment keys found\n🌐 `{page_url}`\n"
+            f"📡 Static: `{reqs}` | Live: `{live_reqs}`", parse_mode='Markdown')
         return
-    lines = [f"💳 *Payment Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
-             f"🌐 `{page_url}`", f"✅ Found: `{len(findings)}`\n"]
-    for i, f in enumerate(findings, 1):
-        env = "🔴 LIVE" if ("live" in f["value"].lower() or "prod" in f["value"].lower()) else "🟡 TEST"
-        lines.append(f"*[{i}] {f['type']}* {env}")
-        lines.append(f"  `{f['value'][:80]}`")
-        lines.append(f"  _📂 {f['source'][:60]}_\n")
+    lines = [
+        f"💳 *Payment Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{page_url}`",
+        f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live-only: `{len(high_live)}` | ⚠️ Static-only: `{len(static_only)}`\n",
+    ]
+    ordered = (
+        [(f, "✅ CONFIRMED") for f in confirmed] +
+        [(f, "🔴 LIVE")      for f in high_live] +
+        [(f, "⚠️ STATIC")   for f in static_only]
+    )
+    for i, (f, badge) in enumerate(ordered[:25], 1):
+        val  = f["value"]
+        env  = "🟥 LIVE" if any(x in val.lower() for x in ("pk_live_","sk_live_","live","prod")) else "🟨 TEST"
+        lines.append(f"*[{i}]* {badge} {env} `{f['type']}`")
+        lines.append(f"  `{val[:80]}`")
+        lines.append(f"  _📂 {f.get('source','')[:60]}_\n")
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
     report = "\n".join(lines)
     try:
@@ -9352,11 +9584,19 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
-            document=_io.BytesIO(json.dumps({"domain": domain, "page_url": page_url,
-                "scanned_at": datetime.now().isoformat(), "findings": findings},
-                indent=2, ensure_ascii=False).encode()),
+            document=_io.BytesIO(json.dumps({
+                "domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(),
+                "findings": findings,
+                "live_requests_captured": live_reqs,
+                "sse_frames_captured": len(live_result.get("sse_frames", [])),
+                "confirmed": len(confirmed), "static_only": len(static_only),
+            }, indent=2, ensure_ascii=False).encode()),
             filename=f"paykeys_{safe_d}_{ts}.json",
-            caption=f"💳 Payment Keys — `{domain}` — `{len(findings)}` found",
+            caption=(
+                f"💳 Payment Keys — `{domain}`\n"
+                f"✅ Confirmed: `{len(confirmed)}` | ⚠️ Static-only: `{len(static_only)}`"
+            ),
             parse_mode='Markdown')
     except Exception as e:
         logger.warning("paykeys export error: %s", e)
@@ -10518,6 +10758,10 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
                 dr[f"dyn_hidden_{k}"] = str(v)[:500]
         data["dom_result"] = dr
 
+    # ── Phase 2: Real-time network stream intercept ───────────────────────────
+    if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
+    live_result = _stream_intercept_sync(url, progress_cb, extra_patterns=_LIVE_HIDDEN_PATTERNS)
+
     findings = []
     seen     = set()
 
@@ -10571,8 +10815,8 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
             ) else "Hidden Input (Shadow)"
             _add(ktype, n, v, "ShadowDOM pierce")
 
-    # Pattern scan on all text
-    for text, label in _gather_all_text(data):
+    # Pattern scan on all text including live stream bodies
+    for text, label in _gather_all_text_v2(data, live_result):
         for key_type, pat in _CSRF_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
@@ -10643,6 +10887,7 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
         "findings": findings,
         "page_url": data["page_url"],
         "requests": len(data.get("network_log", [])),
+        "live_result": live_result,
         "csp_nonces":      [f for f in findings if "CSP Nonce" in f["type"]],
         "sw_findings":     sw_findings,
         "indexeddb_names": [k for k in dr.get("indexedDBKeys", []) if not str(k).startswith("__idb_error__")],
@@ -17651,6 +17896,48 @@ def _run_keydump_sync(url: str) -> dict:
     except Exception as e:
         out["errors"].append(f"Dynamic: {e}")
 
+    # ── 7. Real-time network stream intercept (Phase 2) ───────────────────────
+    try:
+        live_result = _stream_intercept_sync(url, extra_patterns=_LIVE_API_PATTERNS)
+        out["live_result"] = live_result
+        live_corpus = "\n".join(
+            (req.get("body","") or req.get("post_data",""))
+            for req in live_result.get("live_requests", [])
+            if req.get("body") or req.get("post_data")
+        )
+        if live_corpus:
+            for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                try:
+                    raw = re.findall(pat, live_corpus, re.IGNORECASE)
+                except Exception:
+                    continue
+                flat = []
+                for m in raw:
+                    if isinstance(m, tuple):
+                        flat.extend([x.strip() for x in m if x and len(x) > 4])
+                    else:
+                        if m and len(m) > 4:
+                            flat.append(m.strip())
+                if flat:
+                    live_label = f"{label} [live stream]"
+                    bucket = out["by_category"].setdefault(cat_icon, {})
+                    existing = bucket.get(live_label, [])
+                    bucket[live_label] = list(dict.fromkeys(existing + flat[:4]))
+                    out["raw_hits"].setdefault(live_label, []).extend(flat[:4])
+        # Entropy scan on live bodies too
+        if live_corpus:
+            live_entropy = _find_high_entropy(live_corpus, threshold=4.2)
+            # Merge — tag live entropy findings
+            for item in live_entropy:
+                item["source"] = "live stream"
+            out["high_entropy"].extend(live_entropy)
+            out["high_entropy"] = sorted(
+                out["high_entropy"], key=lambda x: -x.get("entropy", 0)
+            )[:50]
+    except Exception as e:
+        out["errors"].append(f"Live stream: {e}")
+        out["live_result"] = {"live_requests": [], "live_findings": [], "sse_frames": []}
+
     return out
 
 
@@ -17748,14 +18035,22 @@ def _format_keydump_report(result: dict) -> tuple:
                 _, lvl = _kd_confidence(label, v)
                 conf_counts[lvl] += 1
 
-    js_mode    = "⚡ JS+Static+Dynamic" if PLAYWRIGHT_OK else "📄 Static+JS"
+    js_mode    = "⚡ JS+Static+Dynamic+LiveStream" if PLAYWRIGHT_OK else "📄 Static+JS"
     inline_cnt = result.get("inline_scripts", 0)
+    live_result = result.get("live_result") or {}
+    live_reqs   = len(live_result.get("live_requests", []))
+    live_labels = [l for l in result.get("raw_hits", {}) if "[live stream]" in l]
+    live_hits   = sum(len(result["raw_hits"][l]) for l in live_labels)
 
     # ── Confidence summary line ───────────────────────────────────────────────
     conf_line = (
         f"🟢 `{conf_counts['HIGH']}` HIGH  "
         f"🟡 `{conf_counts['MED']}` MED  "
         f"⚪ `{conf_counts['LOW']}` LOW"
+    )
+    live_line = (
+        f"🔴 Live stream: `{live_reqs}` requests | "
+        f"`{live_hits}` hits from live traffic"
     )
 
     lines = [
@@ -17766,6 +18061,7 @@ def _format_keydump_report(result: dict) -> tuple:
         f"📦 JS: `{js_cnt}` | Inline: `{inline_cnt}` | {js_mode}",
         f"📊 Patterns: `{len(_KD_PATTERNS)}` | Hits: `{total_hits}`",
         conf_line,
+        live_line,
         "",
     ]
 
@@ -17918,9 +18214,10 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📁 `{path}`\n\n"
         f"① HTML fetch + JS bundle crawl...\n"
         f"② Pattern matching (`{len(_KD_PATTERNS)}` rules)...\n"
-        f"③ Entropy analysis...\n"
+        f"③ Entropy analysis (H≥4.2)...\n"
         f"④ Source map check...\n"
-        "⑤ Dynamic intercept (Playwright)...",
+        f"⑤ Dynamic intercept (Playwright)...\n"
+        f"⑥ 🔴 Live network stream intercept...",
         parse_mode="Markdown"
     )
 
@@ -18024,6 +18321,15 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         c for c in result["dynamic"].get("cookies", [])
                         if any(k in c["name"].lower() for k in
                                ["token","auth","session","key","jwt"])
+                    ],
+                },
+                "live_stream": {
+                    "requests_captured": len(
+                        (result.get("live_result") or {}).get("live_requests", [])),
+                    "sse_frames": len(
+                        (result.get("live_result") or {}).get("sse_frames", [])),
+                    "live_hits": [
+                        l for l in result.get("raw_hits", {}) if "[live stream]" in l
                     ],
                 },
                 "errors":      result["errors"],
@@ -19047,22 +19353,70 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if result.get("error"):
         await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
-    findings = result["findings"]
+    raw_findings = result["findings"]
+    live_result  = result.get("live_result") or {"live_requests": [], "live_findings": [], "sse_frames": []}
+    findings     = _confidence_crossref(
+        # normalize name/value for crossref (hiddenkeys uses both fields)
+        [{"type": f["type"], "value": f.get("value",""), "source": f.get("source",""),
+          "name": f.get("name","")} for f in raw_findings],
+        live_result
+    )
+    # Restore name field after crossref
+    for orig, merged in zip(raw_findings, findings[:len(raw_findings)]):
+        merged["name"] = orig.get("name", "")
+    reqs        = result.get("requests", 0)
+    live_reqs   = len(live_result.get("live_requests", []))
+    confirmed   = [f for f in findings if "CONFIRMED" in f.get("confidence", "")]
+    high_live   = [f for f in findings if f.get("confidence", "").startswith("HIGH")]
+    static_only = [f for f in findings if "STATIC" in f.get("confidence", "")]
     if not findings:
-        await msg.edit_text(f"🔑 *Hidden Keys — `{domain}`*\n\n📭 No hidden tokens found.", parse_mode='Markdown')
+        await msg.edit_text(
+            f"🔑 *Hidden Keys — `{domain}`*\n\n📭 No hidden tokens found.\n"
+            f"📡 Static: `{reqs}` | Live: `{live_reqs}`", parse_mode='Markdown')
         return
-    lines = [f"🔑 *Hidden Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
-             f"✅ Found: `{len(findings)}`\n"]
-    for i, f in enumerate(findings[:25], 1):
-        lines.append(f"*[{i}]* `{f['type']}`")
-        lines.append(f"  Name: `{f.get('name','–')[:40]}`")
-        lines.append(f"  Value: `{f['value'][:60]}`")
+    lines = [
+        f"🔑 *Hidden Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+        f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live-only: `{len(high_live)}` | ⚠️ Static-only: `{len(static_only)}`\n",
+    ]
+    ordered = (
+        [(f, "✅ CONFIRMED") for f in confirmed] +
+        [(f, "🔴 LIVE")      for f in high_live] +
+        [(f, "⚠️ STATIC")   for f in static_only]
+    )
+    for i, (f, badge) in enumerate(ordered[:25], 1):
+        lines.append(f"*[{i}]* {badge} `{f['type']}`")
+        if f.get("name"):
+            lines.append(f"  Name: `{f['name'][:40]}`")
+        lines.append(f"  Value: `{f.get('value','')[:60]}`")
         lines.append(f"  _Source: {f.get('source','')[:40]}_\n")
-    lines.append("⚠️ _Authorized testing only_")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
     try:
         await msg.edit_text("\n".join(lines)[:4000], parse_mode='Markdown')
     except BadRequest:
         await update.effective_message.reply_text("\n".join(lines)[:4000], parse_mode='Markdown')
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "domain": domain, "page_url": url,
+                "scanned_at": datetime.now().isoformat(),
+                "findings": findings,
+                "live_requests_captured": live_reqs,
+                "sse_frames_captured": len(live_result.get("sse_frames", [])),
+                "confirmed": len(confirmed), "static_only": len(static_only),
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"hiddenkeys_{safe_d}_{ts}.json",
+            caption=(
+                f"🔑 Hidden Keys — `{domain}`\n"
+                f"✅ Confirmed: `{len(confirmed)}` | ⚠️ Static-only: `{len(static_only)}`"
+            ),
+            parse_mode='Markdown')
+    except Exception as e:
+        logger.warning("hiddenkeys export error: %s", e)
 
 
 async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
