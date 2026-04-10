@@ -8103,7 +8103,7 @@ _PAY_PATTERNS = [
     # ── Mollie — require "mollie" keyword (avoid "live_" prefix mismatches) ──
     ("Mollie API Key",              re.compile(r'(?i)mollie[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']?((?:live|test)_[A-Za-z0-9]{30,45})["\']?')),
     # ── Klarna ────────────────────────────────────────────────────────────────
-    ("Klarna API Username",         re.compile(r'(?i)klarna[_-]?(?:api[_-]?)?username\s*[=:]\s*["\']([A-Za-z0-9_-@.]{5,60})["\']')),
+    ("Klarna API Username",         re.compile(r'(?i)klarna[_-]?(?:api[_-]?)?username\s*[=:]\s*["\']([A-Za-z0-9_\-@.]{5,60})["\']')),
     # ── Checkout.com ──────────────────────────────────────────────────────────
     ("Checkout.com Public Key",     re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b')),
     # ── Shopify — require "shopify" keyword ───────────────────────────────────
