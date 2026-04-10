@@ -5745,12 +5745,59 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     """
     Try Playwright (DevTools-style) first.
     Falls back to requests-based static scan if Playwright not available.
+    Option A: Playwright constructor hooks (grecaptcha/hcaptcha/turnstile).
+    Option B: Deep asset fetch for additional JS bundles.
     """
-    # ── Try Playwright ─────────────────────────────
+    # ── Option A: Playwright dynamic hooks (sitekey category) ─────────
+    # Run alongside main playwright scan via _playwright_dynamic_scan
+    if PLAYWRIGHT_OK:
+        if progress_cb: progress_cb("🌐 Dynamic captcha hook intercept...")
+        dyn = _playwright_dynamic_scan(url, "sitekey", progress_cb)
+    else:
+        dyn = {"hooks": {}, "xhr": [], "fetch_": [], "storage": {}}
+
+    # ── Main playwright scan ───────────────────────────────────────────
     result = _sitekey_playwright(url, progress_cb)
     if result.get("error") == "playwright_not_installed":
         if progress_cb: progress_cb("⚠️ Playwright မရှိ — static scan သို့ fallback...")
-        return _sitekey_static(url, progress_cb)
+        result = _sitekey_static(url, progress_cb)
+
+    # ── Option A: merge hook captures into findings ────────────────────
+    sk_hook = dyn.get("hooks", {}).get("sitekey", {})
+    _hook_type_map = {
+        "recaptcha_v2": "reCAPTCHA v2 (dynamic hook)",
+        "recaptcha_v3": "reCAPTCHA v3 (dynamic hook)",
+        "hcaptcha":     "hCaptcha (dynamic hook)",
+        "turnstile":    "Cloudflare Turnstile (dynamic hook)",
+    }
+    existing_keys = {f.get("site_key", "") for f in result.get("findings", [])}
+    for hook_k, type_label in _hook_type_map.items():
+        val = sk_hook.get(hook_k, "")
+        if val and val not in existing_keys:
+            result.setdefault("findings", []).append({
+                "type":     type_label,
+                "site_key": val,
+                "source":   "Playwright constructor hook",
+                "action":   "",
+            })
+            existing_keys.add(val)
+
+    # ── Option B: deep asset fetch → re-scan with captcha patterns ─────
+    if progress_cb: progress_cb("📦 Deep asset fetch for captcha keys...")
+    existing_log = []  # sitekey result doesn't expose network_log directly
+    new_assets   = _deep_asset_fetch(url, existing_log, progress_cb)
+
+    if new_assets:
+        all_js = {a["url"]: a["response_body"] for a in new_assets}
+        html_  = ""
+        extra  = _extract_captcha_info(html_, url, all_js)
+        for f in extra:
+            sk = f.get("site_key", "")
+            if sk and sk not in existing_keys:
+                f["source"] = f.get("source", "") + " [deep fetch]"
+                result.setdefault("findings", []).append(f)
+                existing_keys.add(sk)
+
     return result
 
 
@@ -6700,6 +6747,539 @@ def _gather_all_text(data: dict) -> list:
     return texts
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 🌐  SHARED DYNAMIC HELPERS  (Option A + Option B)
+#     Used by: /apikeys /hiddenkeys /paykeys /firebase
+#              /socialkeys /analytics /pushkeys /sitekey
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Option B — Deep Asset Fetcher ────────────────────────────────────
+def _deep_asset_fetch(url: str, existing_network_log: list,
+                      progress_cb=None) -> list:
+    """
+    Option B: Find & fetch JS assets that weren't captured during initial load.
+    Scans HTML for <script src>, checks .js.map source maps,
+    and fetches each new URL with requests.
+    Returns list of {url, response_body} dicts to merge into scan.
+    """
+    from urllib.parse import urljoin as _uj, urlparse as _up
+    already = {e.get("url", "") for e in existing_network_log}
+    new_entries = []
+    seen_fetch  = set(already)
+
+    # ── Step 1: Fetch page HTML to find <script src> tags ───────────
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        html = resp.text
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    candidates = []
+
+    # <script src="..."> tags
+    for tag in soup.find_all("script", src=True):
+        src = tag["src"].strip()
+        if not src or src.startswith("data:"):
+            continue
+        full = _uj(url, src)
+        # same-origin + JS only
+        parsed = _up(full)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if full not in seen_fetch:
+            candidates.append(full)
+            seen_fetch.add(full)
+
+    # ── Step 2: Also check .js.map for each known JS URL ────────────
+    for entry in existing_network_log:
+        js_url = entry.get("url", "")
+        if js_url.endswith(".js"):
+            map_url = js_url + ".map"
+            if map_url not in seen_fetch:
+                candidates.append(map_url)
+                seen_fetch.add(map_url)
+
+    if progress_cb:
+        progress_cb(f"📦 Deep fetch: {len(candidates)} additional assets found...")
+
+    # ── Step 3: Fetch each candidate ────────────────────────────────
+    MAX_DEEP_ASSETS = 30
+    MAX_BODY_KB     = 512
+
+    for asset_url in candidates[:MAX_DEEP_ASSETS]:
+        # SSRF check
+        safe_ok, _ = is_safe_url(asset_url)
+        if not safe_ok:
+            continue
+        try:
+            r = requests.get(asset_url, headers=HEADERS, timeout=12,
+                             verify=False, stream=True)
+            ct = r.headers.get("content-type", "")
+            # Only JS, JSON, text
+            if not any(x in ct for x in ("javascript", "json", "text", "wasm")):
+                # Allow if URL ends with .js/.json/.map regardless of CT
+                if not asset_url.rsplit(".", 1)[-1] in ("js", "json", "map", "ts"):
+                    continue
+            body = r.raw.read(MAX_BODY_KB * 1024).decode("utf-8", errors="replace")
+            if len(body) > 50:
+                new_entries.append({"url": asset_url, "response_body": body})
+        except Exception:
+            continue
+
+    if progress_cb and new_entries:
+        progress_cb(f"📦 Deep fetch: {len(new_entries)} assets fetched & ready")
+
+    return new_entries
+
+
+# ── Option A — Playwright Dynamic Interceptor ─────────────────────────
+_DYNAMIC_BASE_HOOKS = """
+// ── Anti-bot evasion ─────────────────────────────────────────────────
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+window.chrome = {runtime: {}};
+
+// ── XHR interceptor — capture request/response bodies ────────────────
+window.__dynLog = {xhr: [], fetch_: [], storage: {}, hooks: {}};
+(function() {
+    const _origOpen  = XMLHttpRequest.prototype.open;
+    const _origSend  = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this.__dyn_url    = url;
+        this.__dyn_method = method;
+        return _origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+        this.addEventListener('load', function() {
+            try {
+                const entry = {
+                    url:    this.__dyn_url    || '',
+                    method: this.__dyn_method || 'GET',
+                    status: this.status,
+                    body:   (this.responseText || '').substring(0, 4000)
+                };
+                if (entry.body.length > 10)
+                    window.__dynLog.xhr.push(entry);
+            } catch(e) {}
+        });
+        return _origSend.apply(this, arguments);
+    };
+})();
+
+// ── fetch() interceptor ───────────────────────────────────────────────
+(function() {
+    const _origFetch = window.fetch;
+    window.fetch = async function(input, init) {
+        const response = await _origFetch.apply(this, arguments);
+        try {
+            const clone = response.clone();
+            const text  = await clone.text();
+            window.__dynLog.fetch_.push({
+                url:    (typeof input === 'string' ? input : input.url || '').substring(0, 200),
+                status: response.status,
+                body:   text.substring(0, 4000)
+            });
+        } catch(e) {}
+        return response;
+    };
+})();
+
+// ── localStorage + sessionStorage dump ───────────────────────────────
+(function() {
+    try {
+        const ls = {};
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            ls[k] = localStorage.getItem(k) || '';
+        }
+        window.__dynLog.storage.localStorage = ls;
+    } catch(e) {}
+    try {
+        const ss = {};
+        for (let i = 0; i < sessionStorage.length; i++) {
+            const k = sessionStorage.key(i);
+            ss[k] = sessionStorage.getItem(k) || '';
+        }
+        window.__dynLog.storage.sessionStorage = ss;
+    } catch(e) {}
+})();
+"""
+
+# Per-category JS hooks injected alongside the base hooks
+_DYN_HOOKS = {
+    "apikeys": """
+(function() {
+    // Scan window globals for API key-like values
+    const _apiPat = [
+        /\\b(AIza[0-9A-Za-z_-]{35})\\b/,
+        /\\b(sk-[A-Za-z0-9]{20,60})\\b/,
+        /\\b(AKIA[0-9A-Z]{16})\\b/,
+        /\\b(gh[pousr]_[A-Za-z0-9]{36,255})\\b/,
+        /\\b(SG\\.[A-Za-z0-9_-]{22,60}\\.[A-Za-z0-9_-]{22,60})\\b/,
+    ];
+    const hits = {};
+    for (const k of Object.keys(window)) {
+        try {
+            const v = String(window[k] || '');
+            if (v.length < 10 || v.length > 300) continue;
+            for (const p of _apiPat) {
+                const m = p.exec(v);
+                if (m) { hits['global_' + k] = m[1]; break; }
+            }
+        } catch(e) {}
+    }
+    window.__dynLog.hooks.apikeys_globals = hits;
+})();
+""",
+    "firebase": """
+(function() {
+    const fb = {};
+    // Hook firebase.initializeApp before it's called
+    const _poll = setInterval(function() {
+        if ((window.firebase || window.initializeApp) && !window.__fbHooked) {
+            window.__fbHooked = true;
+            // Capture existing app configs
+            if (window.firebase && window.firebase.apps) {
+                fb.apps = window.firebase.apps.map(a => {
+                    try { return a.options; } catch(e) { return {}; }
+                });
+            }
+            // Hook new calls
+            const _orig = window.firebase && window.firebase.initializeApp
+                        ? window.firebase.initializeApp.bind(window.firebase)
+                        : null;
+            if (_orig) {
+                window.firebase.initializeApp = function(config, name) {
+                    try { fb['init_' + (name||'default')] = config; } catch(e) {}
+                    return _orig(config, name);
+                };
+            }
+            clearInterval(_poll);
+        }
+    }, 200);
+    setTimeout(() => clearInterval(_poll), 15000);
+    window.__dynLog.hooks.firebase = fb;
+})();
+""",
+    "socialkeys": """
+(function() {
+    const social = {};
+    // Facebook SDK hook
+    window.fbAsyncInit_orig = window.fbAsyncInit;
+    window.fbAsyncInit = function() {
+        if (window.fbAsyncInit_orig) window.fbAsyncInit_orig();
+        const _origInit = window.FB && window.FB.init ? window.FB.init.bind(window.FB) : null;
+        if (_origInit) {
+            window.FB.init = function(opts) {
+                try { social.fb_init = opts; } catch(e) {}
+                return _origInit(opts);
+            };
+        }
+    };
+    // Google gapi hook
+    const _gPoll = setInterval(function() {
+        if (window.gapi && window.gapi.load && !window.__gapiHooked) {
+            window.__gapiHooked = true;
+            const _origLoad = window.gapi.load.bind(window.gapi);
+            window.gapi.load = function(libs, opts) {
+                try { social['gapi_load_' + libs] = JSON.stringify(opts||{}).substring(0,200); } catch(e) {}
+                return _origLoad(libs, opts);
+            };
+            clearInterval(_gPoll);
+        }
+    }, 300);
+    setTimeout(() => clearInterval(_gPoll), 15000);
+    window.__dynLog.hooks.social = social;
+})();
+""",
+    "analytics": """
+(function() {
+    const ana = {};
+    // gtag hook
+    if (typeof window.gtag !== 'function') {
+        window.gtag = function() {
+            try {
+                const args = Array.from(arguments);
+                if (args[0] === 'config') ana['gtag_config_' + args[1]] = JSON.stringify(args[2]||{}).substring(0,200);
+            } catch(e) {}
+        };
+    } else {
+        const _origGtag = window.gtag;
+        window.gtag = function() {
+            const args = Array.from(arguments);
+            try {
+                if (args[0] === 'config') ana['gtag_config_' + args[1]] = JSON.stringify(args[2]||{}).substring(0,200);
+            } catch(e) {}
+            return _origGtag.apply(this, args);
+        };
+    }
+    // Facebook Pixel hook
+    const _origFbq = window.fbq;
+    if (_origFbq) {
+        window.fbq = function() {
+            const args = Array.from(arguments);
+            try {
+                if (args[0] === 'init') ana['fbq_pixel_id'] = String(args[1]);
+            } catch(e) {}
+            return _origFbq.apply(this, args);
+        };
+    }
+    // Mixpanel hook
+    const _mpPoll = setInterval(function() {
+        if (window.mixpanel && window.mixpanel.init && !window.__mpHooked) {
+            window.__mpHooked = true;
+            const _orig = window.mixpanel.init.bind(window.mixpanel);
+            window.mixpanel.init = function(token, cfg) {
+                try { ana['mixpanel_token'] = token; } catch(e) {}
+                return _orig(token, cfg);
+            };
+            clearInterval(_mpPoll);
+        }
+    }, 300);
+    setTimeout(() => clearInterval(_mpPoll), 15000);
+    window.__dynLog.hooks.analytics = ana;
+})();
+""",
+    "pushkeys": """
+(function() {
+    const push = {};
+    // Hook PushManager.subscribe to capture VAPID key
+    const _swPoll = setInterval(function() {
+        if (navigator.serviceWorker && !window.__swHooked) {
+            window.__swHooked = true;
+            const _origReg = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+            navigator.serviceWorker.register = function(scriptUrl, opts) {
+                try { push['sw_script'] = scriptUrl; } catch(e) {}
+                const reg = _origReg(scriptUrl, opts);
+                reg.then && reg.then(function(r) {
+                    const _origSub = r.pushManager && r.pushManager.subscribe
+                                   ? r.pushManager.subscribe.bind(r.pushManager) : null;
+                    if (_origSub) {
+                        r.pushManager.subscribe = function(options) {
+                            try { push['vapid_key'] = options && options.applicationServerKey
+                                    ? btoa(String.fromCharCode(...new Uint8Array(options.applicationServerKey)))
+                                    : ''; } catch(e) {}
+                            return _origSub(options);
+                        };
+                    }
+                }).catch(()=>{});
+                return reg;
+            };
+            clearInterval(_swPoll);
+        }
+    }, 300);
+    setTimeout(() => clearInterval(_swPoll), 15000);
+    window.__dynLog.hooks.push = push;
+})();
+""",
+    "hiddenkeys": """
+(function() {
+    const hidden = {};
+    // Capture CSRF tokens from fetch/XHR request headers
+    const _origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+        try {
+            if (/x-csrf|x-xsrf|x-requested-with|authorization/i.test(name)) {
+                hidden['header_' + name] = value;
+            }
+        } catch(e) {}
+        return _origSetHeader.apply(this, arguments);
+    };
+    // Deep cookie dump including HttpOnly flags visible to JS
+    try {
+        hidden['all_cookies'] = document.cookie;
+    } catch(e) {}
+    // meta[name=csrf-token] and input[name*=token]
+    try {
+        const meta = document.querySelector('meta[name*="csrf"],meta[name*="token"],meta[name*="nonce"]');
+        if (meta) hidden['meta_token'] = meta.content || meta.getAttribute('content') || '';
+    } catch(e) {}
+    window.__dynLog.hooks.hidden = hidden;
+})();
+""",
+    "sitekey": """
+(function() {
+    const sk = {};
+    // grecaptcha v2/v3 hook
+    const _rePoll = setInterval(function() {
+        if (window.grecaptcha && !window.__reHooked) {
+            window.__reHooked = true;
+            const _render = window.grecaptcha.render;
+            if (_render) {
+                window.grecaptcha.render = function(container, params) {
+                    try { if (params && params.sitekey) sk['recaptcha_v2'] = params.sitekey; } catch(e) {}
+                    return _render.call(window.grecaptcha, container, params);
+                };
+            }
+            const _execute = window.grecaptcha.execute;
+            if (_execute) {
+                window.grecaptcha.execute = function(sitekey, action) {
+                    try { sk['recaptcha_v3'] = sitekey; } catch(e) {}
+                    return _execute.call(window.grecaptcha, sitekey, action);
+                };
+            }
+            clearInterval(_rePoll);
+        }
+    }, 200);
+    // hCaptcha hook
+    const _hcPoll = setInterval(function() {
+        if (window.hcaptcha && !window.__hcHooked) {
+            window.__hcHooked = true;
+            const _hRender = window.hcaptcha.render;
+            if (_hRender) {
+                window.hcaptcha.render = function(container, params) {
+                    try { if (params && params.sitekey) sk['hcaptcha'] = params.sitekey; } catch(e) {}
+                    return _hRender.call(window.hcaptcha, container, params);
+                };
+            }
+            clearInterval(_hcPoll);
+        }
+    }, 200);
+    // Cloudflare Turnstile hook
+    const _cfPoll = setInterval(function() {
+        if (window.turnstile && !window.__cfHooked) {
+            window.__cfHooked = true;
+            const _cfRender = window.turnstile.render;
+            if (_cfRender) {
+                window.turnstile.render = function(container, params) {
+                    try { if (params && params.sitekey) sk['turnstile'] = params.sitekey; } catch(e) {}
+                    return _cfRender.call(window.turnstile, container, params);
+                };
+            }
+            clearInterval(_cfPoll);
+        }
+    }, 200);
+    setTimeout(() => { clearInterval(_rePoll); clearInterval(_hcPoll); clearInterval(_cfPoll); }, 15000);
+    window.__dynLog.hooks.sitekey = sk;
+})();
+""",
+}
+
+
+def _playwright_dynamic_scan(url: str, category: str,
+                              progress_cb=None) -> dict:
+    """
+    Option A: Playwright-based dynamic interceptor.
+    Injects XHR/fetch hooks + localStorage dump + category-specific
+    constructor hooks before page scripts run.
+    Returns {xhr, fetch_, storage, hooks} — caller merges into findings.
+    """
+    empty = {"xhr": [], "fetch_": [], "storage": {}, "hooks": {}}
+    if not PLAYWRIGHT_OK:
+        return empty
+
+    extra_hooks = _DYN_HOOKS.get(category, "")
+    init_script  = _DYNAMIC_BASE_HOOKS + "\n" + extra_hooks
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return empty
+
+    if progress_cb:
+        progress_cb(f"🌐 Dynamic intercept ({category}) launching...")
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=[
+                "--no-sandbox", "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ])
+            ctx  = browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                ignore_https_errors=True,
+            )
+            ctx.add_init_script(init_script)
+            page = ctx.new_page()
+
+            try:
+                page.goto(url, wait_until="networkidle", timeout=25000)
+            except PWTimeout:
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                except Exception:
+                    pass
+
+            # Trigger lazy-loaded SDKs
+            try:
+                page.mouse.move(300, 300)
+                page.mouse.wheel(0, 400)
+                page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+            # Retrieve captured data from window.__dynLog
+            try:
+                dyn = page.evaluate("() => JSON.parse(JSON.stringify(window.__dynLog || {}))")
+            except Exception:
+                dyn = {}
+
+            ctx.close()
+            browser.close()
+
+        return {
+            "xhr":     dyn.get("xhr",    []),
+            "fetch_":  dyn.get("fetch_", []),
+            "storage": dyn.get("storage", {}),
+            "hooks":   dyn.get("hooks",  {}),
+        }
+
+    except Exception as e:
+        logger.debug("_playwright_dynamic_scan error (%s): %s", category, e)
+        return empty
+
+
+def _merge_dynamic_into_data(data: dict, dyn: dict,
+                              new_assets: list) -> dict:
+    """
+    Merge Option A (dyn) and Option B (new_assets) results into
+    the existing data dict so _gather_all_text picks them up automatically.
+    """
+    # Option B: append new asset bodies to network_log
+    existing_log = data.get("network_log", [])
+    for asset in new_assets:
+        existing_log.append({
+            "url":           asset["url"],
+            "method":        "GET",
+            "post_data":     "",
+            "response_body": asset["response_body"],
+        })
+    data["network_log"] = existing_log
+
+    # Option A: append XHR/fetch response bodies
+    for entry in dyn.get("xhr", []):
+        body = entry.get("body", "")
+        if body and len(body) > 20:
+            existing_log.append({
+                "url":           entry.get("url", "XHR"),
+                "method":        entry.get("method", "GET"),
+                "post_data":     "",
+                "response_body": body,
+            })
+
+    for entry in dyn.get("fetch_", []):
+        body = entry.get("body", "")
+        if body and len(body) > 20:
+            existing_log.append({
+                "url":           entry.get("url", "fetch"),
+                "method":        "GET",
+                "post_data":     "",
+                "response_body": body,
+            })
+
+    # Option A: localStorage/sessionStorage into dom_result
+    storage = dyn.get("storage", {})
+    dr = data.get("dom_result") or {}
+    if "localStorage" not in dr and storage.get("localStorage"):
+        dr["localStorage"] = storage["localStorage"]
+    if "sessionStorage" not in dr and storage.get("sessionStorage"):
+        dr["sessionStorage"] = storage["sessionStorage"]
+    data["dom_result"] = dr
+
+    return data
+
+
 def _multipage_crawl(base_url: str, js_eval_code: str,
                      max_pages: int = 5, progress_cb=None) -> list:
     """
@@ -7144,6 +7724,21 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
 
+    # ── Option A: Dynamic intercept + Option B: Deep asset fetch ─────
+    if progress_cb: progress_cb("🌐 Dynamic intercept + deep asset fetch...")
+    dyn        = _playwright_dynamic_scan(url, "apikeys", progress_cb)
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # ── Merge hook data (window globals scan) ─────────────────────────
+    for k, v in (dyn.get("hooks", {}).get("apikeys_globals") or {}).items():
+        if v:
+            for key_type, pat in _API_KEY_PATTERNS:
+                m = pat.search(v)
+                if m:
+                    val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                    data.setdefault("dom_result", {})["dyn_" + k] = val
+
     findings = []
     seen = set()
 
@@ -7336,6 +7931,21 @@ def _firebase_sync(url: str, progress_cb=None) -> dict:
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
 
+    # ── Option A + B ──────────────────────────────────────────────────
+    if progress_cb: progress_cb("🌐 Dynamic Firebase intercept + deep asset fetch...")
+    dyn        = _playwright_dynamic_scan(url, "firebase", progress_cb)
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # Merge Firebase hook: initializeApp captures
+    fb_hook = dyn.get("hooks", {}).get("firebase", {})
+    for key, cfg in fb_hook.items():
+        if isinstance(cfg, dict):
+            cfg_str = json.dumps(cfg)
+            dr = data.get("dom_result") or {}
+            dr[f"dyn_firebase_{key}"] = cfg_str
+            data["dom_result"] = dr
+
     configs = []
     seen = set()
 
@@ -7466,109 +8076,108 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 💳  3. /paykeys — Payment Key Extractor
 # ══════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════
-# v23 IMPROVEMENTS: Reduced false positives by ~80%
-# - Tighter regex patterns with specific prefixes
-# - Reduced character class ranges ({0,30} → [_-]?)
-# - Added post-match validation function below
-# ══════════════════════════════════════════════════════════════════════════
-
 _PAY_PATTERNS = [
-    ("Stripe Publishable Key",  re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Secret Key",       re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Webhook Secret",   re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Restricted Key",   re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
-    # v23: Fixed PayPal pattern - require "paypal" keyword proximity + length validation
-    ("PayPal Client ID",        re.compile(r'(?i)paypal[_-]?(?:client[_-]?)?id\s*[=:]\s*["\']?(A[A-Za-z0-9_-]{47,97})["\']?')),
-    # v23: Fixed Braintree - require specific prefix or length validation happens in validate_payment_key()
-    ("Braintree Tokenization",  re.compile(r'(?i)braintree[_-]?(?:client|token|auth)\s*[=:]\s*["\']?([A-Za-z0-9]{20,100})["\']?')),
-    ("Square App ID",           re.compile(r'\b(sq0idp-[A-Za-z0-9_-]{22,43})\b')),
-    ("Square Access Token",     re.compile(r'\b(sq0atp-[A-Za-z0-9_-]{22,43})\b')),
-    ("Razorpay Key ID",         re.compile(r'\b(rzp_(?:live|test)_[A-Za-z0-9]{14,20})\b')),
-    # v23: Fixed Adyen - tighter character class, require specific keywords
-    ("Adyen Client Key",        re.compile(r'(?i)adyen[_-]?client[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{20,80})["\']?')),
-    # v23: Fixed Authorize.net - tighter context matching
-    ("Authorize.net API Login",  re.compile(r'(?i)authorize[_-]?net[_-]?(?:login|api)[_-]?id\s*[=:]\s*["\']?([A-Za-z0-9]{6,20})["\']?')),
-    ("WooCommerce Consumer Key", re.compile(r'\b(ck_[a-f0-9]{40})\b')),
+    # ── Stripe ────────────────────────────────────────────────────────────────
+    ("Stripe Publishable Key",      re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Secret Key",           re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Webhook Secret",       re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Restricted Key",       re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    # ── PayPal — require "paypal" keyword (removed generic "client" matching) ─
+    ("PayPal Client ID",            re.compile(r'(?i)paypal[_-]?(?:client[_-]?)?id\s*[=:]\s*["\']?(A[A-Za-z0-9_-]{47,97})["\']?')),
+    # ── Braintree — require specific suffix ───────────────────────────────────
+    ("Braintree Tokenization",      re.compile(r'(?i)braintree[_-]?(?:client|token|auth)\s*[=:]\s*["\']?([A-Za-z0-9]{20,100})["\']?')),
+    # ── Square — prefix already specific enough ───────────────────────────────
+    ("Square App ID",               re.compile(r'\b(sq0idp-[A-Za-z0-9_-]{22,43})\b')),
+    ("Square Access Token",         re.compile(r'\b(sq0atp-[A-Za-z0-9_-]{22,43})\b')),
+    # ── Razorpay ──────────────────────────────────────────────────────────────
+    ("Razorpay Key ID",             re.compile(r'\b(rzp_(?:live|test)_[A-Za-z0-9]{14,20})\b')),
+    # ── Adyen — tighter context ───────────────────────────────────────────────
+    ("Adyen Client Key",            re.compile(r'(?i)adyen[_-]?client[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{20,80})["\']?')),
+    # ── Authorize.net ─────────────────────────────────────────────────────────
+    ("Authorize.net API Login",     re.compile(r'(?i)authorize[_-]?net[_-]?(?:api[_-]?)?login\s*[=:]\s*["\']([A-Za-z0-9]{6,20})["\']')),
+    # ── WooCommerce ───────────────────────────────────────────────────────────
+    ("WooCommerce Consumer Key",    re.compile(r'\b(ck_[a-f0-9]{40})\b')),
     ("WooCommerce Consumer Secret", re.compile(r'\b(cs_[a-f0-9]{40})\b')),
-    # v23: Fixed Paddle - require "paddle" keyword
-    ("Paddle Vendor ID",        re.compile(r'(?i)paddle[_-]?vendor[_-]?id\s*[=:]\s*["\']?(\d{4,10})["\']?')),
-    # v23: Fixed Mollie - require "mollie" keyword to avoid generic "live_xxx" matches
-    ("Mollie API Key",          re.compile(r'(?i)mollie[_-]?(?:api[_-])?key\s*[=:]\s*["\']?((?:live|test)_[A-Za-z0-9]{30,45})["\']?')),
-    # v23: Fixed Klarna - tighter context
-    ("Klarna API Username",     re.compile(r'(?i)klarna[_-]?(?:api[_-])?username\s*[=:]\s*["\']?([A-Za-z0-9_-@.]{5,60})["\']?')),
-    ("Checkout.com Public Key", re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b')),
-    ("Shopify Store Domain",    re.compile(r'(?i)shopify[_-]?store[_-]?(?:domain|url)?\s*[=:]\s*["\']?([a-z0-9-]+\.myshopify\.com)["\']?')),
+    # ── Paddle — require "paddle" keyword ────────────────────────────────────
+    ("Paddle Vendor ID",            re.compile(r'(?i)paddle[_-]?vendor[_-]?id\s*[=:]\s*["\']?(\d{4,10})["\']?')),
+    # ── Mollie — require "mollie" keyword (avoid "live_" prefix mismatches) ──
+    ("Mollie API Key",              re.compile(r'(?i)mollie[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']?((?:live|test)_[A-Za-z0-9]{30,45})["\']?')),
+    # ── Klarna ────────────────────────────────────────────────────────────────
+    ("Klarna API Username",         re.compile(r'(?i)klarna[_-]?(?:api[_-]?)?username\s*[=:]\s*["\']([A-Za-z0-9_-@.]{5,60})["\']')),
+    # ── Checkout.com ──────────────────────────────────────────────────────────
+    ("Checkout.com Public Key",     re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b')),
+    # ── Shopify — require "shopify" keyword ───────────────────────────────────
+    ("Shopify Store Domain",        re.compile(r'(?i)shopify[_-]?(?:store[_-]?)?domain\s*[=:]\s*["\']([a-z0-9-]+\.myshopify\.com)["\']')),
+    # ── Stripe PaymentIntent secret ───────────────────────────────────────────
     ("PaymentIntent client secret", re.compile(r'\b(pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
 ]
 
-# ══════════════════════════════════════════════════════════════════════════
-# v23: POST-MATCH VALIDATION — Reduce false positives by secondary validation
-# ══════════════════════════════════════════════════════════════════════════
-
 def _validate_payment_key(key_type: str, key_value: str) -> bool:
-    """Secondary validation to filter false positives"""
-    key_value = key_value.strip()
-    
-    if key_type == "Stripe Publishable Key":
-        return bool(re.match(r'^pk_(?:live|test)_[A-Za-z0-9]{20,60}$', key_value))
-    
-    elif key_type == "Stripe Secret Key":
-        return bool(re.match(r'^sk_(?:live|test)_[A-Za-z0-9]{20,60}$', key_value))
-    
-    elif key_type == "PayPal Client ID":
-        # PayPal client IDs: start with A, 48-101 chars total
-        if not key_value.startswith('A'):
-            return False
-        if len(key_value) < 48:
-            return False
-        # Additional: should contain only alphanumeric, underscore, hyphen, dot
-        return bool(re.match(r'^A[A-Za-z0-9._-]{47,100}$', key_value))
-    
-    elif key_type == "Braintree Tokenization":
-        # Braintree tokens: known prefixes or 32+ chars with specific structure
-        if key_value.startswith(('pk_', 'cr_', 'tb_')):
+    """Secondary validation to filter false positives after regex match."""
+    v = key_value.strip()
+    kt = key_type.lower()
+
+    # ── Stripe ────────────────────────────────────────────────────────────────
+    if "stripe publishable" in kt:
+        return bool(re.match(r'^pk_(live|test)_[A-Za-z0-9]{20,60}$', v))
+    if "stripe secret" in kt:
+        return bool(re.match(r'^sk_(live|test)_[A-Za-z0-9]{20,60}$', v))
+    if "stripe webhook" in kt:
+        return bool(re.match(r'^whsec_[A-Za-z0-9]{20,60}$', v))
+    if "stripe restricted" in kt:
+        return bool(re.match(r'^rk_(live|test)_[A-Za-z0-9]{20,60}$', v))
+
+    # ── PayPal ────────────────────────────────────────────────────────────────
+    if "paypal" in kt:
+        return v.startswith('A') and 48 <= len(v) <= 101
+
+    # ── Braintree ─────────────────────────────────────────────────────────────
+    if "braintree" in kt:
+        if re.match(r'^(pk_|cr_|tb_)', v):
             return True
-        # Also accept 32 char hex-like tokens (Braintree client tokens)
-        if len(key_value) >= 32 and re.match(r'^[a-f0-9]{32,}$', key_value, re.I):
+        if re.match(r'^[a-f0-9]{32}$', v):
             return True
-        return False
-    
-    elif key_type == "Square App ID":
-        return bool(re.match(r'^sq0idp-[A-Za-z0-9_-]{22,43}$', key_value))
-    
-    elif key_type == "Square Access Token":
-        return bool(re.match(r'^sq0atp-[A-Za-z0-9_-]{22,43}$', key_value))
-    
-    elif key_type == "Razorpay Key ID":
-        return bool(re.match(r'^rzp_(?:live|test)_[A-Za-z0-9]{14,20}$', key_value))
-    
-    elif key_type == "Adyen Client Key":
-        # Adyen keys: usually 20-80 alphanumeric with possible underscore
-        return len(key_value) >= 20 and bool(re.match(r'^[A-Za-z0-9_-]{20,80}$', key_value))
-    
-    elif key_type == "WooCommerce Consumer Key":
-        return bool(re.match(r'^ck_[a-f0-9]{40}$', key_value))
-    
-    elif key_type == "WooCommerce Consumer Secret":
-        return bool(re.match(r'^cs_[a-f0-9]{40}$', key_value))
-    
-    elif key_type == "Mollie API Key":
-        # Mollie: live_xxx or test_xxx with 30-45 chars after prefix
-        return bool(re.match(r'^(?:live|test)_[A-Za-z0-9]{30,45}$', key_value))
-    
-    elif key_type == "Checkout.com Public Key":
-        return bool(re.match(r'^pk_(?:sbox|prod)_[A-Za-z0-9]{20,80}$', key_value))
-    
-    elif key_type == "Shopify Store Domain":
-        # Shopify domain: must be *.myshopify.com format
-        return bool(re.match(r'^[a-z0-9-]+\.myshopify\.com$', key_value, re.I))
-    
-    elif key_type == "PaymentIntent client secret":
-        return bool(re.match(r'^pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24}$', key_value))
-    
-    # Default: accept (conservative approach)
+        return len(v) >= 20
+
+    # ── Square ────────────────────────────────────────────────────────────────
+    if "square app" in kt:
+        return bool(re.match(r'^sq0idp-[A-Za-z0-9_-]{22,43}$', v))
+    if "square access" in kt:
+        return bool(re.match(r'^sq0atp-[A-Za-z0-9_-]{22,43}$', v))
+
+    # ── Razorpay ──────────────────────────────────────────────────────────────
+    if "razorpay" in kt:
+        return bool(re.match(r'^rzp_(live|test)_[A-Za-z0-9]{14,20}$', v))
+
+    # ── Mollie ────────────────────────────────────────────────────────────────
+    if "mollie" in kt:
+        return bool(re.match(r'^(live|test)_[A-Za-z0-9]{30,45}$', v))
+
+    # ── WooCommerce ───────────────────────────────────────────────────────────
+    if "woocommerce consumer key" in kt:
+        return bool(re.match(r'^ck_[a-f0-9]{40}$', v))
+    if "woocommerce consumer secret" in kt:
+        return bool(re.match(r'^cs_[a-f0-9]{40}$', v))
+
+    # ── Adyen ─────────────────────────────────────────────────────────────────
+    if "adyen" in kt:
+        return 20 <= len(v) <= 80 and bool(re.match(r'^[A-Za-z0-9_-]+$', v))
+
+    # ── Checkout.com ──────────────────────────────────────────────────────────
+    if "checkout.com" in kt:
+        return bool(re.match(r'^pk_(sbox|prod)_[A-Za-z0-9]{20,80}$', v))
+
+    # ── Shopify ───────────────────────────────────────────────────────────────
+    if "shopify" in kt:
+        return v.endswith('.myshopify.com') and bool(re.match(r'^[a-z0-9-]+\.myshopify\.com$', v))
+
+    # ── PaymentIntent ─────────────────────────────────────────────────────────
+    if "paymentintent" in kt:
+        return bool(re.match(r'^pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24}$', v))
+
+    # Default: pass through unknowns
     return True
+
 
 _PAY_JS_EVAL = """() => {
     const res = {};
@@ -8071,17 +8680,21 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
 
+    # ── Option B: Deep asset fetch (Option A handled by _paykeys_playwright) ─
+    if progress_cb: progress_cb("📦 Deep asset fetch for payment keys...")
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, {}, new_assets)
+
     findings = []
     seen = set()
 
     def _add(t, v, src):
-        """Add finding with v23 validation to reduce false positives"""
+        """Add finding with validation to reduce false positives."""
         v = v.strip()
         d = t + ":" + v[:80]
         if d not in seen and len(v) >= 6:
-            # v23: Apply post-match validation to reduce false positives
             if not _validate_payment_key(t, v):
-                return  # Filtered out by validation
+                return  # filtered by post-match validation
             seen.add(d)
             findings.append({"type": t, "value": v, "source": src})
 
@@ -8295,6 +8908,20 @@ def _socialkeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _SOCIAL_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
+
+    # ── Option A + B ──────────────────────────────────────────────────
+    if progress_cb: progress_cb("🌐 Dynamic social SDK intercept + deep fetch...")
+    dyn        = _playwright_dynamic_scan(url, "socialkeys", progress_cb)
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # Merge FB.init / gapi hook results
+    social_hook = dyn.get("hooks", {}).get("social", {})
+    if social_hook:
+        dr = data.get("dom_result") or {}
+        dr["dyn_social_hooks"] = json.dumps(social_hook)[:2000]
+        data["dom_result"] = dr
+
     findings = []; seen = set()
     def _add(t, v, src):
         d = t+":"+v[:60]
@@ -8447,6 +9074,20 @@ def _analytics_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _ANALYTICS_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
+
+    # ── Option A + B ──────────────────────────────────────────────────
+    if progress_cb: progress_cb("🌐 Dynamic analytics SDK intercept + deep fetch...")
+    dyn        = _playwright_dynamic_scan(url, "analytics", progress_cb)
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # Merge gtag/fbq/mixpanel hook results into dom_result for pattern scan
+    ana_hook = dyn.get("hooks", {}).get("analytics", {})
+    if ana_hook:
+        dr = data.get("dom_result") or {}
+        dr["dyn_analytics_hooks"] = json.dumps(ana_hook)[:2000]
+        data["dom_result"] = dr
+
     findings = []; seen = set()
     def _add(t, v, src):
         d = t+":"+v
@@ -9355,6 +9996,21 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
 
+    # ── Option A + B ──────────────────────────────────────────────────
+    if progress_cb: progress_cb("🌐 Dynamic hidden key intercept + deep fetch...")
+    dyn        = _playwright_dynamic_scan(url, "hiddenkeys", progress_cb)
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # Merge hidden hook: XHR headers, meta token
+    hidden_hook = dyn.get("hooks", {}).get("hidden", {})
+    if hidden_hook:
+        dr = data.get("dom_result") or {}
+        for k, v in hidden_hook.items():
+            if v:
+                dr[f"dyn_hidden_{k}"] = str(v)[:500]
+        data["dom_result"] = dr
+
     findings = []
     seen     = set()
 
@@ -9861,6 +10517,22 @@ def _pushkeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _PUSH_JS_EVAL, progress_cb)
     if data.get("error"):
         return {"error": data["error"], "findings": [], "page_url": url}
+
+    # ── Option A + B ──────────────────────────────────────────────────
+    if progress_cb: progress_cb("🌐 Dynamic push SDK intercept + deep fetch...")
+    dyn        = _playwright_dynamic_scan(url, "pushkeys", progress_cb)
+    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
+    data       = _merge_dynamic_into_data(data, dyn, new_assets)
+
+    # Merge VAPID / SW hook results
+    push_hook = dyn.get("hooks", {}).get("push", {})
+    if push_hook:
+        dr = data.get("dom_result") or {}
+        for k, v in push_hook.items():
+            if v:
+                dr[f"dyn_push_{k}"] = v
+        data["dom_result"] = dr
+
     findings = []; seen = set()
     def _add(t, v, src):
         d = t+":"+v[:60]
@@ -10440,109 +11112,233 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         get_user(db2, uid, uname)
         _save_db_sync(db2)
 
-    js_status   = "✅ JS Ready" if PLAYWRIGHT_OK else "⚠️ JS Off"
-    adm_line     = "\n\n🔧 *Admin Panel:* /admin" if uid in ADMIN_IDS else ""
+    js_badge = "✅ Ready" if PLAYWRIGHT_OK else "⚠️ Not installed"
+    adm_row  = [[InlineKeyboardButton("👑 Admin Panel", callback_data="help_admin")]] if uid in ADMIN_IDS else []
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📥 Download",      callback_data="help_download"),
+            InlineKeyboardButton("🔍 Scan Tools",    callback_data="help_scan"),
+        ],
+        [
+            InlineKeyboardButton("🔑 Key Extract",   callback_data="help_keys"),
+            InlineKeyboardButton("🕵️ Recon",          callback_data="help_recon"),
+        ],
+        [
+            InlineKeyboardButton("📱 App Analyzer",  callback_data="help_app"),
+            InlineKeyboardButton("📊 My Account",    callback_data="help_account"),
+        ],
+        *adm_row,
+        [InlineKeyboardButton("📖 Full Command List", callback_data="help_all")],
+    ])
 
     await update.effective_message.reply_text(
         f"👋 *မင်္ဂလာပါ, {uname}!*\n"
-        f"🌐 *Website Downloader Bot v17.0*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📥 *Download Commands:*\n"
-        f"  `/download <url>` — Single page\n"
-        f"  `/fullsite <url>` — Full website\n"
-        f"  `/jsdownload <url>` — JS/React site _{js_status}_\n"
-        f"  `/resume <url>` — Download ဆက်လုပ်ရန်\n"
-        f"  `/stop` — Download ရပ်ရန်\n\n"
-        f"🔍 *Tools:*\n"
-        f"  `/vuln <url>` — Security scan\n"
-        f"  `/api <url>` — API discovery\n"
-        f"  `/tech <url>` — Tech stack fingerprint\n"
-        f"  `/extract <url>` — Secret/key scanner\n"
-        f"  `/subdomains <domain>` — Subdomain enumeration\n"
-        f"  `/bypass403 <url>` — 403 bypass tester\n"
-        f"  `/fuzz <url>` — Path & param fuzzer\n"
-        f"  `/monitor` — Change alert monitor\n"
-        f"  `/smartfuzz <url>` — 🗂️ Context-aware smart fuzzer\n"
-        f"  `/antibot <url>` — 🤖 Anti-bot / Captcha bypass\n"
-        f"  `/jwtattack <token>` — 🎟️ JWT decode & crack\n"
-        f"  `/sitekey <url>` — 🔑 reCAPTCHA/hCaptcha/Turnstile key extractor\n\n"
-        f"📱 *App Analyzer:*\n"
-        f"  APK / IPA / ZIP / JAR upload လုပ်ပါ\n"
-        f"  → Auto API + Secret extraction\n\n"
-        f"📊 *Account:*\n"
-        f"  `/status` — Usage ကြည့်ရန်\n"
-        f"  `/history` — Download history\n"
-        f"  `/mystats` — Detailed stats\n\n"
-        f"🔒 SSRF Protected{adm_line}\n\n"
-        f"❓ /help — Commands အကူအညီ",
-        parse_mode='Markdown'
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌐 *PhantomScope Bot v18.0*\n\n"
+        f"Web security scanning, recon & download toolkit.\n\n"
+        f"🖥️ JS Engine: `{js_badge}`\n"
+        f"🔒 SSRF Protected · Rate Limited · Queued\n\n"
+        f"⬇️ *Category တစ်ခုရွေးပြီး commands ကြည့်ပါ:*",
+        parse_mode='Markdown',
+        reply_markup=keyboard,
     )
+
+
+# ── Help text per category ────────────────────────────────────────────
+_HELP_TEXTS = {
+    "help_download": (
+        "📥 *Download Commands*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "  /download `<url>` — Single page HTML + assets\n"
+        "  /fullsite `<url>` — Full website crawl\n"
+        "  /jsdownload `<url>` — JS/React/Vue/Angular\n"
+        "  /jsfullsite `<url>` — JS + full crawl\n"
+        "  /resume `<url>` — ကျသွားလျှင် ဆက်လုပ်ရန်\n"
+        "  /stop — Download ရပ်ရန်\n\n"
+        "💡 _50MB+ ဆိုရင် auto-split ဖြင့် ပေးပို့မည်_"
+    ),
+    "help_scan": (
+        "🔍 *Scan & Security Tools*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "  /vuln `<url>` — Vulnerability scanner\n"
+        "  /api `<url>` — API endpoint discovery\n"
+        "  /tech `<url>` — Tech stack fingerprint\n"
+        "  /extract `<url>` — Secret/key extractor\n"
+        "  /antibot `<url>` — Anti-bot bypass tester\n"
+        "  /jwtattack `<token>` — JWT decode & attack\n"
+        "  /sitekey `<url>` — Captcha key extractor\n"
+        "  /monitor `add <url>` — Page change alert\n"
+        "  /keydump `<url>` — All-in-one key dump"
+    ),
+    "help_keys": (
+        "🔑 *Key Extraction Tools*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "  /apikeys `<url>` — Google, OpenAI, AWS, Twilio\n"
+        "  /firebase `<url>` — Firebase config\n"
+        "  /paykeys `<url>` — Stripe, PayPal, Square\n"
+        "  /socialkeys `<url>` — OAuth app IDs\n"
+        "  /analytics `<url>` — GA4, GTM, Pixel IDs\n"
+        "  /hiddenkeys `<url>` — CSRF tokens, JWT\n"
+        "  /pushkeys `<url>` — VAPID, FCM, OneSignal\n"
+        "  /endpoints `<url>` — REST/GraphQL endpoints\n"
+        "  /webhooks `<url>` — Webhook URLs\n"
+        "  /oauthscan `<url>` — OAuth config scan\n\n"
+        "💡 _Dynamic Playwright + deep asset fetch included_"
+    ),
+    "help_recon": (
+        "🕵️ *Recon Tools*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "  /subdomains `<domain>` — Subdomain enum\n"
+        "  /bypass403 `<url>` — 403 bypass (50+ techniques)\n"
+        "  /fuzz `<url>` — Path & param fuzzer\n"
+        "  /smartfuzz `<url>` — Context-aware smart fuzzer\n"
+        "  /monitor `<url>` — Page change monitor\n\n"
+        "💡 _crt.sh + bruteforce + wildcard detection_"
+    ),
+    "help_app": (
+        "📱 *App Analyzer*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Chat ထဲ file drop ရုံသာ!\n\n"
+        "Supported: `APK` `IPA` `ZIP` `JAR` `AAB`\n\n"
+        "  → API endpoints extraction\n"
+        "  → Secrets & API keys\n"
+        "  → AndroidManifest / Info.plist parse\n"
+        "  → Host/domain list\n"
+        "  → JSON report auto-export\n\n"
+        "  /appassets `<url>` — Web app asset analyzer"
+    ),
+    "help_account": (
+        "📊 *My Account*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "  /status — Daily usage & limit\n"
+        "  /history — Download log (last 10)\n"
+        "  /mystats — Detailed statistics\n\n"
+        "💡 _Daily limit reset မှာ midnight UTC_"
+    ),
+    "help_admin": (
+        "👑 *Admin Commands*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "  /admin — Admin panel\n"
+        "  /ban `/unban <uid>` — User ban\n"
+        "  /setlimit `<uid> <n>` — Download limit\n"
+        "  /userinfo `<uid>` — User details\n"
+        "  /broadcast `<msg>` — All users message\n"
+        "  /allusers — User list\n"
+        "  /setpages `/setassets` — Limits\n"
+        "  /proxy — Proxy pool status\n"
+        "  /setforcejoin `<channel>` — Force join"
+    ),
+    "help_all": (
+        "📖 *Full Command List — PhantomScope v18.0*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📥 /download /fullsite /jsdownload /jsfullsite /resume /stop\n\n"
+        "🔍 /vuln /api /tech /extract /antibot /jwtattack /sitekey /keydump\n\n"
+        "🔑 /apikeys /firebase /paykeys /socialkeys /analytics\n"
+        "    /hiddenkeys /pushkeys /endpoints /webhooks /oauthscan\n\n"
+        "🕵️ /subdomains /bypass403 /fuzz /smartfuzz /monitor\n\n"
+        "📱 /appassets — Upload APK/IPA/ZIP\n\n"
+        "📊 /status /history /mystats\n\n"
+        "💡 _/start → Category buttons နဲ့ details ကြည့်ပါ_"
+    ),
+}
+
+_HELP_BACK_KB = InlineKeyboardMarkup([[
+    InlineKeyboardButton("🏠 Menu သို့", callback_data="help_home")
+]])
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid     = update.effective_user.id
-    is_adm  = uid in ADMIN_IDS
-    js_st    = "✅ Ready" if PLAYWRIGHT_OK else "❌ `pip install playwright && playwright install chromium`"
-    base = (
-        "📖 *Commands Guide — v17.0*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
+    uid    = update.effective_user.id
+    is_adm = uid in ADMIN_IDS
+    js_st  = "✅ Ready" if PLAYWRIGHT_OK else "❌ pip install playwright"
 
-        "📥 *Website Download*\n"
-        "  `/download <url>`\n"
-        "   └ Single page HTML + assets\n\n"
-        "  `/fullsite <url>`\n"
-        "   └ Website အပြည့် (sitemap scan ပါ)\n\n"
-        "  `/jsdownload <url>`\n"
-        "   └ React/Vue/Angular JS sites\n"
-        "   └ Status: " + js_st + "\n\n"
-        "  `/jsfullsite <url>`\n"
-        "   └ JS + Full crawl ပေါင်းစပ်\n\n"
-        "  `/resume <url>`\n"
-        "   └ ကျသွားလျှင် ဆက်လုပ်ရန်\n\n"
-
-        "📱 *App Analyzer (Upload File):*\n"
-        "  APK / IPA / ZIP / JAR / AAB / JAR\n"
-        "   └ Chat ထဲ file drop ရုံသာ\n"
-        "   └ API endpoints + Secrets + Hosts\n"
-        "   └ AndroidManifest / Info.plist parse\n"
-        "   └ JSON report auto-export\n"
-        f"   └ Max size: `{APP_MAX_MB}MB`\n\n"
-        "🔍 *Scan & Discovery*\n"
-        "  `/vuln <url>` — Security vulnerability scan\n"
-        "  `/api <url>` — API endpoint discovery\n"
-        "  `/tech <url>` — Tech stack fingerprinter\n"
-        "  `/extract <url>` — Secret/API key scanner (JS bundles)\n\n"
-        "🔓 *Advanced Recon*\n"
-        "  `/subdomains <domain>` — Subdomain enum (crt.sh + brute-force)\n"
-        "  `/bypass403 <url>` — 403 bypass (50+ techniques)\n"
-        "  `/fuzz <url> [paths|params]` — HTTP path & param fuzzer\n\n"
-        "🔔 *Monitoring*\n"
-        "  `/monitor add <url> [min] [label]` — Alert on page change\n"
-        "  `/monitor list|del|clear` — Manage monitors\n\n"
-
-        "📊 *My Account*\n"
-        "  `/status` — Daily limit + usage\n"
-        "  `/history` — Download log (last 10)\n"
-        "  `/mystats` — Total stats\n\n"
-
-        "💡 *Tips:*\n"
-        "  • 50MB+ ဆိုရင် auto split လုပ်ပြီး ပို့ပေးမယ်\n"
-        "  • JS site error ဖြစ်ရင် `/jsdownload` သုံးပါ\n"
-        "  • Download ကျရင် `/resume` နဲ့ ဆက်နိုင်တယ်\n"
-        "  • 🔒 SSRF + Path traversal protected"
-    )
-
-    admin_section = (
-        "\n\n👑 *Admin Commands:*\n"
-        "  `/admin` — Admin panel\n"
-        "  `/ban` `/unban` `/setlimit` `/userinfo`\n"
-        "  `/broadcast` `/allusers` `/setpages` `/setassets`\n\n"
-            )
+    adm_row = [[InlineKeyboardButton("👑 Admin Panel", callback_data="help_admin")]] if is_adm else []
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📥 Download",      callback_data="help_download"),
+            InlineKeyboardButton("🔍 Scan Tools",    callback_data="help_scan"),
+        ],
+        [
+            InlineKeyboardButton("🔑 Key Extract",   callback_data="help_keys"),
+            InlineKeyboardButton("🕵️ Recon",          callback_data="help_recon"),
+        ],
+        [
+            InlineKeyboardButton("📱 App Analyzer",  callback_data="help_app"),
+            InlineKeyboardButton("📊 My Account",    callback_data="help_account"),
+        ],
+        *adm_row,
+        [InlineKeyboardButton("📖 Full List", callback_data="help_all")],
+    ])
 
     await update.effective_message.reply_text(
-        base + (admin_section if is_adm else ""),
-        parse_mode='Markdown'
+        f"📖 *PhantomScope v18.0 — Help*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🖥️ JS Engine: `{js_st}`\n\n"
+        f"Category ရွေးပါ ↓",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
     )
+
+
+async def help_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle help_* InlineKeyboard callbacks."""
+    query = update.callback_query
+    await query.answer()
+    data  = query.data  # e.g. "help_download"
+    uid   = query.from_user.id
+
+    if data == "help_home":
+        # Rebuild main menu
+        js_badge = "✅ Ready" if PLAYWRIGHT_OK else "⚠️ Not installed"
+        adm_row  = [[InlineKeyboardButton("👑 Admin Panel", callback_data="help_admin")]] if uid in ADMIN_IDS else []
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📥 Download",      callback_data="help_download"),
+                InlineKeyboardButton("🔍 Scan Tools",    callback_data="help_scan"),
+            ],
+            [
+                InlineKeyboardButton("🔑 Key Extract",   callback_data="help_keys"),
+                InlineKeyboardButton("🕵️ Recon",          callback_data="help_recon"),
+            ],
+            [
+                InlineKeyboardButton("📱 App Analyzer",  callback_data="help_app"),
+                InlineKeyboardButton("📊 My Account",    callback_data="help_account"),
+            ],
+            *adm_row,
+            [InlineKeyboardButton("📖 Full Command List", callback_data="help_all")],
+        ])
+        try:
+            await query.edit_message_text(
+                f"📖 *PhantomScope v18.0 — Help*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🖥️ JS Engine: `{'✅ Ready' if PLAYWRIGHT_OK else '⚠️ Not installed'}`\n\n"
+                f"Category ရွေးပါ ↓",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception:
+            pass
+        return
+
+    # Guard: admin-only section
+    if data == "help_admin" and uid not in ADMIN_IDS:
+        await query.answer("⛔ Admin only", show_alert=True)
+        return
+
+    text = _HELP_TEXTS.get(data)
+    if not text:
+        return
+
+    try:
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=_HELP_BACK_KB,
+        )
+    except Exception:
+        pass
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with db_lock:
@@ -18232,6 +19028,7 @@ def main():
     app.add_handler(CallbackQueryHandler(force_join_callback,   pattern="^fj_check$"))
     app.add_handler(CallbackQueryHandler(appassets_cat_callback, pattern="^apa_"))
     app.add_handler(CallbackQueryHandler(admin_callback,        pattern="^adm_"))
+    app.add_handler(CallbackQueryHandler(help_category_callback, pattern="^help_"))
     # ── Global error handler → Admin notify ──────────
     app.add_error_handler(error_handler)
 
@@ -18268,6 +19065,72 @@ def main():
                 asyncio.create_task(auto_delete_loop())
                 asyncio.create_task(monitor_loop())
                 logger.info("Background tasks started (queue worker + auto-delete + monitor)")
+
+                # ── Register commands in Telegram menu ────────────────
+                from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
+                _user_cmds = [
+                    BotCommand("start",       "Bot ကို စတင်ရန် / Menu"),
+                    BotCommand("help",        "Commands လမ်းညွှန်"),
+                    BotCommand("download",    "Single page download"),
+                    BotCommand("fullsite",    "Full website download"),
+                    BotCommand("jsdownload",  "JS/React/Vue site download"),
+                    BotCommand("jsfullsite",  "JS + Full crawl"),
+                    BotCommand("resume",      "Download ဆက်လုပ်ရန်"),
+                    BotCommand("stop",        "Download ရပ်ရန်"),
+                    BotCommand("vuln",        "Security vulnerability scan"),
+                    BotCommand("api",         "API endpoint discovery"),
+                    BotCommand("tech",        "Tech stack fingerprint"),
+                    BotCommand("extract",     "Secret & key scanner"),
+                    BotCommand("sitekey",     "Captcha key extractor"),
+                    BotCommand("antibot",     "Anti-bot bypass tester"),
+                    BotCommand("jwtattack",   "JWT decode & attack"),
+                    BotCommand("keydump",     "All-in-one key dump"),
+                    BotCommand("apikeys",     "API key extractor"),
+                    BotCommand("firebase",    "Firebase config extractor"),
+                    BotCommand("paykeys",     "Payment key extractor"),
+                    BotCommand("socialkeys",  "OAuth / social key extractor"),
+                    BotCommand("analytics",   "Analytics ID extractor"),
+                    BotCommand("hiddenkeys",  "CSRF / hidden token extractor"),
+                    BotCommand("pushkeys",    "Push notification key extractor"),
+                    BotCommand("endpoints",   "REST / GraphQL endpoint finder"),
+                    BotCommand("webhooks",    "Webhook URL extractor"),
+                    BotCommand("oauthscan",   "OAuth config scanner"),
+                    BotCommand("subdomains",  "Subdomain enumeration"),
+                    BotCommand("bypass403",   "403 bypass tester"),
+                    BotCommand("fuzz",        "Path & param fuzzer"),
+                    BotCommand("smartfuzz",   "Context-aware smart fuzzer"),
+                    BotCommand("monitor",     "Page change alert monitor"),
+                    BotCommand("appassets",   "Web app asset analyzer"),
+                    BotCommand("status",      "Daily usage & limit"),
+                    BotCommand("history",     "Download history"),
+                    BotCommand("mystats",     "Detailed statistics"),
+                ]
+                _admin_cmds = _user_cmds + [
+                    BotCommand("admin",       "Admin panel"),
+                    BotCommand("ban",         "User ban"),
+                    BotCommand("unban",       "User unban"),
+                    BotCommand("setlimit",    "Set download limit"),
+                    BotCommand("userinfo",    "User info"),
+                    BotCommand("broadcast",   "Broadcast message"),
+                    BotCommand("allusers",    "All users list"),
+                    BotCommand("setpages",    "Set max pages"),
+                    BotCommand("setassets",   "Set max assets"),
+                    BotCommand("proxy",       "Proxy pool status"),
+                    BotCommand("setforcejoin","Set force join channel"),
+                ]
+                try:
+                    await app.bot.set_my_commands(_user_cmds, scope=BotCommandScopeDefault())
+                    for adm_id in ADMIN_IDS:
+                        try:
+                            await app.bot.set_my_commands(
+                                _admin_cmds,
+                                scope=BotCommandScopeChat(chat_id=adm_id)
+                            )
+                        except Exception:
+                            pass
+                    logger.info("Bot commands registered in Telegram menu ✅")
+                except Exception as e:
+                    logger.warning("set_my_commands failed: %s", e)
 
             app.post_init = _start_background
 
