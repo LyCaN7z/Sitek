@@ -9091,10 +9091,6 @@ def _extract_csp_nonce(url: str) -> list:
 
 
 
-_SWAGGER_PATHS
-
-
-
 _SWAGGER_PATHS = [
     "/swagger.json", "/swagger.yaml", "/openapi.json",
     "/openapi.yaml", "/api-docs", "/api-docs/", "/v2/api-docs",
