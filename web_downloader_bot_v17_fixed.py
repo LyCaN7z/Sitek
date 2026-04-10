@@ -17144,6 +17144,771 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════
+# 🛡️  MISSING COMMAND HANDLERS
+# ══════════════════════════════════════════════════
+
+async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/vuln <url> — Full vulnerability scan (headers, paths, CORS, open-redirect, subdomains)"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/vuln https://example.com`\n\n"
+            "🛡️ *Scans for:*\n"
+            "  • Exposed sensitive paths (admin, .env, backups…)\n"
+            "  • Missing security headers (CSP, HSTS, X-Frame…)\n"
+            "  • CORS misconfiguration\n"
+            "  • Open redirect vulnerabilities\n"
+            "  • Clickjacking exposure\n"
+            "  • Live subdomain discovery\n\n"
+            "⚠️ _Authorized security testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🛡️ *Vuln Scan — `{domain}`*\n\n⏳ Starting scan...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(3)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🛡️ *Vuln Scan — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_vuln_scan_sync, url, progress_q)
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ Scan error: `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    report = _format_vuln_report(result)
+    try:
+        await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+
+
+async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/api <url> — Discover API endpoints (Swagger, GraphQL, Next.js routes)"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/api https://example.com`\n\n"
+            "🔍 *Discovers:*\n"
+            "  • Swagger / OpenAPI specs\n"
+            "  • GraphQL introspection\n"
+            "  • Next.js route manifest\n"
+            "  • API endpoints from HTML + JS\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔍 *API Scan — `{domain}`*\n\n⏳ Fetching specs + probing endpoints...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(3)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔍 *API Scan — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]
+    gql      = result.get("graphql", {})
+    swagger  = result.get("swagger", [])
+    next_r   = result.get("next_routes", [])
+    lines = [f"🔍 *API Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"📡 Endpoints found: `{len(findings)}`",
+             f"📄 OpenAPI specs: `{len(swagger)}`",
+             f"🔮 GraphQL: `{'✅ Exposed' if gql.get('vulnerable') else '❌ Not found'}`",
+             f"📦 Next.js routes: `{len(next_r)}`", ""]
+    if gql.get("vulnerable"):
+        lines.append(f"*🔮 GraphQL:* `{gql['endpoint']}`")
+        lines.append(f"  Types: `{'`, `'.join(gql.get('types', [])[:8])}`")
+        lines.append("")
+    if swagger:
+        lines.append("*📄 OpenAPI Specs:*")
+        for s in swagger[:3]:
+            lines.append(f"  • `{s['spec_url']}`  ({len(s.get('endpoints', []))} endpoints)")
+        lines.append("")
+    by_type = {}
+    for f in findings:
+        by_type.setdefault(f["type"], []).append(f["endpoint"])
+    for t, eps in list(by_type.items())[:8]:
+        lines.append(f"*{t}* (`{len(eps)}`):")
+        for ep in eps[:5]:
+            lines.append(f"  `{ep[:80]}`")
+        lines.append("")
+    lines.append("⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+
+
+async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/fuzz <url> [mode] — Directory/file fuzzer (modes: common, api, backup, admin)"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/fuzz https://example.com [mode]`\n\n"
+            "🧪 *Modes:*\n"
+            "  `common` — common paths (default)\n"
+            "  `api`    — API endpoints\n"
+            "  `backup` — backup files (.bak, .old…)\n"
+            "  `admin`  — admin panels\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url  = context.args[0].strip()
+    mode = context.args[1].strip().lower() if len(context.args) > 1 else "common"
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🧪 *Fuzzing — `{domain}`* (`{mode}` mode)\n\n⏳ Starting...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(3)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🧪 *Fuzzing — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        found, baseline = await asyncio.to_thread(_fuzz_sync, url, mode, progress_q)
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if not found:
+        await msg.edit_text(
+            f"🧪 *Fuzzer — `{domain}`*\n\n📭 No interesting paths found.\n"
+            f"_(Baseline: `{baseline}`)_", parse_mode='Markdown')
+        return
+    lines = [f"🧪 *Fuzzer — `{domain}`* (`{mode}`)", "━━━━━━━━━━━━━━━━━━━━",
+             f"✅ Found: `{len(found)}` paths\n"]
+    for h in found[:30]:
+        icon = "🔓" if not h.get("gated") else "🔒"
+        lines.append(f"{icon} `{h['status']}` `{h['url'].replace(url, '')[:60]}` ({h['size']}B)")
+    if len(found) > 30:
+        lines.append(f"\n_…and `{len(found)-30}` more_")
+    lines.append("\n⚠️ _Authorized testing only_")
+    report = "\n".join(lines)
+    try:
+        await msg.edit_text(report[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
+
+
+async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/smartfuzz <url> — AI-assisted smart fuzzer (crawls page to build custom wordlist)"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/smartfuzz https://example.com`\n\n"
+            "🤖 *Smart Fuzzer:*\n"
+            "  • Crawls target page to extract keywords\n"
+            "  • Builds custom wordlist from JS/HTML\n"
+            "  • Probes with backup extension variants\n"
+            "  • Response-diff filtering (no false positives)\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🤖 *SmartFuzz — `{domain}`*\n\n⏳ Crawling page to build wordlist...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(3)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🤖 *SmartFuzz — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        def _run():
+            try:
+                r = requests.get(url, timeout=10, verify=False, headers=_get_headers(),
+                                 proxies=proxy_manager.get_proxy())
+                words = list(dict.fromkeys(re.findall(r'/([a-zA-Z0-9_\-]{3,30})', r.text)))[:200]
+            except Exception:
+                words = ["api", "admin", "login", "user", "config", "static", "assets"]
+            progress_q.append(f"🧠 Wordlist built: `{len(words)}` words — probing...")
+            return _smartfuzz_probe_sync(url, words, lambda t: progress_q.append(t))
+        found = await asyncio.to_thread(_run)
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if not found:
+        await msg.edit_text(f"🤖 *SmartFuzz — `{domain}`*\n\n📭 No interesting paths found.", parse_mode='Markdown')
+        return
+    lines = [f"🤖 *SmartFuzz — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"✅ Found: `{len(found)}` paths\n"]
+    for h in found[:30]:
+        icon = "🔓" if not h.get("gated") else "🔒"
+        lines.append(f"{icon} `{h['status']}` `/{h['word']}` ({h['size']}B)")
+    if len(found) > 30:
+        lines.append(f"\n_…and `{len(found)-30}` more_")
+    lines.append("\n⚠️ _Authorized testing only_")
+    try:
+        await msg.edit_text("\n".join(lines)[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text("\n".join(lines)[:4000], parse_mode='Markdown')
+
+
+async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/jwtattack <token> — JWT attack suite (none alg, alg confusion, brute force, kid injection)"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/jwtattack <JWT_token>`\n\n"
+            "🔐 *Attacks performed:*\n"
+            "  • Decode header + payload\n"
+            "  • `alg:none` bypass\n"
+            "  • Algorithm confusion (RS256→HS256)\n"
+            "  • Secret brute-force (common wordlist)\n"
+            "  • `kid` header injection\n"
+            "  • Expiry forgery\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    token = context.args[0].strip()
+    if not token.startswith("eyJ"):
+        await update.effective_message.reply_text(
+            "❌ Not a valid JWT — must start with `eyJ`", parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    msg = await update.effective_message.reply_text("🔐 *JWT Attack Suite*\n\n⏳ Running attacks...", parse_mode='Markdown')
+    def _run():
+        decoded   = _jwt_decode_payload(token)
+        none_atk  = _jwt_none_attack(token)
+        alg_atk   = _jwt_alg_confusion(token)
+        brute_atk = _jwt_brute_force(token)
+        kid_atk   = _jwt_kid_injection(token)
+        exp_atk   = _jwt_exp_forgery(token)
+        return decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk
+    try:
+        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await asyncio.to_thread(_run)
+    except Exception as e:
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    lines = ["🔐 *JWT Attack Report*", "━━━━━━━━━━━━━━━━━━━━"]
+    if not decoded.get("error"):
+        hdr = decoded.get("header", {})
+        pay = decoded.get("payload", {})
+        lines += [f"*Algorithm:* `{hdr.get('alg','?')}`",
+                  f"*Subject:* `{pay.get('sub', pay.get('user_id', '–'))}`",
+                  f"*Issuer:* `{pay.get('iss','–')}`",
+                  f"*Expires:* `{pay.get('exp','–')}`", ""]
+    lines.append(f"🔓 *alg:none* — {'✅ VULNERABLE' if none_atk.get('success') else '❌ Blocked'}")
+    lines.append(f"🔀 *Alg Confusion* — {'✅ Token crafted' if alg_atk.get('success') else '❌ N/A'}")
+    if brute_atk.get("cracked"):
+        lines.append(f"💥 *Brute Force* — ✅ Secret: `{brute_atk['secret']}`")
+    else:
+        lines.append("🔑 *Brute Force* — ❌ Not cracked")
+    lines.append(f"💉 *kid Injection* — {'✅ Payloads generated' if kid_atk.get('success') else '❌ No kid header'}")
+    lines.append(f"⏰ *Exp Forgery* — {'✅ Token crafted' if exp_atk.get('success') else '❌ N/A'}")
+    lines.append("\n⚠️ _Authorized testing only_")
+    try:
+        await msg.edit_text("\n".join(lines)[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text("\n".join(lines)[:4000], parse_mode='Markdown')
+
+
+async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hiddenkeys <url> — Extract hidden CSRF tokens, nonces, meta tokens from DOM"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/hiddenkeys https://example.com`\n\n"
+            "🔑 *Extracts:*\n"
+            "  • CSRF / XSRF tokens (22 frameworks)\n"
+            "  • Meta tag tokens + CSP nonces\n"
+            "  • Hidden form inputs\n"
+            "  • localStorage / sessionStorage tokens\n"
+            "  • Service worker keys\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔑 *Hidden Keys — `{domain}`*\n\n⏳ Scanning DOM...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔑 *Hidden Keys — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_hiddenkeys_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]
+    if not findings:
+        await msg.edit_text(f"🔑 *Hidden Keys — `{domain}`*\n\n📭 No hidden tokens found.", parse_mode='Markdown')
+        return
+    lines = [f"🔑 *Hidden Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"✅ Found: `{len(findings)}`\n"]
+    for i, f in enumerate(findings[:25], 1):
+        lines.append(f"*[{i}]* `{f['type']}`")
+        lines.append(f"  Name: `{f.get('name','–')[:40]}`")
+        lines.append(f"  Value: `{f['value'][:60]}`")
+        lines.append(f"  _Source: {f.get('source','')[:40]}_\n")
+    lines.append("⚠️ _Authorized testing only_")
+    try:
+        await msg.edit_text("\n".join(lines)[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text("\n".join(lines)[:4000], parse_mode='Markdown')
+
+
+async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/endpoints <url> — Discover all API endpoints from JS, Swagger, GraphQL, Next.js"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/endpoints https://example.com`\n\n"
+            "📡 *Discovers API endpoints from:*\n"
+            "  • Inline + external JavaScript\n"
+            "  • Swagger / OpenAPI specs\n"
+            "  • GraphQL introspection\n"
+            "  • Next.js build manifest\n"
+            "  • Network requests (Playwright)\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"📡 *Endpoint Discovery — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"📡 *Endpoints — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]
+    if not findings:
+        await msg.edit_text(f"📡 *Endpoints — `{domain}`*\n\n📭 No endpoints found.", parse_mode='Markdown')
+        return
+    lines = [f"📡 *Endpoints — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"✅ Found: `{len(findings)}`\n"]
+    by_type = {}
+    for f in findings:
+        by_type.setdefault(f["type"], []).append(f["endpoint"])
+    for t, eps in list(by_type.items())[:10]:
+        lines.append(f"*{t}* (`{len(eps)}`):")
+        for ep in eps[:6]:
+            lines.append(f"  `{ep[:80]}`")
+        lines.append("")
+    lines.append("⚠️ _Authorized testing only_")
+    try:
+        await msg.edit_text("\n".join(lines)[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text("\n".join(lines)[:4000], parse_mode='Markdown')
+
+
+async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/oauthscan <url> — OAuth/OIDC misconfiguration scanner"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/oauthscan https://example.com`\n\n"
+            "🔐 *Scans for:*\n"
+            "  • Exposed client_id / client_secret\n"
+            "  • Dangerous redirect_uri values\n"
+            "  • Missing PKCE / state param (CSRF risk)\n"
+            "  • Implicit flow tokens in URL fragment\n"
+            "  • Open token endpoints\n\n"
+            "⚠️ _Authorized testing only._",
+            parse_mode='Markdown')
+        return
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+    url = context.args[0].strip()
+    if not url.startswith('http'): url = 'https://' + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{reason}`", parse_mode='Markdown')
+        return
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔐 *OAuth Scan — `{domain}`*\n\n⏳ Scanning...", parse_mode='Markdown')
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try: await msg.edit_text(f"🔐 *OAuth Scan — `{domain}`*\n\n{t}", parse_mode='Markdown')
+                except: pass
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_oauthscan_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+    if result.get("error"):
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        return
+    findings = result["findings"]
+    risks    = result.get("risks", [])
+    if not findings and not risks:
+        await msg.edit_text(f"🔐 *OAuth Scan — `{domain}`*\n\n📭 No OAuth artifacts found.", parse_mode='Markdown')
+        return
+    lines = [f"🔐 *OAuth Scan — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
+             f"✅ Found: `{len(findings)}` | ⚠️ Risks: `{len(risks)}`\n"]
+    if risks:
+        lines.append("*⚠️ Risk Findings:*")
+        for r in risks[:5]:
+            lines.append(f"  🟠 `{r}`")
+        lines.append("")
+    for i, f in enumerate(findings[:20], 1):
+        lines.append(f"*[{i}]* `{f['type']}`")
+        lines.append(f"  `{f['value'][:80]}`")
+        if f.get("risk"):
+            lines.append(f"  ⚠️ `{f['risk']}`")
+        lines.append("")
+    lines.append("⚠️ _Authorized testing only_")
+    try:
+        await msg.edit_text("\n".join(lines)[:4000], parse_mode='Markdown')
+    except BadRequest:
+        await update.effective_message.reply_text("\n".join(lines)[:4000], parse_mode='Markdown')
+
+
+# ── Admin handlers ────────────────────────────────────────────────────
+
+@admin_only
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin — Admin panel"""
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text("🔒 Private chat only.")
+        return
+    db = await db_read()
+    await _send_admin_panel(update.effective_message, db)
+
+
+@admin_only
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/ban <user_id> — Ban a user"""
+    if not context.args:
+        await update.effective_message.reply_text("📌 Usage: `/ban <user_id>`", parse_mode='Markdown')
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid user ID.", parse_mode='Markdown')
+        return
+    async with db_lock:
+        db = _load_db_sync()
+        if str(target) not in db["users"]:
+            await update.effective_message.reply_text(f"❌ User `{target}` not found.", parse_mode='Markdown')
+            return
+        db["users"][str(target)]["banned"] = True
+        _save_db_sync(db)
+    await update.effective_message.reply_text(f"🚫 User `{target}` banned.", parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unban <user_id> — Unban a user"""
+    if not context.args:
+        await update.effective_message.reply_text("📌 Usage: `/unban <user_id>`", parse_mode='Markdown')
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid user ID.", parse_mode='Markdown')
+        return
+    async with db_lock:
+        db = _load_db_sync()
+        if str(target) not in db["users"]:
+            await update.effective_message.reply_text(f"❌ User `{target}` not found.", parse_mode='Markdown')
+            return
+        db["users"][str(target)]["banned"] = False
+        _save_db_sync(db)
+    await update.effective_message.reply_text(f"✅ User `{target}` unbanned.", parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setlimit global <n> | /setlimit <user_id> <n> — Set daily download limit"""
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "📌 Usage:\n`/setlimit global <n>` — set global limit\n"
+            "`/setlimit <user_id> <n>` — set per-user limit", parse_mode='Markdown')
+        return
+    try:
+        n = int(context.args[1])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Limit must be a number.", parse_mode='Markdown')
+        return
+    async with db_lock:
+        db = _load_db_sync()
+        if context.args[0].lower() == "global":
+            db["settings"]["global_daily_limit"] = n
+            _save_db_sync(db)
+            await update.effective_message.reply_text(f"✅ Global daily limit set to `{n}`.", parse_mode='Markdown')
+        else:
+            try:
+                uid = int(context.args[0])
+            except ValueError:
+                await update.effective_message.reply_text("❌ Invalid user ID.", parse_mode='Markdown')
+                return
+            if str(uid) not in db["users"]:
+                await update.effective_message.reply_text(f"❌ User `{uid}` not found.", parse_mode='Markdown')
+                return
+            db["users"][str(uid)]["custom_limit"] = n
+            _save_db_sync(db)
+            await update.effective_message.reply_text(f"✅ User `{uid}` limit set to `{n}`.", parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_userinfo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/userinfo <user_id> — Show user info"""
+    if not context.args:
+        await update.effective_message.reply_text("📌 Usage: `/userinfo <user_id>`", parse_mode='Markdown')
+        return
+    try:
+        target = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Invalid user ID.", parse_mode='Markdown')
+        return
+    db = await db_read()
+    u  = db["users"].get(str(target))
+    if not u:
+        await update.effective_message.reply_text(f"❌ User `{target}` not found.", parse_mode='Markdown')
+        return
+    today   = str(date.today())
+    lines = [
+        f"👤 *User Info — `{target}`*",
+        f"Name: `{u.get('name','–')}`",
+        f"Banned: `{'Yes 🚫' if u.get('banned') else 'No ✅'}`",
+        f"Total DLs: `{u.get('total_downloads', 0)}`",
+        f"Today DLs: `{u.get('count_today', 0)}`",
+        f"Last active: `{u.get('last_date', '–')}`",
+        f"Custom limit: `{u.get('custom_limit', 'default')}`",
+    ]
+    await update.effective_message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast <message> — Broadcast message to all users"""
+    if not context.args:
+        await update.effective_message.reply_text("📌 Usage: `/broadcast <message>`", parse_mode='Markdown')
+        return
+    text = " ".join(context.args)
+    db   = await db_read()
+    uids = list(db["users"].keys())
+    msg  = await update.effective_message.reply_text(f"📢 Broadcasting to `{len(uids)}` users...", parse_mode='Markdown')
+    ok = fail = 0
+    for uid_str in uids:
+        try:
+            await context.bot.send_message(chat_id=int(uid_str), text=f"📢 *Broadcast:*\n\n{text}", parse_mode='Markdown')
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await msg.edit_text(f"✅ Sent: `{ok}` | ❌ Failed: `{fail}`", parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_allusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/allusers — List all registered users"""
+    db    = await db_read()
+    users = list(db["users"].items())
+    if not users:
+        await update.effective_message.reply_text("👥 No users registered yet.", parse_mode='Markdown')
+        return
+    lines = [f"👥 *All Users ({len(users)}):*\n"]
+    for uid_str, u in users[:50]:
+        icon = "🚫" if u.get("banned") else "✅"
+        lines.append(f"{icon} `{uid_str}` — {u.get('name','?')} | {u.get('total_downloads',0)} DL")
+    if len(users) > 50:
+        lines.append(f"\n_…and {len(users)-50} more_")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_setpages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setpages <n> — Set max pages per crawl"""
+    if not context.args:
+        await update.effective_message.reply_text("📌 Usage: `/setpages <n>`", parse_mode='Markdown')
+        return
+    try:
+        n = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Must be a number.", parse_mode='Markdown')
+        return
+    async with db_lock:
+        db = _load_db_sync()
+        db["settings"]["max_pages"] = n
+        _save_db_sync(db)
+    await update.effective_message.reply_text(f"✅ Max pages set to `{n}`.", parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_setassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setassets <n> — Set max assets per download"""
+    if not context.args:
+        await update.effective_message.reply_text("📌 Usage: `/setassets <n>`", parse_mode='Markdown')
+        return
+    try:
+        n = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Must be a number.", parse_mode='Markdown')
+        return
+    async with db_lock:
+        db = _load_db_sync()
+        db["settings"]["max_assets"] = n
+        _save_db_sync(db)
+    await update.effective_message.reply_text(f"✅ Max assets set to `{n}`.", parse_mode='Markdown')
+
+
+@admin_only
+async def cmd_setforcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setforcejoin <@channel|off> — Require channel membership before using bot"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 Usage:\n`/setforcejoin @channel` — enable\n`/setforcejoin off` — disable",
+            parse_mode='Markdown')
+        return
+    val = context.args[0].strip()
+    async with db_lock:
+        db = _load_db_sync()
+        if val.lower() == "off":
+            db["settings"]["force_join"] = None
+            _save_db_sync(db)
+            await update.effective_message.reply_text("✅ Force-join disabled.", parse_mode='Markdown')
+        else:
+            channel = val if val.startswith("@") else "@" + val
+            db["settings"]["force_join"] = channel
+            _save_db_sync(db)
+            await update.effective_message.reply_text(
+                f"✅ Force-join enabled: `{channel}`\n"
+                "Make sure the bot is an admin in that channel.", parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
 # 🚀  MAIN
 # ══════════════════════════════════════════════════
 
