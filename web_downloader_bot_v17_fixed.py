@@ -7166,17 +7166,146 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 window.chrome = {runtime: {}};
             """)
 
+            # ── BUG FIX 1: Hook injected BEFORE page.goto via add_init_script ──
+            # Previously injected AFTER goto → missed ALL initial page load requests.
+            # add_init_script runs before any page JS on every navigation.
+            ctx.add_init_script("""
+                window.__streamLog = [];
+                const _log = (entry) => { window.__streamLog.push(entry); };
+
+                // fetch() hook
+                const _origFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const req = args[0];
+                    const opts = args[1] || {};
+                    const url  = (req instanceof Request) ? req.url : String(req);
+                    const method = opts.method || (req instanceof Request ? req.method : 'GET');
+                    const headers = {};
+                    try {
+                        const h = (req instanceof Request) ? req.headers : new Headers(opts.headers || {});
+                        h.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+                    } catch(e) {}
+                    const bodySnip = typeof opts.body === 'string' ? opts.body.slice(0,1000) :
+                                     (opts.body instanceof URLSearchParams ? opts.body.toString().slice(0,1000) : '');
+                    _log({type:'fetch', url, method, headers, body: bodySnip, ts: Date.now()});
+
+                    const resp = await _origFetch.apply(this, args);
+                    // BUG FIX 2: store body synchronously in __responseLog to avoid
+                    // async .then() race condition — read after networkidle wait
+                    try {
+                        const ct = resp.headers.get('content-type') || '';
+                        if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                            const clone = resp.clone();
+                            clone.text().then(t => {
+                                window.__streamLog.push({
+                                    type:'fetch_response', url,
+                                    status: resp.status, content_type: ct,
+                                    body: t.slice(0, 4000), ts: Date.now()
+                                });
+                            }).catch(()=>{});
+                        }
+                    } catch(e) {}
+                    return resp;
+                };
+
+                // XMLHttpRequest hook
+                const _origXHR = window.XMLHttpRequest;
+                function PatchedXHR() {
+                    const xhr = new _origXHR();
+                    const meta = {url:'', method:'GET', headers:{}};
+                    xhr.open = function(m, u, ...rest) {
+                        meta.method = m; meta.url = u;
+                        return _origXHR.prototype.open.apply(xhr, [m, u, ...rest]);
+                    };
+                    xhr.setRequestHeader = function(k, v) {
+                        meta.headers[k.toLowerCase()] = v;
+                        return _origXHR.prototype.setRequestHeader.apply(xhr, [k, v]);
+                    };
+                    xhr.send = function(body) {
+                        _log({type:'xhr', url: meta.url, method: meta.method,
+                              headers: meta.headers,
+                              body: (typeof body === 'string' ? body.slice(0,1000) : ''),
+                              ts: Date.now()});
+                        xhr.addEventListener('load', function() {
+                            const ct = xhr.getResponseHeader('content-type') || '';
+                            if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                                _log({type:'xhr_response', url: meta.url, status: xhr.status,
+                                      content_type: ct, body: xhr.responseText.slice(0,4000),
+                                      ts: Date.now()});
+                            }
+                        });
+                        return _origXHR.prototype.send.apply(xhr, [body]);
+                    };
+                    return xhr;
+                }
+                PatchedXHR.prototype = _origXHR.prototype;
+                window.XMLHttpRequest = PatchedXHR;
+
+                // EventSource (SSE) hook
+                const _origES = window.EventSource;
+                if (_origES) {
+                    window.EventSource = function(url, opts) {
+                        const es = new _origES(url, opts);
+                        _log({type:'sse_open', url, ts: Date.now()});
+                        es.addEventListener('message', function(e) {
+                            _log({type:'sse_message', url,
+                                  data: String(e.data).slice(0,2000), ts: Date.now()});
+                        });
+                        return es;
+                    };
+                    window.EventSource.prototype = _origES.prototype;
+                }
+
+                // sendBeacon hook
+                const _origBeacon = navigator.sendBeacon.bind(navigator);
+                navigator.sendBeacon = function(url, data) {
+                    _log({type:'beacon', url,
+                          body: (data ? String(data).slice(0,500) : ''), ts: Date.now()});
+                    return _origBeacon(url, data);
+                };
+            """)
+
             page = ctx.new_page()
 
-            # ── Playwright-level response header capture (double-coverage) ──
+            # ── BUG FIX 3: Playwright-level response body capture ─────────────
+            # JS hook can miss responses due to async race; Playwright-level
+            # capture is synchronous and reliable — used as primary source.
             _plw_request_headers = {}
+            _plw_response_bodies = {}   # url → body text
+
             def _on_request_headers(req):
                 try:
                     hdrs = {k.lower(): v for k, v in req.all_headers().items()}
                     _plw_request_headers[req.url] = hdrs
                 except Exception:
                     pass
-            page.on("request", _on_request_headers)
+
+            def _on_response(resp):
+                try:
+                    ct = (resp.headers.get("content-type") or "").lower()
+                    if any(x in ct for x in ("json", "text", "javascript")):
+                        body = resp.body()          # synchronous bytes
+                        text = body.decode("utf-8", errors="replace")[:4000]
+                        _plw_response_bodies[resp.url] = text
+                except Exception:
+                    pass
+
+            # ── BUG FIX 4: WebSocket frame capture at Playwright level ─────────
+            _ws_frames = []
+            def _on_websocket(ws):
+                ws_url = ws.url
+                def _on_frame_sent(payload):
+                    _ws_frames.append({"dir": "sent", "url": ws_url,
+                                       "payload": str(payload)[:2000]})
+                def _on_frame_recv(payload):
+                    _ws_frames.append({"dir": "recv", "url": ws_url,
+                                       "payload": str(payload)[:2000]})
+                ws.on("framesent",    _on_frame_sent)
+                ws.on("framereceived", _on_frame_recv)
+
+            page.on("request",   _on_request_headers)
+            page.on("response",  _on_response)
+            page.on("websocket", _on_websocket)
 
             # ── Load page ──────────────────────────────────────────────────
             try:
@@ -7189,15 +7318,9 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 return {"error": str(e), "live_requests": [], "live_findings": [],
                         "sse_frames": [], "page_url": url}
 
-            # ── Inject JS hooks ────────────────────────────────────────────
-            try:
-                page.evaluate(_STREAM_INTERCEPT_JS)
-            except Exception as e:
-                if progress_cb:
-                    progress_cb(f"⚠️ JS hook inject failed: {e}")
-
+            # Hook already running via add_init_script — no separate inject needed
             if progress_cb:
-                progress_cb("🔴 Hooks injected — simulating user interactions...")
+                progress_cb("🔴 Hooks active — simulating user interactions...")
 
             # ── Trigger real network activity ──────────────────────────────
             try:
@@ -7233,12 +7356,13 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                 except Exception:
                     pass
 
-            # Wait for async API calls to settle
+            # Wait for async API calls and async fetch .then() to settle
             try:
                 page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:
                 pass
-            page.wait_for_timeout(2000)
+            # Extra wait so fetch_response async .then() callbacks flush to __streamLog
+            page.wait_for_timeout(3000)
 
             # ── Read JS hook log ───────────────────────────────────────────
             try:
@@ -7248,15 +7372,26 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
 
             browser.close()
 
-        # ── Merge Playwright-level header data with JS hook log ────────────
-        # Add real request headers captured at Playwright level
+        # ── Merge: Playwright headers + Playwright response bodies + JS log ──
         for entry in raw_log:
             u = entry.get("url", "")
+            # Upgrade headers from Playwright-level capture (more complete)
             if u in _plw_request_headers:
-                plw_hdrs = _plw_request_headers[u]
-                hook_hdrs = entry.get("headers", {})
-                merged = {**plw_hdrs, **hook_hdrs}
-                entry["headers"] = merged
+                entry["headers"] = {**_plw_request_headers[u], **entry.get("headers", {})}
+            # For fetch/xhr entries, attach Playwright-level response body
+            # as fallback when JS async .then() body is empty
+            if entry.get("type") in ("fetch", "xhr") and u in _plw_response_bodies:
+                if not entry.get("body"):
+                    entry["body"] = _plw_response_bodies[u]
+
+        # Also create synthetic response entries from Playwright bodies
+        # for any URL that JS hook missed entirely (happened before hook ran)
+        js_seen_urls = {e.get("url","") for e in raw_log}
+        for u, body in _plw_response_bodies.items():
+            if u not in js_seen_urls and body:
+                raw_log.append({"type": "fetch_response", "url": u,
+                                 "body": body, "headers": _plw_request_headers.get(u, {}),
+                                 "status": 200, "source": "playwright_level"})
 
         # ── Separate SSE frames ────────────────────────────────────────────
         for entry in raw_log:
@@ -7268,8 +7403,9 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
 
         if progress_cb:
             progress_cb(
-                f"🔴 Captured: `{len(live_requests)}` live requests | "
-                f"`{len(sse_frames)}` SSE frames"
+                f"🔴 Captured: `{len(live_requests)}` requests | "
+                f"`{len(sse_frames)}` SSE | `{len(_ws_frames)}` WS frames | "
+                f"`{len(_plw_response_bodies)}` response bodies"
             )
 
         # ── Extract secrets from live traffic ──────────────────────────────
@@ -7331,14 +7467,41 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     val = m.group(1) if m.lastindex else m.group(0)
                     _add_live(label, val.strip(), src, confidence="MEDIUM")
 
+        # 4. WebSocket frames (Playwright-level capture — missed nothing)
+        for wsf in _ws_frames:
+            payload = wsf.get("payload", "")
+            if not payload:
+                continue
+            src = f"WS {wsf.get('dir','')[:4].upper()} → {wsf.get('url','')[:60]}"
+            for label, pat in _patterns:
+                for m in pat.finditer(payload):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add_live(label, val.strip(), src, confidence="HIGH")
+            # JWT in WS payload always HIGH
+            for jm in re.finditer(r'(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)',
+                                   payload):
+                _add_live("Live JWT (WebSocket)", jm.group(1), src, confidence="HIGH")
+
+        # 5. Scan Playwright-level response bodies directly (most reliable)
+        for u, body in _plw_response_bodies.items():
+            src = f"Response body → {u[:60]}"
+            for label, pat in _patterns:
+                for m in pat.finditer(body):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add_live(label, val.strip(), src, confidence="HIGH")
+
         if progress_cb:
-            progress_cb(f"🔴 Live findings: `{len(live_findings)}` secrets extracted from stream")
+            progress_cb(
+                f"🔴 Live findings: `{len(live_findings)}` secrets | "
+                f"`{len(_ws_frames)}` WS frames scanned"
+            )
 
         return {
             "error":         None,
             "live_requests": live_requests,
             "live_findings": live_findings,
             "sse_frames":    sse_frames,
+            "ws_frames":     _ws_frames,
             "page_url":      page_url_ref[0],
         }
 
