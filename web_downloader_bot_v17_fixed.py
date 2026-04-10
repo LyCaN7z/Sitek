@@ -8260,7 +8260,7 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
         progress_cb("🔬 Scanning process.env / import.meta.env injections...")
     env_findings = _scan_env_injections(data.get("network_log", []))
     for ef in env_findings:
-        _add(ef["type"], ef.get("name", ef["type"]), ef["value"], ef["source"])
+        _add(ef["type"], f"{ef.get('name', ef['type'])}={ef['value']}", ef["source"])
 
     # Phase 3 Fix 4: WASM binary secret scan
     if progress_cb:
