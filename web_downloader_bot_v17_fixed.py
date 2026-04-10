@@ -5811,7 +5811,7 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
 
     sub_paths = [
         "/contact", "/donate", "/checkout", "/payment",
-        "/register", "/signup", "/login", "/cart",
+        "/register", "/signup", "/login", "/cart", "/donation",
         "/get-involved", "/give", "/contribute",
         # v18.1 additions
         "/pricing", "/plans", "/subscribe", "/membership",
@@ -6744,6 +6744,488 @@ def _gather_all_text(data: dict) -> list:
             texts.append((entry["post_data"], f"POST → {entry['url'][:60]}"))
     if data.get("console_log"):
         texts.append(("\n".join(data["console_log"]), "Console logs"))
+    return texts
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 🔴  REAL-TIME NETWORK STREAM INTERCEPTOR  (False-positive reducer)
+#
+#  ယခင် engine: JS/HTML static scan → key ပါရင် report တက်
+#  ဒီ engine:   Live XHR/Fetch hook → actual request မှာ သုံးနေမှ HIGH
+#
+#  လုပ်ဆောင်ချက်:
+#   1. JS-level fetch/XHR monkey-patch → request headers + bodies ဖမ်း
+#   2. SSE (EventSource) stream frames ဖမ်း
+#   3. WebSocket send frames ဖမ်း (existing ws hook နဲ့ merge)
+#   4. Confidence scoring: static hit + live usage = CONFIRMED
+#   5. _gather_all_text_v2 → live data ပါ merge ထည့်
+# ══════════════════════════════════════════════════════════════════════
+
+# JS hook — page ထဲ inject လုပ်ပြီး fetch/XHR/SSE တိုင်းကို intercept
+_STREAM_INTERCEPT_JS = """
+() => {
+    window.__streamLog = window.__streamLog || [];
+    const _log = (entry) => { window.__streamLog.push(entry); };
+
+    // ── 1. fetch() hook ────────────────────────────────────────────
+    const _origFetch = window.fetch;
+    window.fetch = async function(...args) {
+        const req = args[0];
+        const opts = args[1] || {};
+        const url  = (req instanceof Request) ? req.url : String(req);
+        const method = opts.method || (req instanceof Request ? req.method : 'GET');
+        const headers = {};
+        try {
+            const h = (req instanceof Request) ? req.headers : new Headers(opts.headers || {});
+            h.forEach((v, k) => { headers[k.toLowerCase()] = v; });
+        } catch(e) {}
+        const bodySnip = typeof opts.body === 'string' ? opts.body.slice(0,500) :
+                         (opts.body instanceof URLSearchParams ? opts.body.toString().slice(0,500) : '');
+        _log({type:'fetch', url, method, headers, body: bodySnip, ts: Date.now()});
+
+        const resp = await _origFetch.apply(this, args);
+        try {
+            const ct = resp.headers.get('content-type') || '';
+            if (ct.includes('json') || ct.includes('text')) {
+                const clone = resp.clone();
+                clone.text().then(t => {
+                    _log({type:'fetch_response', url, status: resp.status,
+                          content_type: ct, body: t.slice(0,2000), ts: Date.now()});
+                }).catch(()=>{});
+            }
+        } catch(e) {}
+        return resp;
+    };
+
+    // ── 2. XMLHttpRequest hook ─────────────────────────────────────
+    const _origXHR = window.XMLHttpRequest;
+    function PatchedXHR() {
+        const xhr = new _origXHR();
+        const meta = {url:'', method:'GET', headers:{}};
+        const _origOpen = xhr.open.bind(xhr);
+        const _origSend = xhr.send.bind(xhr);
+        const _origSetHdr = xhr.setRequestHeader.bind(xhr);
+        xhr.open = function(m, u, ...rest) {
+            meta.method = m; meta.url = u;
+            return _origOpen(m, u, ...rest);
+        };
+        xhr.setRequestHeader = function(k, v) {
+            meta.headers[k.toLowerCase()] = v;
+            return _origSetHdr(k, v);
+        };
+        xhr.send = function(body) {
+            _log({type:'xhr', url: meta.url, method: meta.method,
+                  headers: meta.headers,
+                  body: (typeof body === 'string' ? body.slice(0,500) : ''),
+                  ts: Date.now()});
+            xhr.addEventListener('load', function() {
+                const ct = xhr.getResponseHeader('content-type') || '';
+                if (ct.includes('json') || ct.includes('text')) {
+                    _log({type:'xhr_response', url: meta.url, status: xhr.status,
+                          content_type: ct, body: xhr.responseText.slice(0,2000),
+                          ts: Date.now()});
+                }
+            });
+            return _origSend(body);
+        };
+        return xhr;
+    }
+    PatchedXHR.prototype = _origXHR.prototype;
+    window.XMLHttpRequest = PatchedXHR;
+
+    // ── 3. EventSource (SSE) hook ──────────────────────────────────
+    const _origES = window.EventSource;
+    if (_origES) {
+        window.EventSource = function(url, opts) {
+            const es = new _origES(url, opts);
+            _log({type:'sse_open', url, ts: Date.now()});
+            es.addEventListener('message', function(e) {
+                _log({type:'sse_message', url, data: String(e.data).slice(0,1000),
+                      ts: Date.now()});
+            });
+            es.onerror = function() {
+                _log({type:'sse_error', url, ts: Date.now()});
+            };
+            return es;
+        };
+        window.EventSource.prototype = _origES.prototype;
+    }
+
+    // ── 4. navigator.sendBeacon hook ──────────────────────────────
+    const _origBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(url, data) {
+        _log({type:'beacon', url,
+              body: (data ? String(data).slice(0,300) : ''),
+              ts: Date.now()});
+        return _origBeacon(url, data);
+    };
+
+    return {status: 'hooks_installed'};
+}
+"""
+
+# Patterns to extract sensitive values FROM live request headers/bodies
+_LIVE_HEADER_PATTERNS = [
+    ("Authorization Bearer",  re.compile(r'(?i)^bearer\s+(.+)$')),
+    ("Authorization Basic",   re.compile(r'(?i)^basic\s+([A-Za-z0-9+/=]+)$')),
+    ("X-Api-Key header",      re.compile(r'.+')),          # full value if header name is x-api-key
+    ("X-Auth-Token header",   re.compile(r'.+')),
+    ("Stripe-Key header",     re.compile(r'.+')),
+]
+
+_LIVE_BODY_PATTERNS = [
+    ("Live API key",      re.compile(r'(?i)(?:api[_\-]?key|apikey|access_token|client_secret)\s*[=:&]\s*([A-Za-z0-9_\-]{16,120})')),
+    ("Live Bearer token", re.compile(r'(?i)bearer[= ]+([A-Za-z0-9_\-\.]{20,500})')),
+    ("Live JWT",          re.compile(r'(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*)')),
+    ("Live AWS key",      re.compile(r'\b(AKIA[0-9A-Z]{16})\b')),
+    ("Live Stripe key",   re.compile(r'\b((?:pk|sk|rk)_(?:live|test)_[A-Za-z0-9]{24,})\b')),
+    ("Live OpenAI key",   re.compile(r'\b(sk-[A-Za-z0-9]{20,60})\b')),
+]
+
+# Sensitive header names — any value is HIGH confidence
+_SENSITIVE_HEADERS = {
+    "authorization", "x-api-key", "x-auth-token", "x-access-token",
+    "x-secret-key", "api-key", "auth-token", "x-stripe-key",
+    "x-firebase-token", "x-rapidapi-key", "stripe-signature",
+}
+
+
+def _stream_intercept_sync(url: str, progress_cb=None) -> dict:
+    """
+    Inject fetch/XHR/SSE hooks into a live Playwright session.
+    Captures real-time network credentials — HIGH confidence findings only.
+
+    Returns:
+        {
+          "live_requests":  [...],   # all intercepted fetch/XHR entries
+          "live_findings":  [...],   # extracted secrets from live traffic
+          "sse_frames":     [...],   # SSE stream messages
+          "page_url":       str,
+          "error":          str|None,
+        }
+    """
+    if not PLAYWRIGHT_OK:
+        return {"error": "playwright_not_installed", "live_requests": [],
+                "live_findings": [], "sse_frames": [], "page_url": url}
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {"error": "playwright_not_installed", "live_requests": [],
+                "live_findings": [], "sse_frames": [], "page_url": url}
+
+    live_requests = []
+    sse_frames    = []
+    page_url_ref  = [url]
+
+    if progress_cb:
+        progress_cb("🔴 Launching real-time stream interceptor...")
+
+    try:
+        with sync_playwright() as pw:
+            _px = proxy_manager.get_proxy()
+            _pw_proxy = None
+            if _px:
+                from urllib.parse import urlparse as _up
+                _pp = _up(_px.get("http") or _px.get("https", ""))
+                _pw_proxy = {"server": f"{_pp.scheme}://{_pp.hostname}:{_pp.port}"}
+                if _pp.username:
+                    _pw_proxy["username"] = _pp.username
+                    _pw_proxy["password"] = _pp.password or ""
+
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-gpu",
+                ]
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 900},
+                ignore_https_errors=True,
+                proxy=_pw_proxy,
+                java_script_enabled=True,
+            )
+            # Stealth init
+            ctx.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins',   {get: () => [1,2,3,4,5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                window.chrome = {runtime: {}};
+            """)
+
+            page = ctx.new_page()
+
+            # ── Playwright-level response header capture (double-coverage) ──
+            _plw_request_headers = {}
+            def _on_request_headers(req):
+                try:
+                    hdrs = {k.lower(): v for k, v in req.all_headers().items()}
+                    _plw_request_headers[req.url] = hdrs
+                except Exception:
+                    pass
+            page.on("request", _on_request_headers)
+
+            # ── Load page ──────────────────────────────────────────────────
+            try:
+                page.goto(url, wait_until="load", timeout=30_000)
+                page_url_ref[0] = page.url
+            except PWTimeout:
+                page_url_ref[0] = page.url
+            except Exception as e:
+                browser.close()
+                return {"error": str(e), "live_requests": [], "live_findings": [],
+                        "sse_frames": [], "page_url": url}
+
+            # ── Inject JS hooks ────────────────────────────────────────────
+            try:
+                page.evaluate(_STREAM_INTERCEPT_JS)
+            except Exception as e:
+                if progress_cb:
+                    progress_cb(f"⚠️ JS hook inject failed: {e}")
+
+            if progress_cb:
+                progress_cb("🔴 Hooks injected — simulating user interactions...")
+
+            # ── Trigger real network activity ──────────────────────────────
+            try:
+                page.wait_for_load_state("networkidle", timeout=10_000)
+            except Exception:
+                pass
+
+            # Scroll to trigger lazy-load API calls
+            for pct in [0.25, 0.5, 0.75, 1.0]:
+                try:
+                    page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {pct})")
+                    page.wait_for_timeout(500)
+                except Exception:
+                    pass
+
+            # Click interactive elements to trigger auth'd API calls
+            _trigger_selectors = [
+                "button:not([disabled])", "[role='button']",
+                "a[href='#']", "[data-toggle]", "[data-action]",
+                "input[type='submit']", "form button",
+            ]
+            _clicks = 0
+            for sel in _trigger_selectors:
+                if _clicks >= 5:
+                    break
+                try:
+                    els = page.query_selector_all(sel)
+                    for el in els[:2]:
+                        if el.is_visible():
+                            el.click(timeout=1000)
+                            page.wait_for_timeout(400)
+                            _clicks += 1
+                except Exception:
+                    pass
+
+            # Wait for async API calls to settle
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+
+            # ── Read JS hook log ───────────────────────────────────────────
+            try:
+                raw_log = page.evaluate("() => window.__streamLog || []")
+            except Exception:
+                raw_log = []
+
+            browser.close()
+
+        # ── Merge Playwright-level header data with JS hook log ────────────
+        # Add real request headers captured at Playwright level
+        for entry in raw_log:
+            u = entry.get("url", "")
+            if u in _plw_request_headers:
+                plw_hdrs = _plw_request_headers[u]
+                hook_hdrs = entry.get("headers", {})
+                merged = {**plw_hdrs, **hook_hdrs}
+                entry["headers"] = merged
+
+        # ── Separate SSE frames ────────────────────────────────────────────
+        for entry in raw_log:
+            t = entry.get("type", "")
+            if t in ("sse_message", "sse_open"):
+                sse_frames.append(entry)
+            elif t in ("fetch", "xhr", "beacon", "fetch_response", "xhr_response"):
+                live_requests.append(entry)
+
+        if progress_cb:
+            progress_cb(
+                f"🔴 Captured: `{len(live_requests)}` live requests | "
+                f"`{len(sse_frames)}` SSE frames"
+            )
+
+        # ── Extract secrets from live traffic ──────────────────────────────
+        live_findings = []
+        seen_findings = set()
+
+        def _add_live(key_type, value, source, confidence="HIGH"):
+            dedup = key_type + ":" + value[:60]
+            if dedup in seen_findings or len(value) < 8:
+                return
+            seen_findings.add(dedup)
+            live_findings.append({
+                "type":       key_type,
+                "value":      value[:300],
+                "source":     source,
+                "confidence": confidence,
+            })
+
+        # 1. Sensitive headers → always HIGH confidence
+        for req in live_requests:
+            hdrs = req.get("headers", {})
+            u    = req.get("url", "")[:80]
+            for hdr_name, hdr_val in hdrs.items():
+                hn = hdr_name.lower()
+                if hn == "authorization":
+                    for label, pat in [
+                        ("Authorization Bearer", re.compile(r'(?i)^bearer\s+(.+)$')),
+                        ("Authorization Basic",  re.compile(r'(?i)^basic\s+([A-Za-z0-9+/=]+)$')),
+                    ]:
+                        m = pat.match(hdr_val)
+                        if m:
+                            _add_live(label, m.group(1).strip(), f"Header → {u}")
+                        else:
+                            _add_live("Authorization header", hdr_val.strip()[:200],
+                                      f"Header → {u}")
+                    break
+                elif hn in _SENSITIVE_HEADERS:
+                    _add_live(f"{hdr_name} header (live)", hdr_val.strip()[:200],
+                              f"Header → {u}")
+
+        # 2. Request bodies + response bodies
+        for req in live_requests:
+            for field in ("body", "post_data"):
+                text = req.get(field, "")
+                if not text:
+                    continue
+                src = f"{req.get('type','req').upper()} body → {req.get('url','')[:60]}"
+                for label, pat in _LIVE_BODY_PATTERNS:
+                    for m in pat.finditer(text):
+                        val = m.group(1) if m.lastindex else m.group(0)
+                        _add_live(label, val.strip(), src)
+
+        # 3. SSE stream data
+        for frame in sse_frames:
+            data = frame.get("data", "")
+            src  = f"SSE → {frame.get('url','')[:60]}"
+            for label, pat in _LIVE_BODY_PATTERNS:
+                for m in pat.finditer(data):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add_live(label, val.strip(), src, confidence="MEDIUM")
+
+        if progress_cb:
+            progress_cb(f"🔴 Live findings: `{len(live_findings)}` secrets extracted from stream")
+
+        return {
+            "error":         None,
+            "live_requests": live_requests,
+            "live_findings": live_findings,
+            "sse_frames":    sse_frames,
+            "page_url":      page_url_ref[0],
+        }
+
+    except Exception as e:
+        return {
+            "error":         str(e),
+            "live_requests": [],
+            "live_findings": [],
+            "sse_frames":    [],
+            "page_url":      url,
+        }
+
+
+def _confidence_crossref(static_findings: list, live_result: dict) -> list:
+    """
+    Cross-reference static scan findings against live network traffic.
+    Upgrades matching findings to CONFIRMED, downgrades unmatched to LOW.
+
+    Args:
+        static_findings: list of {type, value, source, ...} from static scan
+        live_result:     return value of _stream_intercept_sync()
+
+    Returns:
+        list of findings with added 'confidence' field:
+            CONFIRMED  — value seen in both static + live traffic
+            HIGH       — found only in live request headers
+            MEDIUM     — found in live body/SSE
+            STATIC     — found only in static scan (may be false positive)
+    """
+    live_values = set()
+
+    # Collect all values seen in live traffic
+    for req in live_result.get("live_requests", []):
+        for field in ("body", "post_data"):
+            text = req.get(field, "")
+            if text:
+                # Extract any 16+ char tokens
+                for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', text):
+                    live_values.add(tok)
+        for hdr_val in req.get("headers", {}).values():
+            for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', str(hdr_val)):
+                live_values.add(tok)
+
+    for frame in live_result.get("sse_frames", []):
+        for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', frame.get("data", "")):
+            live_values.add(tok)
+
+    upgraded = []
+    for f in static_findings:
+        val = f.get("value", "")
+        # Check if any 16+ char sub-token of this value appears in live traffic
+        val_tokens = set(re.findall(r'[A-Za-z0-9_\-\.]{16,}', val))
+        if val_tokens & live_values:
+            upgraded.append({**f, "confidence": "CONFIRMED ✅"})
+        else:
+            upgraded.append({**f, "confidence": "STATIC ⚠️"})
+
+    # Also include pure live findings not in static
+    static_values = {f.get("value", "")[:60] for f in static_findings}
+    for lf in live_result.get("live_findings", []):
+        if lf.get("value", "")[:60] not in static_values:
+            upgraded.append({**lf, "confidence": lf.get("confidence", "HIGH")})
+
+    return upgraded
+
+
+def _gather_all_text_v2(data: dict, live_result: dict | None = None) -> list:
+    """
+    Extended version of _gather_all_text — adds live stream bodies.
+    Drop-in replacement: if live_result is None, behaves identically.
+    """
+    texts = _gather_all_text(data)  # existing: html + JS network_log + console
+
+    if not live_result:
+        return texts
+
+    # Add live request/response bodies
+    for req in live_result.get("live_requests", []):
+        u = req.get("url", "")[:70]
+        for field, label in [("body", "Live POST"), ("post_data", "Live XHR body")]:
+            text = req.get(field, "")
+            if text and len(text) > 10:
+                texts.append((text, f"{label} → {u}"))
+
+    # Add SSE stream messages
+    sse_combined = "\n".join(
+        f.get("data", "") for f in live_result.get("sse_frames", []) if f.get("data")
+    )
+    if sse_combined:
+        texts.append((sse_combined, "SSE stream frames"))
+
     return texts
 
 
@@ -7840,49 +8322,74 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = asyncio.create_task(_prog())
     try:
         result = await asyncio.to_thread(_apikeys_sync, url, lambda t: progress_q.append(t))
+        progress_q.append("\U0001f534 Phase 2: real-time network stream intercept...")
+        live_result = await asyncio.to_thread(
+            _stream_intercept_sync, url, lambda t: progress_q.append(t)
+        )
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{e}`", parse_mode='Markdown')
+        await msg.edit_text(f"\u274c `{e}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await msg.edit_text(f"\u274c `{result['error']}`", parse_mode='Markdown')
         return
-    findings = result["findings"]
+    raw_findings = result["findings"]
+    findings = _confidence_crossref(raw_findings, live_result)
     page_url = result["page_url"]
     reqs = result.get("requests", 0)
+    live_reqs = len(live_result.get("live_requests", []))
+    confirmed   = [f for f in findings if "CONFIRMED" in f.get("confidence","")]
+    high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
+    static_only = [f for f in findings if "STATIC" in f.get("confidence","")]
     if not findings:
         await msg.edit_text(
-            f"🔑 *API Key Extractor — `{domain}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No API keys found\n🌐 `{page_url}`\n📡 Requests: `{reqs}`",
+            f"\U0001f511 *API Key Extractor \u2014 `{domain}`*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
+            f"\U0001f4ed No API keys found\n\U0001f310 `{page_url}`\n"
+            f"\U0001f4e1 Static: `{reqs}` | Live: `{live_reqs}`",
             parse_mode='Markdown')
         return
-    lines = [f"🔑 *API Keys — `{domain}`*", "━━━━━━━━━━━━━━━━━━━━",
-             f"🌐 `{page_url}`", f"📡 Requests: `{reqs}`",
-             f"✅ Found: `{len(findings)}`\n"]
-    for i, f in enumerate(findings, 1):
-        lines.append(f"*[{i}] {f['type']}*")
+    lines = [
+        f"\U0001f511 *API Keys \u2014 `{domain}`*", "\u2501"*20,
+        f"\U0001f310 `{page_url}`",
+        f"\U0001f4e1 Static: `{reqs}` | Live: `{live_reqs}` requests",
+        f"\u2705 CONFIRMED: `{len(confirmed)}` | \U0001f534 Live-only: `{len(high_live)}` | \u26a0\ufe0f Static-only: `{len(static_only)}`\n",
+    ]
+    ordered = (
+        [(f, "\u2705 CONFIRMED") for f in confirmed] +
+        [(f, "\U0001f534 LIVE")  for f in high_live] +
+        [(f, "\u26a0\ufe0f STATIC") for f in static_only]
+    )
+    for i, (f, badge) in enumerate(ordered[:25], 1):
+        lines.append(f"*[{i}]* {badge} `{f['type']}`")
         lines.append(f"  `{f['value'][:80]}`")
-        lines.append(f"  _📂 {f['source'][:60]}_\n")
-    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+        lines.append(f"  _\U0001f4c2 {f.get('source','')[:60]}_\n")
+    lines.append("\u2501"*18 + "\n\u26a0\ufe0f _Authorized testing only_")
     report = "\n".join(lines)
     try:
-        if len(report) <= 4000: await msg.edit_text(report, parse_mode='Markdown')
-        else: await msg.edit_text(report[:4000], parse_mode='Markdown')
+        await msg.edit_text(report[:4000], parse_mode='Markdown')
     except BadRequest:
         await update.effective_message.reply_text(report[:4000], parse_mode='Markdown')
     import io as _io
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d = re.sub(r'[^\w\-]', '_', domain)
-    export = {"domain": domain, "page_url": page_url, "scanned_at": datetime.now().isoformat(),
-              "findings": findings}
+    export = {
+        "domain": domain, "page_url": page_url,
+        "scanned_at": datetime.now().isoformat(),
+        "findings": findings,
+        "live_requests_captured": live_reqs,
+        "sse_frames_captured": len(live_result.get("sse_frames", [])),
+    }
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=_io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode()),
             filename=f"apikeys_{safe_d}_{ts}.json",
-            caption=f"🔑 API Keys — `{domain}` — `{len(findings)}` found",
+            caption=(
+                f"\U0001f511 API Keys \u2014 `{domain}`\n"
+                f"\u2705 Confirmed: `{len(confirmed)}` | \u26a0\ufe0f Static-only: `{len(static_only)}`"
+            ),
             parse_mode='Markdown')
     except Exception as e:
         logger.warning("apikeys export error: %s", e)
