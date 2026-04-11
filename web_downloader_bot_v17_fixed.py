@@ -5926,7 +5926,7 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     sub_paths = [
         "/contact", "/donate", "/checkout", "/payment",
         "/register", "/signup", "/login", "/cart", "/donation",
-        "/get-involved", "/give", "/contribute", "/payment",
+        "/get-involved", "/give", "/contribute",
         "/pricing", "/plans", "/subscribe", "/membership",
         "/join", "/support", "/help", "/feedback",
         "/order", "/pay", "/billing", "/upgrade",
@@ -6217,8 +6217,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         icon   = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
         badge  = f.get("confidence", "⚠️ STATIC")
         lines.append(f"*{icon} [{i}]* {badge} *{f['type']}*")
-        lines.append(f"  🔑 `site_key`  : `{f['site_key'] or 'N/A'}`")
-        lines.append(f"  🌐 `page_url`  : `{f['page_url']}`")
+        lines.append(f"  🔑 `site_key`  : `{f.get('site_key') or f.get('value') or 'N/A'}`")
+        lines.append(f"  🌐 `page_url`  : `{f.get('page_url', '')}`")
         if f.get("action"):
             lines.append(f"  ⚡ `action`     : `{f['action']}`")
         if f.get("invisible"):
@@ -6243,14 +6243,14 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  📞 `callback`   : `{f['callback']}`")
         if f.get("user_agent"):
             lines.append(f"  🖥️ `user_agent` : `{f['user_agent'][:60]}`")
-        lines.append(f"  📂 Source      : _{f['source'][:70]}_")
+        lines.append(f"  📂 Source      : _{f.get('source','')[:70]}_")
         lines.append("")
 
         # ── Solver-ready block ─────────────────────────────
         lines.append("  *📋 Solver params (copy-ready):*")
         lines.append(f"  `type`      = `{f['type']}`")
-        lines.append(f"  `sitekey`   = `{f['site_key']}`")
-        lines.append(f"  `pageurl`   = `{f['page_url']}`")
+        lines.append(f"  `sitekey`   = `{f.get('site_key') or f.get('value') or ''}`")
+        lines.append(f"  `pageurl`   = `{f.get('page_url', '')}`")
         if f.get("action"):
             lines.append(f"  `action`    = `{f['action']}`")
         if f.get("enterprise"):
@@ -12560,7 +12560,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle help_* InlineKeyboard callbacks."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass  # Query too old / expired — ignore
     data  = query.data  # e.g. "help_download"
     uid   = query.from_user.id
 
@@ -17485,7 +17488,10 @@ def analyze_app_file(filepath: str, progress_cb=None) -> dict:
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     if query.from_user.id not in ADMIN_IDS:
         await query.answer("🚫 Admin only", show_alert=True); return
     if update.effective_chat.type != "private":
@@ -18896,7 +18902,10 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /keydump inline buttons: raw, entropy, json export"""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
     data = query.data   # kd_raw_UID | kd_entropy_UID | kd_json_UID
 
     try:
@@ -19524,7 +19533,10 @@ async def check_force_join(update: Update, context) -> bool:
 async def force_join_callback(update: Update, context) -> None:
     """Handles the '✅ I Joined' button — re-checks membership."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     uid  = query.from_user.id
     db   = await db_read()
@@ -19566,7 +19578,10 @@ async def force_join_callback(update: Update, context) -> None:
 async def appassets_cat_callback(update: Update, context) -> None:
     """Handles apa_<category> inline button selections from /appassets."""
     query = update.callback_query
-    await query.answer()
+    try:
+        await query.answer()
+    except Exception:
+        pass
 
     uid  = query.from_user.id
     data = query.data  # e.g. "apa_images" or "apa_all"
