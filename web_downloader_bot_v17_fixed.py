@@ -4890,151 +4890,148 @@ def _jwt_brute_force(token: str, wordlist: list = None, progress_cb=None) -> dic
 # ───────────────────────────────────────────────────────────────────
 
 _CAPTCHA_PATTERNS = {
-
-    # ─── reCAPTCHA v2 ─────────────────────────────────────────────────────────
-    # Real Google reCAPTCHA v2 sitekeys ALWAYS start with "6L" and are 40 chars.
-    # Patterns here require that prefix to prevent cross-labeling hCaptcha/Turnstile.
+    # ── reCAPTCHA ────────────────────────────────────────────────────────────
     "reCAPTCHA v2": [
-        # data-sitekey="6Lxxxxxx..." — 6L prefix enforced
-        re.compile(r'data-sitekey=["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        # grecaptcha.render({sitekey:"6L..."})
-        re.compile(r'grecaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        # {sitekey:"6L..."} / {site_key:"6L..."}
-        re.compile(r'["\']sitekey["\']\s*:\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'["\']site_key["\']\s*:\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        # siteKey = "6L..." / siteKey: "6L..."
-        re.compile(r'siteKey\s*[=:]\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        # recaptcha/api.js?render=6Lxxx (v2 explicit render param in script URL)
-        re.compile(r'recaptcha/api\.js[^"\']*[?&]render=(' r'6L[A-Za-z0-9_\-]{38})', re.I),
+        re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{40})["\']', re.I),
+        re.compile(r'grecaptcha\.render\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
+        re.compile(r'grecaptcha_sitekey\s*=\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
+        re.compile(r'["\']sitekey["\']\s*:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'captcha[_\-]?key\s*[=:]\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
     ],
-
-    # ─── reCAPTCHA v3 ─────────────────────────────────────────────────────────
-    # v3 keys also start with "6L" — distinguish from v2 by grecaptcha.execute context.
     "reCAPTCHA v3": [
-        # grecaptcha.execute("6Lxxx", {action:...}) — canonical v3 call
-        re.compile(r'grecaptcha\.execute\s*\(\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        # grecaptcha.ready(function(){ ... execute("6L...") })
-        re.compile(r'execute\(["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        # recaptcha/api.js?render=6Lxxx (v3 uses render= in script src)
-        re.compile(r'recaptcha/(?:api|enterprise)\.js[^"\']*[?&]render=(' r'6L[A-Za-z0-9_\-]{38})', re.I),
-        # window.RECAPTCHA_SITE_KEY / NEXT_PUBLIC_RECAPTCHA_KEY = "6L..."
-        re.compile(r'(?:RECAPTCHA|RECAPTCHA_SITE|NEXT_PUBLIC_RECAPTCHA)[_A-Z]*\s*[=:]\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'grecaptcha\.execute\s*\(\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'grecaptcha\.execute\s*\(\s*([6L][A-Za-z0-9_\-]{38})\s*,', re.I),
+        re.compile(r'\/recaptcha\/api\.js\?render=([0-9A-Za-z_\-]{40})', re.I),
+        re.compile(r'["\']render["\']\s*:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
     ],
-
-    # ─── reCAPTCHA Enterprise ──────────────────────────────────────────────────
-    # Enterprise keys also begin with 6L but loaded via /recaptcha/enterprise.js
     "reCAPTCHA Enterprise": [
-        re.compile(r'enterprise\.js[^"\']*[?&]render=(' r'6L[A-Za-z0-9_\-]{38})', re.I),
-        re.compile(r'grecaptcha_enterprise\s*\.\s*(?:execute|render)\s*\(\s*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'RecaptchaEnterpriseServiceV1Beta1[^"\']*["\'](' r'6L[A-Za-z0-9_\-]{38})["\']', re.I),
+        re.compile(r'grecaptcha\.enterprise\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
+        re.compile(r'\/recaptcha\/enterprise\.js\?render=([0-9A-Za-z_\-]{40})', re.I),
+        re.compile(r'enterprise\.js[^"\']*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
     ],
-
-    # ─── hCaptcha ─────────────────────────────────────────────────────────────
-    # hCaptcha sitekeys are UUIDs: 8-4-4-4-12 hex format (lowercase).
-    # Must be checked BEFORE any generic data-sitekey scan.
     "hCaptcha": [
-        # data-sitekey="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-        re.compile(r'data-sitekey=["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-        # hcaptcha.render({sitekey:"uuid"})
-        re.compile(r'hcaptcha\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-        # {sitekey:"uuid"} in hcaptcha context
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
-        # hcaptcha.com/checksiteconfig?sitekey=uuid
-        re.compile(r'hcaptcha\.com/(?:checksiteconfig|getcaptcha|anchor)[^"\']*[?&](?:sitekey|s)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})', re.I),
-        # HCAPTCHA_SITE_KEY = "uuid"
-        re.compile(r'HCAPTCHA[_A-Z]*\s*[=:]\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
+        re.compile(r'data-sitekey=["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']', re.I),
+        re.compile(r'hcaptcha\.render\([^)]*["\']sitekey["\']\s*:\s*["\']([a-f0-9-]{36})["\']', re.I),
+        re.compile(r'window\.hcaptcha\s*=.*?["\']([a-f0-9-]{36})["\']', re.I),
+        re.compile(r'hcaptcha\.com/1/api\.js.*?(?:hl=[a-z]+&)?(?:sitekey=([a-f0-9-]{36}))', re.I),
     ],
-
-    # ─── Cloudflare Turnstile ─────────────────────────────────────────────────
-    # Turnstile sitekeys start with "0x" or "1x" followed by hex chars.
-    # Must NOT match reCAPTCHA 6L keys or hCaptcha UUIDs.
     "Cloudflare Turnstile": [
-        # data-sitekey="0x4A..." or "1x00..."
-        re.compile(r'data-sitekey=["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
-        # turnstile.render({sitekey:"0x..."})
-        re.compile(r'turnstile\.render\s*\([^)]*["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
-        # {sitekey:"0x..."} in turnstile context (require 0x/1x prefix strictly)
-        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
-        # challenges.cloudflare.com/turnstile URL sitekey param
-        re.compile(r'challenges\.cloudflare\.com/turnstile[^"\']*[?&](?:sitekey|k)=([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})', re.I),
-        # CF_TURNSTILE_SITE_KEY = "0x..."
-        re.compile(r'(?:TURNSTILE|CF_TURNSTILE)[_A-Z]*\s*[=:]\s*["\']([01]x[0-9A-Fa-f][A-Za-z0-9_\-]{18,58})["\']', re.I),
+        re.compile(r'data-sitekey=["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
+        re.compile(r'turnstile\.render\([^)]*sitekey\s*:\s*["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
+        re.compile(r'["\']sitekey["\']\s*:\s*["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
+        re.compile(r'cf-turnstile[^>]*data-sitekey=["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
+        # ★ Managed challenge (no explicit key — domain-level)
+        re.compile(r'challenges\.cloudflare\.com/cdn-cgi/challenge-platform', re.I),
     ],
-
-    # ─── FunCaptcha / Arkose Labs ─────────────────────────────────────────────
-    # Keys are UUIDs — distinguish from hCaptcha by context (public_key / ArkoseEnforcement)
     "FunCaptcha": [
-        re.compile(r'(?:public_key|data-pkey)\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
-        re.compile(r'ArkoseEnforcement\s*\([^)]*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
-        re.compile(r'arkose[_\-]?(?:labs)?[_\-]?(?:public)?[_\-]?key\s*[=:]\s*["\']([0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})["\']', re.I),
+        re.compile(r'(?:pk|data-pkey|public_key)\s*[=:]\s*["\']([A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12})["\']', re.I),
+        re.compile(r'ArkoseLabsChallenge\s*\(\s*["\']([A-Z0-9\-]{36})["\']', re.I),
+        re.compile(r'arkoselabs\.com[^"\']*["\']([A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12})["\']', re.I),
     ],
-
-    # ─── GeeTest ─────────────────────────────────────────────────────────────
-    # GeeTest gt param: 32 hex chars
     "GeeTest": [
-        re.compile(r'\bgt\s*[=:]\s*["\']([0-9a-f]{32})["\']', re.I),
-        re.compile(r'["\']gt["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
-        re.compile(r'initGeetest\s*\([^)]*gt\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'initGeetest(?:4)?\s*\([^)]*["\']gt["\']\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
+        re.compile(r'["\']captchaId["\']\s*:\s*["\']([a-f0-9]{32})["\']', re.I),
+        re.compile(r'gt\s*:\s*["\']([0-9a-f]{32})["\']', re.I),
     ],
-
-    # ─── AWS WAF Captcha ──────────────────────────────────────────────────────
-    "AWS WAF Captcha": [
-        re.compile(r'AwsWafIntegration\.getToken\s*\(\s*["\']([^"\']{10,200})["\']', re.I),
-        re.compile(r'jsapi\.token\s*[=:]\s*["\']([^"\']{10,200})["\']', re.I),
-    ],
-
-    # ─── FriendlyCaptcha ─────────────────────────────────────────────────────
-    # FriendlyCaptcha site keys start with "FC" prefix
+    # ★ NEW: FriendlyCaptcha
     "FriendlyCaptcha": [
-        re.compile(r'data-sitekey=["\'](' r'FC[A-Z0-9]{16,60})["\']', re.I),
-        re.compile(r'["\']sitekey["\']\s*:\s*["\'](' r'FC[A-Z0-9]{16,60})["\']', re.I),
-        re.compile(r'FriendlyCaptcha\s*\([^)]*["\']sitekey["\']\s*:\s*["\'](' r'FC[A-Z0-9]{16,60})["\']', re.I),
+        re.compile(r'data-sitekey=["\']([A-Z0-9FCAP_]{16,60})["\'](?=[^>]*friendly)', re.I),
+        re.compile(r'FriendlyCaptcha\s*\.[A-Za-z]+\s*\(\s*[^)]*sitekey\s*:\s*["\']([A-Z0-9]{16,60})["\']', re.I),
+        re.compile(r'friendlycaptcha\.(?:com|eu)[^"\']*sitekey=([A-Z0-9_\-]{16,60})', re.I),
+    ],
+    # ★ NEW: mCaptcha (open source)
+    "mCaptcha": [
+        re.compile(r'mCaptcha\s*\.\s*init\s*\(\s*["\']([A-Za-z0-9_]{20,60})["\']', re.I),
+        re.compile(r'data-mcaptcha-sitekey=["\']([A-Za-z0-9_]{20,60})["\']', re.I),
+    ],
+    # ★ NEW: MTCaptcha
+    "MTCaptcha": [
+        re.compile(r'mtcaptcha\.config\s*=\s*\{[^}]*sitekey\s*:\s*["\']([A-Za-z0-9_\-]{20,80})["\']', re.I),
+        re.compile(r'MTCaptchaConfig\s*=\s*\{[^}]*["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_\-]{20,80})["\']', re.I),
+    ],
+    # ★ NEW: Kasada (pure detection, no key)
+    "Kasada Bot Defense": [
+        re.compile(r'kasada\.io', re.I),
+        re.compile(r'kpsdk\.js|kcollect\.js|kprotect\.js', re.I),
+    ],
+    # ★ NEW: Akamai Bot Manager
+    "Akamai Bot Manager": [
+        re.compile(r'_abck\s*=\s*["\']([A-Za-z0-9+/=]{60,})["\']', re.I),
+        re.compile(r'sensor_data|ak_bmsc|bm_sz', re.I),
+    ],
+    # ★ NEW: DataDome
+    "DataDome": [
+        re.compile(r'tag\.datadome\.co/tags\.js', re.I),
+        re.compile(r'datadome\.co/device-check[^"\']*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+        re.compile(r'DATADOME_CLIENT_KEY\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+    ],
+    # ★ NEW: PerimeterX / HUMAN
+    "PerimeterX/HUMAN": [
+        re.compile(r'client\.px-cloud\.net/[A-Za-z0-9]+/main\.min\.js', re.I),
+        re.compile(r'px\.js\?appId=([A-Za-z0-9_\-]{8,40})', re.I),
+        re.compile(r'_pxAppId\s*[=:]\s*["\']([A-Za-z0-9_]{6,20})["\']', re.I),
+    ],
+    # ★ NEW: AWS WAF Captcha
+    "AWS WAF Captcha": [
+        re.compile(r'captcha\.us-east-1\.amazonaws\.com', re.I),
+        re.compile(r'AwsWafCaptcha\.renderCaptcha', re.I),
+        re.compile(r'awswaf-captcha-api-key\s*[=:]\s*["\']([A-Za-z0-9+/=]{20,})["\']', re.I),
+    ],
+    # ★ NEW: GoBotBlocker / Altcha (newer open-source)
+    "Altcha": [
+        re.compile(r'altcha-widget|<altcha-widget', re.I),
+        re.compile(r'altcha\.org/api/v1/challenge', re.I),
     ],
 }
 
-# ─── Priority scan order (more specific first to avoid cross-labeling) ────────
-# hCaptcha (UUID) and Turnstile (0x/1x) must resolve before generic sitekey scan.
-_CAPTCHA_SCAN_ORDER = [
-    "hCaptcha",            # UUID format — most distinct, check first
-    "FunCaptcha",          # UUID format with specific context keywords
-    "Cloudflare Turnstile",# 0x/1x prefix — check before generic sitekey
-    "FriendlyCaptcha",     # FC prefix
-    "reCAPTCHA Enterprise",# enterprise.js context
-    "reCAPTCHA v3",        # grecaptcha.execute context
-    "reCAPTCHA v2",        # grecaptcha.render / data-sitekey with 6L
-    "GeeTest",             # 32-char hex gt param
-    "AWS WAF Captcha",     # AwsWafIntegration context
-]
-
-# ─── reCAPTCHA action pattern ─────────────────────────────────────────────────
-_ACTION_PATTERNS = [
-    re.compile(r'action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
-    re.compile(r'["\']action["\']\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
-    re.compile(r'grecaptcha\.execute\s*\([^,]+,\s*\{[^}]*action\s*:\s*["\']([a-zA-Z0-9_\/]{2,60})["\']', re.I),
-]
-
-# ─── Script src signatures ────────────────────────────────────────────────────
-_CAPTCHA_SCRIPT_SIGS = {
-    "reCAPTCHA":         ["google.com/recaptcha", "recaptcha/api.js"],
-    "reCAPTCHA Enterprise": ["recaptcha/enterprise.js"],
-    "hCaptcha":          ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
-    "Turnstile":         ["challenges.cloudflare.com/turnstile"],
-    "FunCaptcha":        ["funcaptcha.com", "arkoselabs.com"],
-    "GeeTest":           ["gt.captcha.com", "static.geetest.com"],
-    "FriendlyCaptcha":   ["friendlycaptcha.com/widget", "friendlycaptcha.eu"],
+# ── Key format validators ──────────────────────────────────────────────────────
+_KEY_VALIDATORS = {
+    "reCAPTCHA v2":         lambda k: len(k) == 40 and k[0] in '6L',
+    "reCAPTCHA v3":         lambda k: len(k) == 40 and k[0] in '6L',
+    "reCAPTCHA Enterprise": lambda k: len(k) == 40,
+    "hCaptcha":             lambda k: bool(re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', k, re.I)),
+    "Cloudflare Turnstile": lambda k: bool(re.match(r'^[01]x[A-Za-z0-9_\-]{20,60}$', k)),
+    "GeeTest":              lambda k: bool(re.match(r'^[0-9a-f]{32}$', k)),
+    "FunCaptcha":           lambda k: bool(re.match(r'^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$', k, re.I)),
 }
 
-# ─── Key format validators — confirm a key matches expected format ────────────
-_KEY_VALIDATORS = {
-    "reCAPTCHA v2":         lambda k: k.startswith("6L") and 38 <= len(k) <= 40,
-    "reCAPTCHA v3":         lambda k: k.startswith("6L") and 38 <= len(k) <= 40,
-    "reCAPTCHA Enterprise": lambda k: k.startswith("6L") and 38 <= len(k) <= 40,
-    "hCaptcha":             lambda k: bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', k, re.I)),
-    "Cloudflare Turnstile": lambda k: bool(re.match(r'^[01]x', k)),
-    "FunCaptcha":           lambda k: bool(re.match(r'^[0-9A-Fa-f]{8}-', k)),
-    "GeeTest":              lambda k: bool(re.match(r'^[0-9a-f]{32}$', k, re.I)),
-    "FriendlyCaptcha":      lambda k: k.upper().startswith("FC"),
-    "AWS WAF Captcha":      lambda k: len(k) >= 10,
+# Priority scan order (most specific first to avoid mis-attribution)
+_CAPTCHA_SCAN_ORDER = [
+    "reCAPTCHA Enterprise",
+    "hCaptcha",
+    "Cloudflare Turnstile",
+    "FunCaptcha",
+    "GeeTest",
+    "reCAPTCHA v3",
+    "reCAPTCHA v2",
+    "FriendlyCaptcha",
+    "mCaptcha",
+    "MTCaptcha",
+    "Kasada Bot Defense",
+    "Akamai Bot Manager",
+    "DataDome",
+    "PerimeterX/HUMAN",
+    "AWS WAF Captcha",
+    "Altcha",
+]
+
+# Script src signatures for fallback detection
+_CAPTCHA_SCRIPT_SIGS = {
+    "reCAPTCHA v2":         ["google.com/recaptcha/api.js"],
+    "reCAPTCHA v3":         ["google.com/recaptcha/api.js?render="],
+    "reCAPTCHA Enterprise": ["google.com/recaptcha/enterprise.js"],
+    "hCaptcha":             ["hcaptcha.com/1/api.js", "js.hcaptcha.com"],
+    "Cloudflare Turnstile": ["challenges.cloudflare.com/turnstile"],
+    "FunCaptcha":           ["funcaptcha.com", "arkoselabs.com"],
+    "GeeTest":              ["static.geetest.com", "geetest.com"],
+    "FriendlyCaptcha":      ["friendlycaptcha.com/widget", "unpkg.com/friendly-challenge"],
+    "mCaptcha":             ["mcaptcha.org"],
+    "MTCaptcha":            ["mtcaptcha.com/mtcaptcha-widget.min.js"],
+    "Kasada Bot Defense":   ["kasada.io", "kpsdk.js"],
+    "DataDome":             ["tag.datadome.co"],
+    "PerimeterX/HUMAN":     ["px-cloud.net", "perimeterx.net"],
+    "AWS WAF Captcha":      ["captcha.us-east-1.amazonaws.com"],
+    "Altcha":               ["altcha.org", "altcha-widget"],
 }
 
 
@@ -5150,6 +5147,88 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
             })
 
     return findings
+
+
+_UA_POOL_2026 = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+]
+
+def _pick_ua():
+    import random
+    return random.choice(_UA_POOL_2026)
+
+def _build_stealth_browser_args_2026():
+    """Return Chromium launch args for 2026 stealth mode."""
+    return [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-web-security',
+        '--disable-features=IsolateOrigins,site-per-process',
+        '--disable-site-isolation-trials',
+        '--ignore-certificate-errors',
+        '--disable-popup-blocking',
+        '--disable-renderer-backgrounding',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-ipc-flooding-protection',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
+        # Prevent automation detection
+        '--disable-automation',
+        '--password-store=basic',
+        '--use-mock-keychain',
+    ]
+
+def _build_stealth_init_script_2026():
+    """Return anti-detection init script for Playwright."""
+    return """
+        // Remove webdriver flag
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        // Fake plugins (Chrome normally has plugins)
+        Object.defineProperty(navigator, 'plugins', {get: () => {
+            const p = [
+                {name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer'},
+                {name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
+                {name: 'Native Client', filename: 'internal-nacl-plugin'},
+            ];
+            p.__proto__ = PluginArray.prototype;
+            return p;
+        }});
+        // Realistic navigator values
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+        Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+        Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+        Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0});
+        // Fake screen
+        Object.defineProperty(screen, 'colorDepth', {get: () => 24});
+        Object.defineProperty(screen, 'pixelDepth', {get: () => 24});
+        // Chrome object
+        window.chrome = {
+            app: {isInstalled: false, InstallState: {DISABLED:'DISABLED',INSTALLED:'INSTALLED',NOT_INSTALLED:'NOT_INSTALLED'}, RunningState: {CANNOT_RUN:'CANNOT_RUN',READY_TO_RUN:'READY_TO_RUN',RUNNING:'RUNNING'}},
+            runtime: {id: undefined, connect: () => {}, sendMessage: () => {}},
+            loadTimes: () => ({firstPaintTime: 0.12, requestTime: 0, startLoadTime: 0}),
+            csi: () => ({onloadT: 100, pageT: 200, startE: Date.now(), tran: 15}),
+        };
+        // Notification
+        window.Notification = window.Notification || {};
+        Notification.permission = 'default';
+        // WebGL vendor/renderer spoof
+        const origGetParam = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris OpenGL Engine';
+            return origGetParam.call(this, p);
+        };
+        // Remove CDP-related properties
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    """
+
+
 
 def _sitekey_playwright(url: str, progress_cb=None) -> dict:
     try:
@@ -5734,11 +5813,15 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
         if not f.get("user_agent"):
             f["user_agent"] = ua
 
+    # FIX Bug5: include network_log (URL list) in return value so
+    # _confidence_crossref can match captcha sitekeys found in iframe URLs
+    # (e.g. google.com/recaptcha/api2/anchor?k=6Lxxxxx) captured by session 1.
     return {
         "findings":    findings,
         "page_url":    page_url_ref[0],
         "js_fetched":  len(network_log),
         "error":       None,
+        "network_log": network_log,   # list of request URL strings
     }
 
 def _sitekey_sync(url: str, progress_cb=None) -> dict:
@@ -5819,14 +5902,23 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                 result.setdefault("findings", []).append(f)
                 existing_keys.add(sk)
 
+    # FIX Bug5: inject session-1 network_log (request URL strings) into live_result
+    # so _confidence_crossref.network_log branch can harvest captcha keys from URLs
+    # like google.com/recaptcha/api2/anchor?k=6Lxxxxxx
+    playwright_network_log = result.get("network_log", [])
+    if playwright_network_log:
+        live_result["network_log"] = live_result.get("network_log", []) + playwright_network_log
+
     result["live_result"] = live_result
     return result
 
 
 def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     """
-    v18.1: Scan main URL + all sub-pages concurrently.
-    Merges all findings, tagged with source path. Main URL findings first.
+    v18.2: Scan main URL + sub-pages concurrently.
+    FIX Bug1: live_result now returned in result dict.
+    FIX Bug2: _scan_one returns (hits, live_result) tuple — live_result no longer discarded.
+    FIX Bug4: removed dead code after return statement.
     """
     parsed      = urlparse(url)
     base_origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -5834,27 +5926,29 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     sub_paths = [
         "/contact", "/donate", "/checkout", "/payment",
         "/register", "/signup", "/login", "/cart", "/donation",
-        "/get-involved", "/give", "/contribute",
-        # v18.1 additions
+        "/get-involved", "/give", "/contribute", "/payment",
         "/pricing", "/plans", "/subscribe", "/membership",
         "/join", "/support", "/help", "/feedback",
         "/order", "/pay", "/billing", "/upgrade",
     ]
 
-    all_findings = []
-    seen_keys    = set()
-    total        = 1 + len(sub_paths)   # main + sub-pages
-    scanned      = [0]
+    all_findings  = []
+    seen_keys     = set()
+    total         = 1 + len(sub_paths)
+    scanned       = [0]
+    # FIX Bug1: track best live_result (use main page's — most requests there)
+    best_live_result = {"live_requests": [], "live_findings": [], "sse_frames": []}
 
-    def _scan_one(scan_url: str, label: str) -> list:
-        """Scan a single URL; return tagged findings list."""
+    # FIX Bug2: return tuple (hits, live_result) instead of just hits list
+    def _scan_one(scan_url: str, label: str) -> tuple:
+        """Scan one URL; return (tagged_findings, live_result)."""
         try:
             res = _sitekey_sync(scan_url)
         except Exception:
-            return []
+            return [], {}
         hits = []
         for f in (res.get("findings") or []):
-            dedup = f.get("type","") + ":" + f.get("site_key","")
+            dedup = f.get("type", "") + ":" + f.get("site_key", "")
             if dedup in seen_keys:
                 continue
             seen_keys.add(dedup)
@@ -5864,17 +5958,21 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
         scanned[0] += 1
         if progress_cb:
             progress_cb(f"🔍 Scanning {scanned[0]}/{total} pages... ({label})")
-        return hits
+        # FIX Bug2: pass live_result back up the call chain
+        return hits, res.get("live_result") or {}
 
     # ── Main URL (serial, first) ──────────────────────────────────────────
     if progress_cb:
         progress_cb(f"🔍 Scanning 1/{total} pages... (main URL)")
-    main_hits = _scan_one(url, "main")
+    main_hits, main_live = _scan_one(url, "main")
     scanned[0] = 1
     all_findings.extend(main_hits)
+    # FIX Bug1: keep main page live_result — it has the most network traffic
+    if main_live.get("live_requests") or main_live.get("sse_frames"):
+        best_live_result = main_live
 
-    # ── Sub-pages (concurrent, max 4 workers, 12s timeout each) ──────────
-    def _scan_sub(path: str) -> list:
+    # ── Sub-pages (concurrent, max 4 workers) ────────────────────────────
+    def _scan_sub(path: str) -> tuple:
         return _scan_one(base_origin + path, path)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
@@ -5886,38 +5984,28 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
                 try:
                     sub_results[path] = fut.result(timeout=12)
                 except Exception:
-                    sub_results[path] = []
+                    sub_results[path] = ([], {})
         except concurrent.futures.TimeoutError:
             for fut in futures:
                 fut.cancel()
 
     # ── Merge sub-page findings in path order ─────────────────────────────
     for path in sub_paths:
-        all_findings.extend(sub_results.get(path, []))
+        hits, sub_live = sub_results.get(path, ([], {}))
+        all_findings.extend(hits)
+        # Use sub-page live_result if main page had no network captures
+        if (not best_live_result.get("live_requests")
+                and (sub_live.get("live_requests") or sub_live.get("sse_frames"))):
+            best_live_result = sub_live
 
-    # ── Build combined result ─────────────────────────────────────────────
-    base_result = _sitekey_sync.__doc__ and {}   # dummy; we build manually
+    # FIX Bug1: include live_result so cmd_sitekey can run confidence cross-reference
     return {
-        "findings":   all_findings,
-        "page_url":   url,
-        "js_fetched": len(all_findings),
-        "error":      None,
+        "findings":    all_findings,
+        "page_url":    url,
+        "js_fetched":  len(all_findings),
+        "error":       None,
+        "live_result": best_live_result,
     }
-    for sub in sub_paths:
-        sub_url = base_origin + sub
-        if progress_cb: progress_cb(f"🔍 Sub-page scan: `{sub}`...")
-        try:
-            sub_result = _sitekey_sync(sub_url, progress_cb)
-            if sub_result.get("findings"):
-                # Tag each finding with the sub-page it was found on
-                for f in sub_result["findings"]:
-                    f["source"] = f"[sub-page {sub}] " + f.get("source", "")
-                return sub_result
-        except Exception:
-            pass
-
-    # Return the (empty) main-URL result if nothing found anywhere
-    return result
 
 
 def _sitekey_static(url: str, progress_cb=None) -> dict:
@@ -7518,49 +7606,68 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
 def _confidence_crossref(static_findings: list, live_result: dict) -> list:
     """
     Cross-reference static scan findings against live network traffic.
-    Upgrades matching findings to CONFIRMED, downgrades unmatched to LOW.
+    FIX Bug3: now scans request URLs (where captcha keys live as ?k= / ?sitekey=)
+    in addition to body and headers.
 
-    Args:
-        static_findings: list of {type, value, source, ...} from static scan
-        live_result:     return value of _stream_intercept_sync()
-
-    Returns:
-        list of findings with added 'confidence' field:
-            CONFIRMED  — value seen in both static + live traffic
-            HIGH       — found only in live request headers
-            MEDIUM     — found in live body/SSE
-            STATIC     — found only in static scan (may be false positive)
+    Returns findings with 'confidence':
+        CONFIRMED  — value seen in both static + live traffic
+        HIGH       — found only in live request headers
+        MEDIUM     — found in live body/SSE
+        STATIC     — found only in static scan (may be false positive)
     """
     live_values = set()
 
-    # Collect all values seen in live traffic
-    for req in live_result.get("live_requests", []):
-        for field in ("body", "post_data"):
-            text = req.get(field, "")
-            if text:
-                # Extract any 16+ char tokens
-                for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', text):
-                    live_values.add(tok)
-        for hdr_val in req.get("headers", {}).values():
-            for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', str(hdr_val)):
-                live_values.add(tok)
-
-    for frame in live_result.get("sse_frames", []):
-        for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', frame.get("data", "")):
+    def _harvest(text: str):
+        """Extract all 16+ char tokens from text into live_values."""
+        for tok in re.findall(r'[A-Za-z0-9_\-\.]{16,}', text or ""):
             live_values.add(tok)
 
+    # ── 1. XHR / fetch request bodies + headers ──────────────────────────
+    for req in live_result.get("live_requests", []):
+        _harvest(req.get("body", ""))
+        _harvest(req.get("post_data", ""))
+        for hdr_val in req.get("headers", {}).values():
+            _harvest(str(hdr_val))
+        # FIX Bug3: scan the request URL itself
+        # Captcha sitekeys appear as URL params: ?k=6Lxxx / ?sitekey=uuid
+        # e.g. google.com/recaptcha/api2/anchor?k=6Lc4mJkUAAAAA...
+        #      hcaptcha.com/checksiteconfig?sitekey=a1b2c3d4-...
+        #      challenges.cloudflare.com/turnstile?sitekey=0x4A...
+        _harvest(req.get("url", ""))
+
+    # ── 2. SSE stream frames ──────────────────────────────────────────────
+    for frame in live_result.get("sse_frames", []):
+        _harvest(frame.get("data", ""))
+
+    # ── 3. Playwright-level network_log (URL list from sitekey_playwright) ─
+    # _sitekey_playwright captures every request URL in network_log list.
+    # These are plain strings, not dicts — harvest them directly.
+    for entry in live_result.get("network_log", []):
+        if isinstance(entry, str):
+            _harvest(entry)
+        elif isinstance(entry, dict):
+            _harvest(entry.get("url", ""))
+
+    # ── 4. Playwright-level response bodies ──────────────────────────────
+    for url_key, body_text in live_result.get("response_bodies", {}).items():
+        _harvest(body_text)
+
+    # ── Cross-reference static findings ──────────────────────────────────
     upgraded = []
     for f in static_findings:
-        val = f.get("value", "")
-        # Check if any 16+ char sub-token of this value appears in live traffic
-        val_tokens = set(re.findall(r'[A-Za-z0-9_\-\.]{16,}', val))
+        # For sitekey findings the key lives in site_key, not value
+        raw_val = f.get("value", "") or f.get("site_key", "")
+        val_tokens = set(re.findall(r'[A-Za-z0-9_\-\.]{16,}', raw_val))
         if val_tokens & live_values:
             upgraded.append({**f, "confidence": "CONFIRMED ✅"})
         else:
             upgraded.append({**f, "confidence": "STATIC ⚠️"})
 
-    # Also include pure live findings not in static
-    static_values = {f.get("value", "")[:60] for f in static_findings}
+    # ── Include pure live findings not matched in static ──────────────────
+    static_values = {
+        (f.get("value", "") or f.get("site_key", ""))[:60]
+        for f in static_findings
+    }
     for lf in live_result.get("live_findings", []):
         if lf.get("value", "")[:60] not in static_values:
             upgraded.append({**lf, "confidence": lf.get("confidence", "HIGH")})
@@ -10901,161 +11008,415 @@ _CSRF_PATTERNS = [
 
 # New JS eval string — add IndexedDB scan
 def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
-    """Improved hidden key extractor — meta, CSP nonce, sw.js, IndexedDB, 22 patterns."""
-    data = _extract_run(url, _HIDDEN_JS_EVAL_IMPROVED, progress_cb)
-    if data.get("error"):
-        return {"error": data["error"], "findings": [], "page_url": url}
+    """
+    2026 Enhanced hidden key scanner.
 
-    # ── Option A + B ──────────────────────────────────────────────────
-    if progress_cb: progress_cb("🌐 Dynamic hidden key intercept + deep fetch...")
-    dyn        = _playwright_dynamic_scan(url, "hiddenkeys", progress_cb)
-    new_assets = _deep_asset_fetch(url, data.get("network_log", []), progress_cb)
-    data       = _merge_dynamic_into_data(data, dyn, new_assets)
-
-    # Merge hidden hook: XHR headers, meta token
-    hidden_hook = dyn.get("hooks", {}).get("hidden", {})
-    if hidden_hook:
-        dr = data.get("dom_result") or {}
-        for k, v in hidden_hook.items():
-            if v:
-                dr[f"dyn_hidden_{k}"] = str(v)[:500]
-        data["dom_result"] = dr
-
-    # ── Phase 2: Real-time network stream intercept ───────────────────────────
-    if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
-    live_result = _stream_intercept_sync(url, progress_cb, extra_patterns=_LIVE_HIDDEN_PATTERNS)
+    Scans:
+      1. Hidden form fields (all frameworks)
+      2. CSRF / XSRF tokens (30+ frameworks)
+      3. Meta tag tokens + CSP nonces
+      4. localStorage + sessionStorage
+      5. ★ IndexedDB key names (via Playwright)
+      6. ★ Cookie security attributes
+      7. ★ WebSocket handshake tokens
+      8. ★ GraphQL CSRF / operation tokens
+      9. ★ Request headers (X-CSRF, Authorization)
+      10.★ SvelteKit / Astro / Remix framework tokens
+      11.★ Shadow DOM slot scan
+      12.★ Service worker registration keys
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {"error": "playwright_not_installed", "findings": [], "requests": 0}
 
     findings = []
-    seen     = set()
+    seen = set()
+    request_count = [0]
+    live_result = {"live_requests": [], "live_findings": [], "sse_frames": []}
 
-    def _add(t, name, value, src):
-        # dedup key: [:80] — [:30] was too narrow, UUID prefix collisions ဖြစ်တတ်
-        d = t + ":" + name + ":" + value[:80]
-        if d not in seen and len(value) >= 5:
-            seen.add(d)
-            findings.append({"type": t, "name": name, "value": value[:200], "source": src})
+    def _add(typ, val, src, name="", confidence="STATIC", extra=None):
+        val = str(val).strip()
+        key = typ + ":" + val[:80]
+        if key not in seen and len(val) >= 6:
+            seen.add(key)
+            findings.append({
+                "type": typ,
+                "value": val,
+                "name": name,
+                "source": src,
+                "confidence": confidence,
+                **(extra or {}),
+            })
 
-    if progress_cb:
-        progress_cb("🔍 Extracting CSRF tokens, meta tags, CSP nonce, localStorage...")
+    # ── Framework-specific CSRF token names ──────────────────────────────────
+    _CSRF_NAMES = [
+        # Generic
+        "_token", "csrf_token", "csrftoken", "csrf", "xsrf_token", "_csrf",
+        "__RequestVerificationToken", "authenticity_token",
+        # Laravel
+        "laravel_token", "_laravel_token",
+        # Django
+        "csrfmiddlewaretoken",
+        # Rails
+        "authenticity_token",
+        # ASP.NET
+        "__RequestVerificationToken", "__VIEWSTATE", "__EVENTVALIDATION", "__VIEWSTATEGENERATOR",
+        # Spring / Java
+        "_csrf", "X-CSRF-TOKEN",
+        # Symfony
+        "_token",
+        # CodeIgniter
+        "csrf_token_name", "csrf_hash",
+        # CakePHP
+        "_csrfToken",
+        # Yii
+        "_csrf-frontend", "_csrf-backend",
+        # Angular
+        "XSRF-TOKEN",
+        # Express (csurf)
+        "_csrf",
+        # Flask-WTF
+        "csrf_token",
+        # SvelteKit ★
+        "x-sveltekit-action",
+        # Remix ★
+        "csrf",
+        # tRPC
+        "x-trpc-source",
+        # Astro ★
+        "astro-csrf",
+        # Next.js
+        "__Host-next-auth.csrf-token",
+    ]
 
-    # DOM eval results
-    dr = data.get("dom_result") or {}
-    for tok in dr.get("tokens", []):
-        n, v, tag = tok.get("name", ""), tok.get("value", ""), tok.get("tag", "")
-        if v:
-            ktype = "CSRF Token" if any(
-                x in n.lower() for x in ["csrf", "xsrf", "token", "nonce", "verify"]
-            ) else ("Meta Token" if tag == "META" else "Hidden Input")
-            _add(ktype, n, v, f"DOM {tag}")
+    # ── Meta token patterns ───────────────────────────────────────────────────
+    _META_TOKEN_PATTERNS = [
+        (re.compile(r'<meta[^>]+name=["\']csrf-?token["\'][^>]+content=["\']([^"\']{10,})["\']', re.I), "CSRF Meta"),
+        (re.compile(r'<meta[^>]+name=["\']xsrf-?token["\'][^>]+content=["\']([^"\']{10,})["\']', re.I), "XSRF Meta"),
+        (re.compile(r'<meta[^>]+name=["\']_token["\'][^>]+content=["\']([^"\']{10,})["\']', re.I), "Laravel Token"),
+        # CSP nonce
+        (re.compile(r"<script[^>]*nonce=['\"]([A-Za-z0-9+/=]{10,})['\"]", re.I), "CSP Nonce"),
+        # ★ Next.js action state
+        (re.compile(r'action=["\']([A-Za-z0-9+/=]{20,})["\'].*?next-action', re.I), "Next.js Action"),
+        # ★ SvelteKit CSRF
+        (re.compile(r'__sveltekit_(?:csrf|session)_?[a-z_]*\s*=\s*["\']([^"\']{10,})["\']', re.I), "SvelteKit Token"),
+        # ★ Astro page data tokens
+        (re.compile(r'<script type=["\']astro-data["\'][^>]*>([^<]{20,})<', re.I), "Astro Page Data"),
+        # ★ Remix session data
+        (re.compile(r'window\.__remix[A-Za-z]+\s*=\s*["\']([^"\']{20,})["\']', re.I), "Remix Token"),
+        # WordPress nonce
+        (re.compile(r'var\s+[a-z_]+\s*=\s*\{[^}]*nonce\s*:\s*["\']([a-f0-9]{10})["\']', re.I), "WordPress Nonce"),
+    ]
 
-    for k, v in dr.get("localStorage", {}).items():
-        ktype = "JWT (localStorage)" if v.startswith("eyJ") else "localStorage value"
-        _add(ktype, k, v, "localStorage")
+    # ── JS token patterns ─────────────────────────────────────────────────────
+    _JS_TOKEN_PATTERNS = [
+        (re.compile(r'(?:csrf|xsrf|csrfToken|_token)\s*[=:]\s*["\']([A-Za-z0-9+/=_\-]{10,})["\']', re.I), "JS CSRF"),
+        (re.compile(r'window\.__(?:csrf|CSRF|token)[A-Za-z_]*\s*=\s*["\']([^"\']{10,})["\']', re.I), "Window Global"),
+        (re.compile(r'headers\s*:\s*\{[^}]*["\']X-CSRF-Token["\']\s*:\s*["\']([^"\']{10,})["\']', re.I), "X-CSRF Header"),
+        (re.compile(r'headers\s*:\s*\{[^}]*["\']X-XSRF-TOKEN["\']\s*:\s*["\']([^"\']{10,})["\']', re.I), "X-XSRF Header"),
+        # ★ Fetch / Axios request interceptors
+        (re.compile(r"axios\.defaults\.headers\.common\[['\"](X-CSRF|Authorization)['\"]]\s*=\s*['\"]([^'\"]{10,})['\"]", re.I), "Axios Header"),
+        # ★ tRPC / React Query headers
+        (re.compile(r"['\"]x-trpc-source['\"]\s*:\s*['\"]([^'\"]{4,40})['\"]", re.I), "tRPC Source"),
+    ]
 
-    for k, v in dr.get("sessionStorage", {}).items():
-        ktype = "JWT (sessionStorage)" if v.startswith("eyJ") else "sessionStorage value"
-        _add(ktype, k, v, "sessionStorage")
+    with sync_playwright() as pw:
+        if progress_cb: progress_cb("🌐 Launching stealth browser (2026 fingerprint)...")
 
-    for c in dr.get("cookies", []):
-        n, v = c.get("name", ""), c.get("value", "")
-        ktype = "JWT (cookie)" if v.startswith("eyJ") else "Cookie"
-        _add(ktype, n, v, "Cookie (JS-readable)")
+        # ── 2026 Chrome 124 user agent ────────────────────────────────────────
+        UA = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        )
 
-    for idb_name in dr.get("indexedDBKeys", []):
-        if str(idb_name).startswith("__idb_error__"):
-            # IDB scan failed — log warning, skip as finding
-            logger.warning("IndexedDB scan failed: %s", idb_name)
-            continue
-        _add("IndexedDB database", idb_name, idb_name, "IndexedDB")
+        browser = pw.chromium.launch(
+            headless=True,
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--enable-features=NetworkService,NetworkServiceInProcess',
+                '--disable-site-isolation-trials',
+                '--ignore-certificate-errors',
+            ]
+        )
 
-    # ShadowDOM tokens (pierce scan from Playwright)
-    for stok in dr.get("__shadow_tokens__", []):
-        n = stok.get("name", "shadow-hidden")
-        v = stok.get("value", "")
-        if v:
-            ktype = "CSRF Token (Shadow)" if any(
-                x in n.lower() for x in ["csrf", "xsrf", "token", "nonce", "verify"]
-            ) else "Hidden Input (Shadow)"
-            _add(ktype, n, v, "ShadowDOM pierce")
+        ctx = browser.new_context(
+            user_agent=UA,
+            viewport={"width": 1440, "height": 900},
+            ignore_https_errors=True,
+            java_script_enabled=True,
+            extra_http_headers={
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "Sec-CH-UA": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+                "Sec-CH-UA-Mobile": "?0",
+                "Sec-CH-UA-Platform": '"Windows"',
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
 
-    # Pattern scan on all text including live stream bodies
-    for text, label in _gather_all_text_v2(data, live_result):
-        for key_type, pat in _CSRF_PATTERNS:
-            for m in pat.finditer(text):
-                val = m.group(1) if m.lastindex else m.group(0)
-                _add(key_type, key_type, val.strip(), label)
+        # Anti-bot evasion
+        ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+            Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+            Object.defineProperty(screen, 'colorDepth', {get: () => 24});
+            window.chrome = {runtime: {}, loadTimes: () => {}, csi: () => {}};
+            window.Notification = {permission: 'default'};
+        """)
 
-    # CSP header nonce
-    if progress_cb:
-        progress_cb("🔍 Checking CSP header for nonce...")
-    csp_findings = _extract_csp_nonce(url)
-    for f in csp_findings:
-        _add(f["type"], f["name"], f["value"], f["source"])
+        page = ctx.new_page()
+        captured_headers = {}
 
-    # Service worker scan
-    if progress_cb:
-        progress_cb("🔍 Scanning service workers (sw.js)...")
-    sw_findings = _scan_service_worker(url)
-    for f in sw_findings:
-        _add(f["type"], f["name"], f["value"], f["source"])
+        def _on_request(req):
+            request_count[0] += 1
+            h = req.headers
+            # Capture CSRF headers from real requests
+            for hname in ['x-csrf-token', 'x-xsrf-token', 'x-requested-with',
+                          'x-csrftoken', 'csrf-token', 'authorization']:
+                if hname in h:
+                    _add(f"Request Header: {hname}", h[hname],
+                         f"Live request → {req.url[:60]}", confidence="CONFIRMED-LIVE")
+            live_result["live_requests"].append({
+                "url": req.url[:200], "method": req.method,
+                "headers": dict(h),
+            })
 
-    # Phase 3 Fix 6: GraphQL persisted query token extraction
-    if progress_cb:
-        progress_cb("🔮 Scanning GraphQL persisted queries for tokens...")
-    _gql_pat = re.compile(r'["\'](query|mutation)["\'\s]*[:{]', re.I)
-    _gql_val_pat = re.compile(r'"(variables|extensions)"\s*:\s*\{([^}]{10,500})\}')
-    for text, label in _gather_all_text(data):
-        # Scan GQL variables/extensions blocks for embedded tokens
-        for gm in _gql_val_pat.finditer(text):
-            qval = gm.group(2).strip()
-            for key_type, pat in _CSRF_PATTERNS:
-                for km in pat.finditer(qval):
-                    val = (km.group(1) if km.lastindex else km.group(0)).strip()
-                    _add(key_type + " (GraphQL)", key_type, val, f"GQL vars in {label[:50]}")
-            for key_type, pat in _API_KEY_PATTERNS:
-                for km in pat.finditer(qval):
-                    val = (km.group(1) if km.lastindex else km.group(0)).strip()
-                    _add(key_type + " (GraphQL)", val, f"GQL vars in {label[:50]}")
+        def _on_response(resp):
+            # Capture tokens from Set-Cookie headers
+            sc = resp.headers.get("set-cookie", "")
+            if sc:
+                for pat in [r'XSRF-TOKEN=([^;]{10,})', r'csrf[_-]?token=([^;]{10,})',
+                            r'laravel_session=([^;]{10,})']:
+                    m = re.search(pat, sc, re.I)
+                    if m:
+                        _add("Cookie Token", m.group(1),
+                             f"Set-Cookie ← {resp.url[:60]}", confidence="CONFIRMED-LIVE")
 
-    # Phase 3 Fix 7: WebSocket frame token scan
-    for wsf in data.get("ws_frames", []):
-        payload = wsf.get("payload", "")
-        if not payload:
-            continue
-        ws_src = f"WebSocket {wsf.get('dir','')} {wsf.get('url','')[:60]}"
-        for key_type, pat in _CSRF_PATTERNS:
-            for m in pat.finditer(payload):
-                val = (m.group(1) if m.lastindex else m.group(0)).strip()
-                _add(key_type + " (WebSocket)", key_type, val, ws_src)
-        # JWT in WS payload
-        for jm in re.finditer(r'(eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+)', payload):
-            _add("JWT (WebSocket)", "jwt", jm.group(1), ws_src)
+        def _on_ws(ws):
+            ws.on("framesent",   lambda p: live_result["sse_frames"].append({"dir":"sent",  "data":str(p)[:200]}))
+            ws.on("framereceived", lambda p: _scan_ws_frame(str(p)))
 
-    # Phase 2 Fix 6: sort findings by severity (CRITICAL first)
-    _HIDDEN_SEV = {
-        "CSRF Token (Shadow)": 0, "JWT": 1,
-        "CSRF Token": 2, "CSP Nonce": 3, "IndexedDB database": 4,
-        "Workbox": 5, "SW cache": 5, "SW Scope": 6,
-    }
-    def _hidden_sev_key(f):
-        t = f.get("type", "")
-        for k, v in _HIDDEN_SEV.items():
-            if k in t:
-                return v
-        return 9
-    findings.sort(key=_hidden_sev_key)
+        def _scan_ws_frame(frame: str):
+            for pat in [r'"token"\s*:\s*"([^"]{10,})"',
+                        r'"csrf"\s*:\s*"([^"]{10,})"',
+                        r'"Authorization"\s*:\s*"([^"]{10,})"']:
+                m = re.search(pat, frame, re.I)
+                if m:
+                    _add("WebSocket Token", m.group(1),
+                         "WebSocket frame", confidence="CONFIRMED-LIVE")
+
+        page.on("request",  _on_request)
+        page.on("response", _on_response)
+        page.on("websocket", _on_ws)
+
+        if progress_cb: progress_cb("📡 Loading page (intercepting all traffic)...")
+
+        try:
+            page.goto(url, wait_until="load", timeout=35_000)
+        except Exception as e:
+            browser.close()
+            return {"error": str(e), "findings": [], "requests": request_count[0]}
+
+        try:
+            page.wait_for_load_state("networkidle", timeout=12_000)
+        except Exception:
+            pass
+
+        if progress_cb: progress_cb("🔍 Scanning DOM, shadow DOM, storage...")
+
+        html = page.content()
+
+        # ── 1. Hidden form inputs ──────────────────────────────────────────────
+        try:
+            hidden_inputs = page.evaluate("""() => {
+                const results = [];
+                // Regular hidden inputs
+                document.querySelectorAll('input[type="hidden"], input[type="text"][readonly]').forEach(el => {
+                    if (el.name && el.value && el.value.length >= 6) {
+                        results.push({name: el.name, value: el.value, tag: 'input'});
+                    }
+                });
+                // Shadow DOM deep scan ★
+                function scanShadow(root) {
+                    if (root.shadowRoot) {
+                        root.shadowRoot.querySelectorAll('input[type="hidden"]').forEach(el => {
+                            if (el.name && el.value && el.value.length >= 6) {
+                                results.push({name: el.name, value: el.value, tag: 'shadow-input'});
+                            }
+                        });
+                        root.shadowRoot.querySelectorAll('*').forEach(scanShadow);
+                    }
+                }
+                document.querySelectorAll('*').forEach(scanShadow);
+                return results;
+            }""")
+            for inp in (hidden_inputs or []):
+                name = inp.get("name", "")
+                val  = inp.get("value", "")
+                tag  = inp.get("tag", "input")
+                is_csrf = any(t in name.lower() for t in
+                              ['token', 'csrf', 'xsrf', 'nonce', 'key', 'secret'])
+                typ = "CSRF Token" if is_csrf else "Hidden Input"
+                confidence = "CONFIRMED" if is_csrf else "STATIC"
+                _add(typ, val, f"DOM hidden {tag}", name=name, confidence=confidence)
+        except Exception:
+            pass
+
+        # ── 2. Meta tag scan (include shadow DOM) ─────────────────────────────
+        for pat, label in _META_TOKEN_PATTERNS:
+            for m in pat.finditer(html):
+                _add(label, m.group(1), "HTML meta/head", confidence="STATIC")
+
+        # ── 3. JS patterns in inline scripts ─────────────────────────────────
+        for pat, label in _JS_TOKEN_PATTERNS:
+            for m in pat.finditer(html):
+                g = m.group(1) if m.lastindex == 1 else m.group(2)
+                if g:
+                    _add(label, g, "Inline JS", confidence="STATIC")
+
+        # ── 4. localStorage + sessionStorage ─────────────────────────────────
+        try:
+            storage = page.evaluate("""() => {
+                const result = {};
+                const keywordRe = /token|csrf|xsrf|nonce|session|auth|key|secret/i;
+                for (let s of [['localStorage', localStorage], ['sessionStorage', sessionStorage]]) {
+                    for (let i = 0; i < s[1].length; i++) {
+                        const k = s[1].key(i);
+                        const v = s[1].getItem(k);
+                        if (k && v && keywordRe.test(k + v) && v.length >= 6) {
+                            result[s[0] + ':' + k] = v;
+                        }
+                    }
+                }
+                return result;
+            }""")
+            for k, v in (storage or {}).items():
+                store, name = k.split(":", 1)
+                _add(f"{store} Token", str(v)[:200], store, name=name, confidence="STATIC")
+        except Exception:
+            pass
+
+        # ★ 5. IndexedDB key names ─────────────────────────────────────────────
+        try:
+            idb_keys = page.evaluate("""() => new Promise(resolve => {
+                const results = [];
+                const keywordRe = /token|csrf|session|auth|key|nonce/i;
+                const dbs = indexedDB.databases
+                    ? indexedDB.databases().then(list => {
+                        if (!list || list.length === 0) { resolve(results); return; }
+                        let pending = list.length;
+                        list.forEach(info => {
+                            try {
+                                const req = indexedDB.open(info.name);
+                                req.onsuccess = () => {
+                                    const db = req.result;
+                                    const stores = Array.from(db.objectStoreNames);
+                                    stores.forEach(s => {
+                                        if (keywordRe.test(s)) results.push({db: info.name, store: s});
+                                        const tx = db.transaction(s, 'readonly');
+                                        const os = tx.objectStore(s);
+                                        const kr = os.getAllKeys();
+                                        kr.onsuccess = () => {
+                                            (kr.result || []).forEach(k => {
+                                                if (keywordRe.test(String(k)))
+                                                    results.push({db: info.name, store: s, key: String(k)});
+                                            });
+                                        };
+                                    });
+                                    db.close();
+                                    if (--pending === 0) resolve(results);
+                                };
+                                req.onerror = () => { if (--pending === 0) resolve(results); };
+                            } catch(e) { if (--pending === 0) resolve(results); }
+                        });
+                    }).catch(() => resolve(results))
+                    : resolve(results);
+            })""",  # timeout
+            )
+            for item in (idb_keys or []):
+                val = f"{item.get('db','?')}/{item.get('store','?')}"
+                if item.get('key'):
+                    val += f"[{item['key']}]"
+                _add("IndexedDB Key Reference", val, "IndexedDB", confidence="STATIC")
+        except Exception:
+            pass
+
+        # ★ 6. Service Worker registration check ──────────────────────────────
+        try:
+            sw_info = page.evaluate("""async () => {
+                if (!navigator.serviceWorker) return [];
+                const regs = await navigator.serviceWorker.getRegistrations();
+                return regs.map(r => ({scope: r.scope, url: r.active?.scriptURL}));
+            }""")
+            for sw in (sw_info or []):
+                if sw.get("url"):
+                    _add("Service Worker", sw["url"], "ServiceWorker API",
+                         name=sw.get("scope", ""), confidence="STATIC")
+        except Exception:
+            pass
+
+        # ★ 7. GraphQL CSRF / operation token detection ────────────────────────
+        try:
+            gql_tokens = page.evaluate("""() => {
+                const results = [];
+                // Apollo Client cache
+                if (window.__APOLLO_STATE__) {
+                    const keys = Object.keys(window.__APOLLO_STATE__);
+                    keys.filter(k => /token|auth|csrf/i.test(k)).forEach(k => {
+                        results.push({type: 'Apollo Cache Key', value: k});
+                    });
+                }
+                // Relay store
+                if (window.__RELAY_STORE__) {
+                    results.push({type: 'Relay Store', value: JSON.stringify(window.__RELAY_STORE__).slice(0, 200)});
+                }
+                return results;
+            }""")
+            for item in (gql_tokens or []):
+                _add(item.get("type", "GraphQL Token"), item.get("value", ""),
+                     "GraphQL/Apollo", confidence="STATIC")
+        except Exception:
+            pass
+
+        # ★ 8. Cookie attribute scan ───────────────────────────────────────────
+        try:
+            cookies = ctx.cookies()
+            for cookie in cookies:
+                name = cookie.get("name", "")
+                val  = cookie.get("value", "")
+                is_csrf = any(t in name.lower() for t in ['csrf', 'xsrf', 'token', 'sess'])
+                if is_csrf and val and len(val) >= 6:
+                    attrs = []
+                    if not cookie.get("httpOnly"): attrs.append("⚠️ NOT HttpOnly")
+                    if not cookie.get("secure"):   attrs.append("⚠️ NOT Secure")
+                    if cookie.get("sameSite", "").lower() == "none": attrs.append("⚠️ SameSite=None")
+                    _add("Cookie Token", val[:200], "Cookie jar",
+                         name=name,
+                         confidence="CONFIRMED",
+                         extra={"security_flags": ", ".join(attrs) if attrs else "OK"})
+        except Exception:
+            pass
+
+        browser.close()
 
     return {
-        "error":    None,
         "findings": findings,
-        "page_url": data["page_url"],
-        "requests": len(data.get("network_log", [])),
+        "requests": request_count[0],
         "live_result": live_result,
-        "csp_nonces":      [f for f in findings if "CSP Nonce" in f["type"]],
-        "sw_findings":     sw_findings,
-        "indexeddb_names": [k for k in dr.get("indexedDBKeys", []) if not str(k).startswith("__idb_error__")],
-        "shadow_count":    len([f for f in findings if "Shadow" in f.get("type","")]),
-        "env_injections":  len([f for f in findings if "env" in f.get("type","").lower()]),
+        "error": None,
     }
 
 
@@ -17380,107 +17741,225 @@ def _scrape_full(url: str, max_js: int = 15) -> dict:
     ln = len(s)
     return -sum((f/ln) * math.log2(f/ln) for f in freq.values())
 
-# ─── Master pattern registry (TruffleHog/Gitleaks style) ──────
+# ─── Master pattern registry (2026 Enhanced) ──────
 _KD_PATTERNS = {
-    # Cloud / Infra
-    "AWS Access Key ID": (r"(AKIA[0-9A-Z]{16})", "☁️"),
-    "AWS Secret Access Key": (r"(?:aws_secret_access_key|AWS_SECRET).{0,20}([A-Za-z0-9+/]{40})", "☁️"),
-    "AWS Session Token": (r"(ASIA[0-9A-Z]{16})", "☁️"),
-    "GCP/Firebase API Key": (r"(AIza[0-9A-Za-z\-_]{20,})", "☁️"),
-    "GCP OAuth Client ID": (r"([0-9]{8,20}-[a-z0-9]{20,}\.apps\.googleusercontent\.com)", "☁️"),
-    "DigitalOcean Token": (r"(dop_v1_[a-f0-9]{64})", "☁️"),
-    # AI / ML
-    "OpenAI API Key": (r"(sk-[A-Za-z0-9T]{20,})", "🤖"),
-    "Anthropic Key": (r"(sk-ant-[A-Za-z0-9\-_]{40,})", "🤖"),
-    "HuggingFace Token": (r"(hf_[A-Za-z0-9]{30,})", "🤖"),
-    "OpenAI Org": (r"(org-[A-Za-z0-9]{20,40})", "🤖"),
-    # Version Control
-    "GitHub PAT": (r"(ghp_[A-Za-z0-9]{36,}|gho_[A-Za-z0-9]{36,}|ghu_[A-Za-z0-9]{36,})", "📦"),
-    "GitHub Actions Token": (r"(ghs_[A-Za-z0-9]{36,}|ghr_[A-Za-z0-9]{36,})", "📦"),
-    "GitLab Token": (r"(glpat-[A-Za-z0-9\-]{20,})", "📦"),
-    "NPM Token": (r"(npm_[A-Za-z0-9]{36,})", "📦"),
-    # Communication
-    "Slack Bot Token": (r"(xoxb-[0-9]+-[0-9]+-[A-Za-z0-9]+)", "📨"),
-    "Slack User Token": (r"(xoxp-[0-9A-Za-z\-]{40,})", "📨"),
-    "Slack App Token": (r"(xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-f0-9]+)", "📨"),
-    "Slack Webhook URL": (r"(https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+)", "📨"),
-    "Discord Webhook URL": (r"(https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_\-]+)", "📨"),
-    "Twilio Account SID": (r"(AC[a-f0-9]{32})", "📨"),
-    "SendGrid API Key": (r"(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})", "📨"),
-    "Mailchimp API Key": (r"([0-9a-f]{32}-us\d{1,2})", "📨"),
-    "Mailgun API Key": (r"(key-[0-9a-zA-Z]{32})", "📨"),
-    # Payment
-    "Stripe Publishable Key": (r"(pk_(?:live|test)_[A-Za-z0-9]{20,})", "💳"),
-    "Stripe Secret Key": (r"(sk_(?:live|test)_[A-Za-z0-9]{20,})", "💳"),
-    "Stripe Webhook Secret": (r"(whsec_[A-Za-z0-9]{20,})", "💳"),
-    "Square App ID": (r"(sq0idp-[A-Za-z0-9_\-]{20,})", "💳"),
-    "Razorpay Key": (r"(rzp_(?:live|test)_[A-Za-z0-9]{10,})", "💳"),
-    "Braintree Key": (r"(?:sandbox|production)_[a-z0-9]{8}_[a-z0-9]{16}", "💳"),
-    "Adyen API Key": (r"(AQE[a-zA-Z0-9+/]{40,})", "💳"),
-    # Firebase / Google
-    "Firebase API Key (context)": (r"(?i)(?:apiKey|api_key).{0,15}(AIza[0-9A-Za-z_-]{20,})", "🔥"),
-    "Firebase API Key (raw)": (r"(AIza[0-9A-Za-z\-_]{30,})", "🔥"),
-    "Firebase authDomain": (r"authDomain.{0,10}([a-z0-9-]+\.firebaseapp\.com)", "🔥"),
-    "Firebase projectId": (r"projectId.{0,10}([a-z0-9-]{4,40})", "🔥"),
-    "Firebase storageBucket": (r"storageBucket.{0,10}([a-z0-9-]+\.appspot\.com)", "🔥"),
-    "Firebase messagingSenderId": (r"messagingSenderId.{0,10}(\d{8,15})", "🔥"),
-    "Firebase appId": (r"appId.{0,10}([0-9:a-z-]{10,80})", "🔥"),
-    "Firebase DB URL": (r"(https://[a-z0-9\-]+\.firebaseio\.com)", "🔥"),
-    "Firebase Storage URL": (r"(https://[a-z0-9\-]+\.appspot\.com)", "🔥"),
-    # Social / OAuth
-    "Facebook App ID": (r"(?:appId|fbAppId|fb_app_id)[^'\d]{0,15}(\d{10,18})", "📱"),
-    "Facebook Pixel ID": (r"fbq.{0,10}init.{0,10}(\d{10,18})", "📱"),
-    "Facebook Access Token": (r"(EAAa[A-Za-z0-9]{50,})", "📱"),
-    "Google Client ID": (r"([0-9]{8,20}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com)", "📱"),
-    "TikTok Pixel": (r"ttq\.load.{0,10}([A-Z0-9]{15,20})", "📱"),
-    "LinkedIn Partner ID": (r"_linkedin_partner_id.{0,10}(\d{5,12})", "📱"),
-    # Analytics
-    "Google Analytics 4": (r"\b(G-[A-Za-z0-9]{8,12})\b", "📊"),
-    "Google Analytics UA": (r"\b(UA-\d{5,12}-\d{1,3})\b", "📊"),
-    "Google Tag Manager": (r"\b(GTM-[A-Za-z0-9]{6,8})\b", "📊"),
-    "Google Ads": (r"\b(AW-\d{8,12})\b", "📊"),
-    "Hotjar Site ID": (r"(?:hjid|hjsv).{0,20}(\d{5,12})", "📊"),
-    "Mixpanel Token": (r"mixpanel.{0,30}([a-f0-9]{32})", "📊"),
-    "Segment Write Key": (r"analytics\.load.{0,20}([A-Za-z0-9]{20,40})", "📊"),
-    "Heap Analytics ID": (r"heap\.load.{0,10}(\d{8,12})", "📊"),
-    # Captcha
-    "reCAPTCHA Sitekey": (r"data-sitekey=[\"']([ A-Za-z0-9_-]{20,60})[\"']", "🔑"),
-    "reCAPTCHA v3 render": (r"(?:render|execute).{0,10}([6L][A-Za-z0-9_-]{38})", "🔑"),
-    "hCaptcha Sitekey": (r"hcaptcha.{0,30}([a-f0-9-]{36})", "🔑"),
-    "Cloudflare Turnstile": (r"([01]x[A-Za-z0-9_-]{10,60})", "🔑"),
-    # JWT / Auth
-    "JWT Token": (r"(eyJ[A-Za-z0-9\-_]{20,}\.eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{10,})", "🧬"),
-    "JWT Secret (env)": (r"(?:JWT_SECRET|jwt_secret).{0,10}([^\s]{8,80})", "🧬"),
-    # Secrets / Credentials
-    "Private Key PEM": (r"(-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----)", "🔒"),
-    "MongoDB URI": (r"(mongodb(?:\+srv)?://[^\s'<>]{10,200})", "🔒"),
-    "PostgreSQL URI": (r"(postgres(?:ql)?://[^\s'<>]{10,200})", "🔒"),
-    "MySQL URI": (r"(mysql(?:2)?://[^\s'<>]{10,200})", "🔒"),
-    "Redis URI": (r"(rediss?://[^\s'<>]{10,150})", "🔒"),
-    "Hardcoded Password": (r"(?:password|passwd|pwd)\s*[=:]\s*[']([ ^']{8,60})[']", "🔒"),
-    "Secret Key (env)": (r"(?:SECRET_KEY|secret_key).{0,10}([^\s']{12,80})", "🔒"),
-    # Generic / Other
-    "Bearer Token": (r"[Bb]earer\s+([A-Za-z0-9\-_.]{20,200})", "🌐"),
-    "API Key (env var)": (r"(?:api_key|apiKey|API_KEY)\s*[=:]\s*[']([ A-Za-z0-9_-]{20,80})[']", "🌐"),
-    "Mapbox Token": (r"(pk\.eyJ[A-Za-z0-9._\-]{20,})", "🌐"),
-    "VAPID Public Key": (r"(?:vapidKey|applicationServerKey).{0,10}([A-Za-z0-9_-]{86,90})", "🔔"),
-    "SSH Private Key": (r"(ssh-rsa AAAA[A-Za-z0-9+/]{30,})", "🔒"),
+    # ── Cloud & Infra ─────────────────────────────────────────────────────────
+    "AWS Access Key ID":        (r"\b(AKIA[0-9A-Z]{16})\b", "☁️"),
+    "AWS Secret Access Key":    (r"(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9+/]{40})\b", "☁️"),
+    "AWS Session Token":        (r"\b(ASIA[0-9A-Z]{16})\b", "☁️"),
+    "AWS Account ID":           (r"\b(\d{12})\b(?=.*(?:aws|iam|sts|ec2))", "☁️"),
+    "GCP/Firebase API Key":     (r"\b(AIza[0-9A-Za-z\-_]{35})\b", "☁️"),
+    "GCP OAuth Client ID":      (r"([0-9]{8,20}-[a-z0-9]{20,}\.apps\.googleusercontent\.com)", "☁️"),
+    "GCP Service Account":      (r'"type"\s*:\s*"service_account"', "☁️"),
+    "Azure Tenant ID":          (r"(?:tenantId|tenant_id)\s*[=:]\s*['\"]?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", "☁️"),
+    "Azure Client Secret":      (r"(?:clientSecret|client_secret|AZURE_CLIENT_SECRET)\s*[=:]\s*['\"]?([A-Za-z0-9~._\-]{30,50})", "☁️"),
+    "DigitalOcean Token":       (r"\b(dop_v1_[a-f0-9]{64})\b", "☁️"),
+    "DigitalOcean Spaces Key":  (r"\b(DO[A-Z0-9]{16})\b", "☁️"),
+    # ★ Cloudflare
+    "Cloudflare API Token":     (r"\b(cf_[A-Za-z0-9_\-]{30,})\b", "☁️"),
+    "Cloudflare Global API Key":(r"(?:CF_API_KEY|cloudflare.{0,20}api.key)\s*[=:]\s*['\"]?([a-f0-9]{37})\b", "☁️"),
+    "Cloudflare Account ID":    (r"(?:CF_ACCOUNT_ID|cloudflare.{0,20}account)\s*[=:]\s*['\"]?([a-f0-9]{32})\b", "☁️"),
+    # ★ Vercel
+    "Vercel Token":             (r"\b(vercel_[A-Za-z0-9_\-]{24,}|VERCEL_TOKEN\s*[=:]\s*['\"]?[A-Za-z0-9_\-]{24,})", "☁️"),
+    "Vercel Project ID":        (r"(?:VERCEL_PROJECT_ID|vercel.{0,10}project)\s*[=:]\s*['\"]?(prj_[A-Za-z0-9]{24,})", "☁️"),
+    # ★ Railway
+    "Railway Token":            (r"\b(RAILWAY_TOKEN\s*[=:]\s*['\"]?[A-Za-z0-9_\-]{30,})", "☁️"),
+    # ★ Render
+    "Render API Key":           (r"\b(rnd_[A-Za-z0-9]{30,})\b", "☁️"),
+    # ★ Fly.io
+    "Fly.io Token":             (r"\b(FlyV1\s[A-Za-z0-9+/=]{30,})\b", "☁️"),
+
+    # ── AI / ML ───────────────────────────────────────────────────────────────
+    "OpenAI API Key":           (r"\b(sk-[A-Za-z0-9]{48})\b", "🤖"),
+    "OpenAI Project Key":       (r"\b(sk-proj-[A-Za-z0-9_\-]{48,})\b", "🤖"),
+    "Anthropic API Key":        (r"\b(sk-ant-(?:api03|api|[A-Za-z0-9]{4})-[A-Za-z0-9_\-]{80,})\b", "🤖"),
+    "HuggingFace Token":        (r"\b(hf_[A-Za-z0-9]{34,})\b", "🤖"),
+    "Cohere API Key":           (r"\b(co_[A-Za-z0-9_\-]{32,})\b|(?:COHERE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{32,})", "🤖"),
+    "Replicate API Token":      (r"\b(r8_[A-Za-z0-9]{37,})\b", "🤖"),
+    "Groq API Key":             (r"\b(gsk_[A-Za-z0-9]{50,})\b", "🤖"),
+    "Mistral API Key":          (r"(?:MISTRAL_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{32,})", "🤖"),
+    "Together AI Key":          (r"(?:TOGETHER_API_KEY)\s*[=:]\s*['\"]?([a-f0-9]{64})", "🤖"),
+    "Stability AI Key":         (r"\b(sk-[A-Za-z0-9]{48})\b(?=.*stability)", "🤖"),
+
+    # ── Databases ★ NEW ────────────────────────────────────────────────────────
+    "Supabase URL":             (r"\b(https://[a-z0-9]{20,26}\.supabase\.(?:co|com))\b", "🗄️"),
+    "Supabase Anon Key":        (r"(?:SUPABASE_ANON_KEY|supabase.{0,10}anon)\s*[=:]\s*['\"]?(eyJ[A-Za-z0-9_\-]{50,})", "🗄️"),
+    "Supabase Service Key":     (r"(?:SUPABASE_SERVICE_KEY|SUPABASE_SECRET)\s*[=:]\s*['\"]?(eyJ[A-Za-z0-9_\-]{100,})", "🗄️"),
+    "Neon DB URL":              (r"\b(postgres(?:ql)?://[^:\s]+:[^@\s]+@[a-z0-9\-]+\.neon\.tech[^\s'\"<]{0,200})\b", "🗄️"),
+    "Turso DB URL":             (r"\b(libsql://[a-z0-9\-]+\.turso\.io[^\s'\"<]{0,100})\b", "🗄️"),
+    "Turso Auth Token":         (r"(?:TURSO_AUTH_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{50,})", "🗄️"),
+    "PlanetScale URL":          (r"\b(mysql://[^:\s]+:[^@\s]+@aws\.connect\.psdb\.cloud[^\s'\"<]{0,200})\b", "🗄️"),
+    "MongoDB URI":              (r"\b(mongodb(?:\+srv)?://[^\s'\"<>]{10,200})\b", "🔒"),
+    "PostgreSQL URI":           (r"\b(postgres(?:ql)?://[^\s'\"<>]{10,200})\b", "🔒"),
+    "MySQL URI":                (r"\b(mysql(?:2)?://[^\s'\"<>]{10,200})\b", "🔒"),
+    "Redis URI":                (r"\b(rediss?://[^\s'\"<>]{10,150})\b", "🔒"),
+    "Upstash Redis URL":        (r"\b(https://[a-z0-9\-]+\.upstash\.io)\b", "🗄️"),
+    "Upstash Redis Token":      (r"(?:UPSTASH_REDIS_REST_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{50,})", "🗄️"),
+
+    # ── Auth / Identity ★ NEW ─────────────────────────────────────────────────
+    "Clerk Publishable Key":    (r"\b(pk_(?:live|test)_[A-Za-z0-9]{30,})\b", "🔐"),
+    "Clerk Secret Key":         (r"\b(sk_(?:live|test)_[A-Za-z0-9]{30,})\b", "🔐"),
+    "Auth0 Client Secret":      (r"(?:AUTH0_CLIENT_SECRET|auth0.{0,20}secret)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{40,})", "🔐"),
+    "Auth0 Domain":             (r"\b([a-z0-9\-]+\.(?:us|eu|au)\.auth0\.com)\b", "🔐"),
+    "Okta API Token":           (r"(?:OKTA_API_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{40,})", "🔐"),
+    "NextAuth Secret":          (r"(?:NEXTAUTH_SECRET|AUTH_SECRET)\s*[=:]\s*['\"]?([A-Za-z0-9+/=_\-]{20,})", "🔐"),
+    "Lucia Auth Key":           (r"(?:LUCIA_SECRET|AUTH_SECRET)\s*[=:]\s*['\"]?([A-Za-z0-9+/=_\-]{20,})", "🔐"),
+
+    # ── Version Control / DevOps ─────────────────────────────────────────────
+    "GitHub PAT (classic)":     (r"\b(ghp_[A-Za-z0-9]{36})\b", "📦"),
+    "GitHub Fine-grained PAT":  (r"\b(github_pat_[A-Za-z0-9_]{82})\b", "📦"),
+    "GitHub Actions Token":     (r"\b(ghs_[A-Za-z0-9]{36}|ghr_[A-Za-z0-9]{36})\b", "📦"),
+    "GitHub OAuth Token":       (r"\b(gho_[A-Za-z0-9]{36})\b", "📦"),
+    "GitLab Token":             (r"\b(glpat-[A-Za-z0-9_\-]{20})\b", "📦"),
+    "NPM Token":                (r"\b(npm_[A-Za-z0-9]{36})\b", "📦"),
+    "Docker Hub Token":         (r"(?:DOCKER_TOKEN|DOCKERHUB_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "📦"),
+
+    # ── Email / Communication ★ NEW ───────────────────────────────────────────
+    "Resend API Key":           (r"\b(re_[A-Za-z0-9_]{24,})\b", "📨"),
+    "Loops API Key":            (r"(?:LOOPS_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "📨"),
+    "Postmark Server Token":    (r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b(?=.*postmark)", "📨"),
+    "SendGrid API Key":         (r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b", "📨"),
+    "Mailchimp API Key":        (r"\b([0-9a-f]{32}-us\d{1,2})\b", "📨"),
+    "Mailgun API Key":          (r"\b(key-[0-9a-zA-Z]{32})\b", "📨"),
+    "Slack Bot Token":          (r"\b(xoxb-[0-9]+-[0-9]+-[A-Za-z0-9]+)\b", "📨"),
+    "Slack User Token":         (r"\b(xoxp-[0-9A-Za-z\-]{40,})\b", "📨"),
+    "Slack App Token":          (r"\b(xapp-[0-9]-[A-Z0-9]+-[0-9]+-[a-f0-9]+)\b", "📨"),
+    "Slack Webhook URL":        (r"\b(https://hooks\.slack\.com/services/T[A-Z0-9]{8}/B[A-Z0-9]{8}/[A-Za-z0-9]{24})\b", "📨"),
+    "Discord Bot Token":        (r"\b([MN][A-Za-z0-9]{23}\.[A-Za-z0-9_\-]{6}\.[A-Za-z0-9_\-]{27,})\b", "📨"),
+    "Discord Webhook URL":      (r"\b(https://discord(?:app)?\.com/api/webhooks/\d{17,19}/[A-Za-z0-9_\-]{68})\b", "📨"),
+    "Twilio Account SID":       (r"\b(AC[a-f0-9]{32})\b", "📨"),
+    "Twilio Auth Token":        (r"(?:TWILIO_AUTH_TOKEN)\s*[=:]\s*['\"]?([a-f0-9]{32})", "📨"),
+    "Courier API Key":          (r"(?:COURIER_AUTH_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "📨"),
+
+    # ── Observability ★ NEW ────────────────────────────────────────────────────
+    "Sentry DSN":               (r"\b(https://[a-f0-9]{32}@o\d+\.ingest\.(?:sentry|us)\.io/\d+)\b", "📡"),
+    "LogRocket App ID":         (r"(?:LOGROCKET_APP_ID|LogRocket\.init)\s*[^'\"]*['\"]([a-z0-9]+/[a-z0-9\-]+)['\"]", "📡"),
+    "Datadog API Key":          (r"(?:DD_API_KEY|datadog.{0,10}key)\s*[=:]\s*['\"]?([a-f0-9]{32})\b", "📡"),
+    "Datadog App Key":          (r"(?:DD_APP_KEY)\s*[=:]\s*['\"]?([a-f0-9]{40})\b", "📡"),
+    "New Relic License Key":    (r"\b([A-Za-z0-9]{40})(?=.*newrelic)", "📡"),
+    "Grafana API Token":        (r"\b(glsa_[A-Za-z0-9_]{32})\b", "📡"),
+    "Axiom API Token":          (r"(?:AXIOM_TOKEN)\s*[=:]\s*['\"]?(xaat-[A-Za-z0-9_\-]{36,})", "📡"),
+
+    # ── Firebase / Google ─────────────────────────────────────────────────────
+    "Firebase API Key (ctx)":   (r"(?:apiKey|api_key)\s*[=:]\s*['\"]?(AIza[0-9A-Za-z_-]{35})['\"]", "🔥"),
+    "Firebase API Key (raw)":   (r"\b(AIza[0-9A-Za-z\-_]{35})\b", "🔥"),
+    "Firebase authDomain":      (r"authDomain\s*[=:]\s*['\"]([a-z0-9\-]+\.firebaseapp\.com)['\"]", "🔥"),
+    "Firebase projectId":       (r"projectId\s*[=:]\s*['\"]([a-z0-9\-]{4,40})['\"]", "🔥"),
+    "Firebase storageBucket":   (r"storageBucket\s*[=:]\s*['\"]([a-z0-9\-]+\.(?:appspot|firebasestorage)\.com)['\"]", "🔥"),
+    "Firebase messagingSenderId":(r"messagingSenderId\s*[=:]\s*['\"](\d{10,15})['\"]", "🔥"),
+    "Firebase appId":           (r"appId\s*[=:]\s*['\"]([0-9]:[\d]+:[a-z]:[a-f0-9]{16,})['\"]", "🔥"),
+    "Firebase DB URL":          (r"\b(https://[a-z0-9\-]+\.firebaseio\.com)\b", "🔥"),
+    "Firebase Realtime DB":     (r"\b(https://[a-z0-9\-]+\.asia-southeast1\.firebasedatabase\.app)\b", "🔥"),
+
+    # ── Social / OAuth ────────────────────────────────────────────────────────
+    "Facebook App ID":          (r"(?:appId|fbAppId|fb_app_id)\s*[=:'\"]{1,3}\s*['\"]?(\d{13,18})", "📱"),
+    "Facebook Pixel ID":        (r"fbq\s*\(\s*['\"]init['\"]\s*,\s*['\"]?(\d{13,18})", "📱"),
+    "Facebook Access Token":    (r"\b(EAAa[A-Za-z0-9]{100,})\b", "📱"),
+    "Google Client ID":         (r"\b([0-9]{10,20}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com)\b", "📱"),
+    "TikTok Pixel":             (r"ttq\.load\s*\(['\"]([A-Z0-9]{15,20})['\"]", "📱"),
+    "LinkedIn Partner ID":      (r"_linkedin_partner_id\s*=\s*['\"]?(\d{5,12})", "📱"),
+    "Twitter/X Bearer Token":   (r"(?:TWITTER_BEARER_TOKEN|twitter.{0,10}bearer)\s*[=:]\s*['\"]?(AAAA[A-Za-z0-9%_\-]{60,})", "📱"),
+    "Pinterest App ID":         (r"(?:PINTEREST_APP_ID|pintrk).{0,20}['\"](\d{10,18})['\"]", "📱"),
+
+    # ── Analytics ─────────────────────────────────────────────────────────────
+    "Google Analytics 4":       (r"\b(G-[A-Z0-9]{8,12})\b", "📊"),
+    "Google Analytics UA":      (r"\b(UA-\d{5,12}-\d{1,3})\b", "📊"),
+    "Google Tag Manager":       (r"\b(GTM-[A-Z0-9]{6,8})\b", "📊"),
+    "Google Ads":               (r"\b(AW-\d{9,12})\b", "📊"),
+    "Hotjar Site ID":           (r"(?:hjid|HOTJAR_ID)\s*[=:,]\s*['\"]?(\d{5,10})", "📊"),
+    "Mixpanel Token":           (r"mixpanel\.init\s*\(\s*['\"]([a-f0-9]{32})['\"]", "📊"),
+    "Segment Write Key":        (r"(?:analytics|segment)\.load\s*\(\s*['\"]([A-Za-z0-9]{20,40})['\"]", "📊"),
+    "Amplitude API Key":        (r"(?:amplitude|Amplitude)\.init\s*\(\s*['\"]([a-f0-9]{32})['\"]", "📊"),
+    "Heap Analytics ID":        (r"heap\.load\s*\(\s*['\"]?(\d{8,12})", "📊"),
+    "PostHog API Key":          (r"(?:posthog\.init|POSTHOG_KEY)\s*['\",\(]*([A-Za-z0-9_\-]{30,50})", "📊"),
+
+    # ── Captcha Keys ──────────────────────────────────────────────────────────
+    "reCAPTCHA Sitekey":        (r'data-sitekey=["\']([0-9A-Za-z_\-]{40})["\']', "🔑"),
+    "reCAPTCHA v3 render":      (r"(?:render|execute)\s*\(\s*['\"]([6L][A-Za-z0-9_\-]{38})['\"]", "🔑"),
+    "hCaptcha Sitekey":         (r'(?:sitekey|data-sitekey)\s*[=:]\s*["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']', "🔑"),
+    "Cloudflare Turnstile":     (r'(?:sitekey|data-sitekey)\s*[=:]\s*["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', "🔑"),
+
+    # ── JWT / Auth Tokens ─────────────────────────────────────────────────────
+    "JWT Token (live)":         (r"\b(eyJ[A-Za-z0-9\-_]{20,}\.eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{10,})\b", "🧬"),
+    "JWT Secret":               (r"(?:JWT_SECRET|NEXTAUTH_SECRET|TOKEN_SECRET)\s*[=:]\s*['\"]?([^\s'\"]{16,80})", "🧬"),
+    "PASETO Token":             (r"\b(v[1-4]\.[a-z]+\.[A-Za-z0-9\-_=]+)\b", "🧬"),
+
+    # ── Secrets & Credentials ─────────────────────────────────────────────────
+    "Private Key PEM":          (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "🔒"),
+    "SSH Private Key":          (r"-----BEGIN OPENSSH PRIVATE KEY-----", "🔒"),
+    "SSH RSA Key":              (r"ssh-rsa AAAA[A-Za-z0-9+/]{100,}", "🔒"),
+    "Hardcoded Password":       (r'(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\']{8,80})["\']', "🔒"),
+    "Secret Key (env)":         (r"(?:SECRET_KEY|APP_SECRET|SESSION_SECRET)\s*[=:]\s*['\"]?([^\s'\"]{16,80})", "🔒"),
+    "Encryption Key":           (r"(?:ENCRYPTION_KEY|CIPHER_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9+/=]{24,})", "🔒"),
+
+    # ── Push / Real-time ─────────────────────────────────────────────────────
+    "VAPID Public Key":         (r"(?:vapidKey|applicationServerKey)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{86,90})", "🔔"),
+    "Pusher App Key":           (r"(?:pusher|PUSHER_KEY)\s*[=:,\(]*\s*['\"]?([a-f0-9]{20})", "🔔"),
+    "Ably API Key":             (r"\b([A-Za-z0-9_\-]{8,16}\.[A-Za-z0-9_\-]{6,16}:[A-Za-z0-9_\-+/=]{30,})\b(?=.*ably)", "🔔"),
+    "Liveblocks Public Key":    (r"\b(pk_(?:dev|prod)_[A-Za-z0-9]{30,})\b", "🔔"),
+    "Partykit Key":             (r"(?:PARTYKIT_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{20,})", "🔔"),
+
+    # ── Payments (Publishable/Non-sensitive only) ─────────────────────────────
+    "Stripe Publishable Key":   (r"\b(pk_(?:live|test)_[A-Za-z0-9]{24,})\b", "💳"),
+    "Razorpay Key ID":          (r"\b(rzp_(?:live|test)_[A-Za-z0-9]{14})\b", "💳"),
+
+    # ── Misc / Generic ────────────────────────────────────────────────────────
+    "Bearer Token":             (r"[Bb]earer\s+(eyJ[A-Za-z0-9\-_.]{30,}|[A-Za-z0-9_\-]{40,200})", "🌐"),
+    "Mapbox Token":             (r"\b(pk\.eyJ[A-Za-z0-9._\-]{20,})\b", "🌐"),
+    "Algolia App ID":           (r"\b([A-Z0-9]{10})\b(?=.*algolia)", "🌐"),
+    "Algolia API Key":          (r"(?:apiKey|ALGOLIA_KEY)\s*[=:]\s*['\"]([a-f0-9]{32})['\"]", "🌐"),
+    "Bing Maps Key":            (r"\b(A[a-zA-Z0-9_\-]{80})\b(?=.*bing)", "🌐"),
+    "IPInfo Token":             (r"ipinfo\.io[^'\"]*[?/]([a-f0-9]{14})", "🌐"),
+    "Abstract API Key":         (r"(?:abstract.{0,20}key)\s*[=:]\s*['\"]([a-f0-9]{32})['\"]", "🌐"),
+    "API Key (generic env)":    (r"(?:API_KEY|APIKEY)\s*[=:]\s*['\"]([A-Za-z0-9_\-]{20,80})['\"]", "🌐"),
 }
+
+# ── Category map (same as before + new ones) ─────────────────────────────────
 _KD_CATEGORIES = {
     "☁️": "Cloud & Infra",
     "🤖": "AI / ML",
+    "🗄️": "Database",
+    "🔐": "Auth & Identity",
     "📦": "Version Control / DevOps",
-    "📨": "Communication & Messaging",
-    "💳": "Payment Gateways",
+    "📨": "Email & Messaging",
+    "📡": "Observability",
     "🔥": "Firebase / Google",
     "📱": "Social / OAuth",
     "📊": "Analytics & Tracking",
     "🔑": "Captcha Keys",
-    "🧬": "JWT Tokens",
+    "🧬": "JWT & Auth Tokens",
     "🔒": "Secrets & Credentials",
+    "🔔": "Push / Real-time",
+    "💳": "Payment (Publishable)",
     "🌐": "Generic / Other",
-    "🔔": "Push Notifications",
 }
+
+# ── Severity scoring per category ─────────────────────────────────────────────
+_KD_SEVERITY = {
+    "🔒": "CRITICAL",   # Private keys, passwords, DB URIs
+    "🤖": "CRITICAL",   # AI API keys (often have billing)
+    "☁️": "CRITICAL",   # Cloud infra
+    "🗄️": "CRITICAL",   # Database connections
+    "🔐": "HIGH",       # Auth secrets
+    "🧬": "HIGH",       # JWT secrets
+    "📨": "HIGH",       # Comms API keys
+    "📡": "HIGH",       # Observability (error/log data)
+    "📦": "HIGH",       # Source code access
+    "🔥": "MEDIUM",     # Firebase (public keys, but config leak)
+    "📱": "MEDIUM",     # Social (app IDs usually public)
+    "🔑": "LOW",        # Captcha sitekeys (public by design)
+    "🔔": "MEDIUM",     # Push keys
+    "💳": "LOW",        # Publishable payment keys (public by design)
+    "📊": "LOW",        # Analytics IDs (public by design)
+    "🌐": "MEDIUM",     # Generic (context-dependent)
+}
+
+# Compile patterns once
+_KD_COMPILED = {
+    label: (re.compile(pat, re.IGNORECASE | re.MULTILINE), icon)
+    for label, (pat, icon) in _KD_PATTERNS.items()
+}
+
 
 # ─── Shannon entropy calculator ───────────────────────────────
 def _entropy(s: str) -> float:
