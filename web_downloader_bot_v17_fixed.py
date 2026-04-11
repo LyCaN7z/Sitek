@@ -6106,7 +6106,7 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
 # ── ENH3: Sub-page sitekey scanner ───────────────────────────────────────
 _SITEKEY_SUBPAGES = [
     "/login", "/signin", "/sign-in", "/register", "/signup", "/sign-up",
-    "/checkout", "/cart", "/pay", "/payment", "/contact", "/contact-us",
+    "/checkout", "/cart", "/pay", "/payment", "/contact", "/contact-us", "/donation",
     "/donate", "/support", "/reset-password", "/forgot-password",
 ]
 
@@ -6252,6 +6252,38 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     playwright_network_log = result.get("network_log", [])
     if playwright_network_log:
         live_result["network_log"] = live_result.get("network_log", []) + playwright_network_log
+
+    # ── ENH: scan live response bodies as JSON for embedded sitekey configs ──
+    # Some providers embed sitekey inside JSON API responses (e.g. /config.json)
+    _sk_seen: set = {f.get("type","") + ":" + f.get("site_key","") for f in result.get("findings",[])}
+    _sk_net_log = [
+        {"url": r.get("url",""), "response_body": r.get("body",""),
+         "response_headers": r.get("headers",{})}
+        for r in live_result.get("live_requests", [])
+    ]
+    # Scan JSON responses for sitekey field names
+    _sk_patterns = [
+        ("reCAPTCHA sitekey (JSON)", re.compile(r'(?i)"siteKey"\s*:\s*"(6[A-Za-z0-9_\-]{38})"')),
+        ("hCaptcha sitekey (JSON)",  re.compile(r'(?i)"sitekey"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"')),
+        ("Turnstile sitekey (JSON)", re.compile(r'(?i)"siteKey"\s*:\s*"(0x4[A-Za-z0-9_]{20,})"')),
+        ("Captcha key (response header)", re.compile(r'(?i)x-(?:captcha|recaptcha|hcaptcha)-key:\s*([A-Za-z0-9_\-]{20,})')),
+    ]
+    for entry in _sk_net_log:
+        body = entry.get("response_body", "")
+        if not body:
+            continue
+        for ktype, pat in _sk_patterns:
+            for m in pat.finditer(body):
+                val = m.group(1).strip()
+                dedup = ktype + ":" + val
+                if dedup not in _sk_seen and len(val) >= 8:
+                    _sk_seen.add(dedup)
+                    result.setdefault("findings", []).append({
+                        "type":     ktype,
+                        "site_key": val,
+                        "source":   f"JSON response ← {entry.get('url','')[:70]}",
+                        "confidence": "HIGH ✅",
+                    })
 
     result["live_result"] = live_result
     return result
@@ -8238,6 +8270,402 @@ def _gather_all_text_v2(data: dict, live_result: dict | None = None) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# 🔬  ENH: API RESPONSE DEEP SCAN HELPERS
+#     Used by: /apikeys /keydump /paykeys /hiddenkeys /sitekey
+# ══════════════════════════════════════════════════════════════════════
+
+# ── ENH-A: Sensitive JSON field names ─────────────────────────────────
+_JSON_SENSITIVE_KEY_RE = re.compile(
+    r"""(?ix)^(?:
+        api[_\-]?key|apikey|access[_\-]?token|secret[_\-]?key|private[_\-]?key|
+        auth[_\-]?token|bearer|password|passwd|credential|client[_\-]?secret|
+        app[_\-]?secret|webhook[_\-]?secret|signing[_\-]?key|encryption[_\-]?key|
+        service[_\-]?account|db[_\-]?pass(?:word)?|database[_\-]?url|
+        connection[_\-]?string|stripe[_\-]?key|firebase[_\-]?key|
+        supabase[_\-]?key|openai[_\-]?key|twilio[_\-]?auth|
+        access[_\-]?key[_\-]?id|secret[_\-]?access[_\-]?key|
+        admin[_\-]?key|master[_\-]?key|root[_\-]?password
+    )$"""
+)
+
+
+def _extract_json_blocks_from_text(text: str) -> list:
+    """Extract parseable JSON objects/arrays from arbitrary text."""
+    blocks = []
+    # Case 1: pure JSON
+    stripped = text.strip()
+    if stripped and stripped[0] in ('{', '['):
+        try:
+            blocks.append(json.loads(stripped))
+            return blocks
+        except (json.JSONDecodeError, ValueError):
+            pass
+    # Case 2: JS variable assignments  var x = {...}
+    for m in re.finditer(
+        r'(?:window\.__\w+|var\s+\w+|const\s+\w+|let\s+\w+|\w+)\s*=\s*(\{[^}{]{20,}\})',
+        text, re.S
+    ):
+        if len(m.group(1)) > 5000:
+            continue
+        try:
+            blocks.append(json.loads(m.group(1)))
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return blocks
+
+
+def _traverse_json_for_keys(obj, source: str, patterns: list,
+                             findings: list, seen: set,
+                             path: str = "$", depth: int = 0) -> None:
+    """
+    ENH-A: Recursively traverse a JSON object.
+    Captures:
+      - Values whose key name matches _JSON_SENSITIVE_KEY_RE
+      - Values that match any of patterns[]
+    """
+    if depth > 12:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            cur = f"{path}.{k}"
+            if isinstance(v, str) and len(v) >= 8:
+                # Sensitive key name → record value directly
+                if _JSON_SENSITIVE_KEY_RE.match(str(k)):
+                    dedup = f"json_field:{k}:{v[:60]}"
+                    if dedup not in seen:
+                        seen.add(dedup)
+                        findings.append({
+                            "type":      f"JSON field: {k}",
+                            "value":     v[:200],
+                            "source":    source,
+                            "json_path": cur,
+                        })
+                else:
+                    # Pattern-scan the string value
+                    for ktype, pat in patterns:
+                        m = pat.search(v)
+                        if m:
+                            val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                            dedup = f"{ktype}:{val[:60]}"
+                            if dedup not in seen and len(val) >= 8:
+                                seen.add(dedup)
+                                findings.append({
+                                    "type":      ktype,
+                                    "value":     val[:200],
+                                    "source":    source,
+                                    "json_path": cur,
+                                })
+            if isinstance(v, (dict, list)):
+                _traverse_json_for_keys(v, source, patterns, findings, seen, cur, depth + 1)
+    elif isinstance(obj, list):
+        for i, item in enumerate(obj[:100]):
+            _traverse_json_for_keys(item, source, patterns, findings, seen,
+                                    f"{path}[{i}]", depth + 1)
+
+
+def _deep_json_response_scan(network_log: list, patterns: list, seen: set) -> list:
+    """
+    ENH-A: Scan every API response body as JSON (recursive).
+    Much better than flat regex for nested configs like:
+      {"data":{"config":{"apiKey":"sk-..."}}}
+    """
+    findings = []
+    for entry in network_log:
+        body = entry.get("response_body", "")
+        if not body or len(body) < 20:
+            continue
+        url_label = f"JSON response ← {entry.get('url','')[:70]}"
+        for block in _extract_json_blocks_from_text(body):
+            _traverse_json_for_keys(block, url_label, patterns, findings, seen)
+    return findings
+
+
+# ── ENH-B: Response Header + Cookie Scanner ──────────────────────────
+_SENSITIVE_RESP_HEADER_RE = re.compile(
+    r"""(?ix)^x-(?:api|auth|access|internal|service|secret|app|client)-?
+        (?:key|token|secret|credential|header)?$
+        |^authorization$|^x-goog-api-key$|^x-amz-security-token$
+        |^x-shopify-access-token$|^x-hasura-admin-secret$
+        |^cf-access-client-secret$"""
+)
+_SENSITIVE_COOKIE_RE = re.compile(
+    r'(?i)(?:auth|token|session|jwt|api.?key|secret|bearer|access|credential)', re.I
+)
+
+
+def _response_header_cookie_scan(network_log: list, patterns: list, seen: set) -> list:
+    """
+    ENH-B: Scan HTTP response headers and Set-Cookie for leaked keys.
+    Existing engine scans REQUEST headers (live intercept) but never
+    scans RESPONSE headers — common place devs accidentally leak tokens.
+    """
+    findings = []
+    for entry in network_log:
+        url_short = entry.get("url", "")[:70]
+        hdrs = entry.get("response_headers", {}) or {}
+
+        for hname, hval in hdrs.items():
+            if not hval:
+                continue
+            hval_str = str(hval)
+
+            # Sensitive header name → grab value directly
+            if _SENSITIVE_RESP_HEADER_RE.match(hname.lower()):
+                # Strip Bearer/Token prefix
+                cleaned = re.sub(r"^(?:Bearer|Token)\s+", "", hval_str, flags=re.I).strip()
+                if len(cleaned) >= 8:
+                    dedup = f"resp_hdr:{hname}:{cleaned[:60]}"
+                    if dedup not in seen:
+                        seen.add(dedup)
+                        findings.append({
+                            "type":   f"Response Header: {hname}",
+                            "value":  cleaned[:200],
+                            "source": f"HTTP resp header ← {url_short}",
+                        })
+
+            # Pattern scan on any header value
+            for ktype, pat in patterns:
+                m = pat.search(hval_str)
+                if m:
+                    val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                    dedup = f"{ktype}:{val[:60]}"
+                    if dedup not in seen and len(val) >= 8:
+                        seen.add(dedup)
+                        findings.append({
+                            "type":   ktype,
+                            "value":  val[:200],
+                            "source": f"Response header ({hname}) ← {url_short}",
+                        })
+
+            # Set-Cookie: scan cookie values
+            if hname.lower() == "set-cookie":
+                for cookie_seg in hval_str.split(";"):
+                    if "=" not in cookie_seg:
+                        continue
+                    c_name, _, c_val = cookie_seg.strip().partition("=")
+                    c_val = c_val.strip().strip('"')
+                    if len(c_val) < 16:
+                        continue
+                    if _SENSITIVE_COOKIE_RE.search(c_name):
+                        dedup = f"cookie:{c_name.strip()}:{c_val[:60]}"
+                        if dedup not in seen:
+                            seen.add(dedup)
+                            findings.append({
+                                "type":   f"Cookie: {c_name.strip()}",
+                                "value":  c_val[:200],
+                                "source": f"Set-Cookie ← {url_short}",
+                            })
+                    for ktype, pat in patterns:
+                        m2 = pat.search(c_val)
+                        if m2:
+                            val = (m2.group(1) if m2.lastindex else m2.group(0)).strip()
+                            dedup = f"{ktype}:{val[:60]}"
+                            if dedup not in seen and len(val) >= 8:
+                                seen.add(dedup)
+                                findings.append({
+                                    "type":   ktype,
+                                    "value":  val[:200],
+                                    "source": f"Cookie ({c_name.strip()}) ← {url_short}",
+                                })
+    return findings
+
+
+# ── ENH-C: JWT Payload Embedded Key Scanner ───────────────────────────
+_JWT_FULL_RE = re.compile(
+    r"(eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,})"
+)
+_JWT_FIELD_RE = re.compile(
+    r"(?i)(?:api.?key|apikey|secret|password|token|credential|key|auth)", re.I
+)
+
+
+def _decode_jwt_payload_safe(token: str):
+    """Base64url-decode the JWT payload (middle part). Returns dict or None."""
+    try:
+        import base64 as _b64
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        pad = parts[1] + "=" * (-len(parts[1]) % 4)
+        raw = _b64.urlsafe_b64decode(pad)
+        return json.loads(raw.decode("utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+
+def _jwt_payload_scan(all_text_sources: list, patterns: list, seen: set) -> list:
+    """
+    ENH-C: Find JWT tokens → base64-decode payload → scan for embedded secrets.
+    Dev mistake: including api_key / internal_token inside JWT claims.
+    """
+    findings = []
+    seen_jwts: set = set()
+    for text, label in all_text_sources:
+        for jwt_m in _JWT_FULL_RE.finditer(text):
+            tok = jwt_m.group(1)
+            if tok in seen_jwts:
+                continue
+            seen_jwts.add(tok)
+            payload = _decode_jwt_payload_safe(tok)
+            if not isinstance(payload, dict):
+                continue
+            payload_str = json.dumps(payload)
+            # Sensitive field names in payload
+            for field, fval in payload.items():
+                if not isinstance(fval, str) or len(fval) < 8:
+                    continue
+                if _JWT_FIELD_RE.search(str(field)):
+                    dedup = f"jwt_field:{field}:{fval[:60]}"
+                    if dedup not in seen:
+                        seen.add(dedup)
+                        findings.append({
+                            "type":   f"JWT Payload field: {field}",
+                            "value":  fval[:200],
+                            "source": f"JWT payload ← {label[:60]}",
+                        })
+            # Pattern scan full payload JSON
+            for ktype, pat in patterns:
+                m2 = pat.search(payload_str)
+                if m2:
+                    val = (m2.group(1) if m2.lastindex else m2.group(0)).strip()
+                    dedup = f"{ktype}:{val[:60]}"
+                    if dedup not in seen and len(val) >= 8:
+                        seen.add(dedup)
+                        findings.append({
+                            "type":   ktype,
+                            "value":  val[:200],
+                            "source": f"JWT payload ← {label[:60]}",
+                        })
+    return findings
+
+
+# ── ENH-D: WebSocket Message Deep Scanner ────────────────────────────
+def _websocket_deep_scan(live_result: dict, patterns: list, seen: set) -> list:
+    """
+    ENH-D: WS frame data → JSON parse → recursive traverse.
+    Old code only regex-scans raw WS text — nested JSON frames missed.
+    e.g. {"event":"auth","data":{"token":"sk-..."}}
+    """
+    findings = []
+    frames = (
+        live_result.get("ws_messages", []) +
+        live_result.get("websocket_frames", []) +
+        live_result.get("ws_frames", [])
+    )
+    for frame in frames:
+        data_str = (
+            frame.get("data", "") or frame.get("message", "")
+            if isinstance(frame, dict) else str(frame)
+        )
+        if len(data_str) < 10:
+            continue
+        # Raw pattern scan
+        for ktype, pat in patterns:
+            m = pat.search(data_str)
+            if m:
+                val = (m.group(1) if m.lastindex else m.group(0)).strip()
+                dedup = f"{ktype}:{val[:60]}"
+                if dedup not in seen and len(val) >= 8:
+                    seen.add(dedup)
+                    findings.append({
+                        "type":   ktype,
+                        "value":  val[:200],
+                        "source": "WebSocket frame",
+                    })
+        # JSON deep scan
+        for block in _extract_json_blocks_from_text(data_str):
+            _traverse_json_for_keys(block, "WebSocket frame (JSON)", patterns,
+                                    findings, seen)
+    return findings
+
+
+# ── ENH-E: GraphQL Response Deep Scanner ─────────────────────────────
+_GQL_URL_RE = re.compile(r"(?i)/graphql|/gql|/api/graphql|__schema")
+
+
+def _graphql_response_deep_scan(network_log: list, patterns: list, seen: set) -> list:
+    """
+    ENH-E: GraphQL response bodies → JSON traverse.
+    Schema descriptions & query variables sometimes leak internal keys.
+    """
+    findings = []
+    for entry in network_log:
+        if not _GQL_URL_RE.search(entry.get("url", "")):
+            continue
+        body = entry.get("response_body", "")
+        if not body or len(body) < 20:
+            continue
+        label = f"GraphQL ← {entry.get('url','')[:70]}"
+        for block in _extract_json_blocks_from_text(body):
+            _traverse_json_for_keys(block, label, patterns, findings, seen)
+    return findings
+
+
+# ── ENH-F: Browser Storage Dump Scanner ─────────────────────────────
+# JS eval snippet — inject via Playwright to capture storage + state blobs
+_ENH_STORAGE_JS_EVAL = """() => {
+    const r = {};
+    // localStorage
+    try { for(let i=0;i<localStorage.length;i++){
+        const k=localStorage.key(i), v=localStorage.getItem(k);
+        if(v&&v.length>8) r['ls:'+k]=v.slice(0,1000);
+    }} catch(e){}
+    // sessionStorage
+    try { for(let i=0;i<sessionStorage.length;i++){
+        const k=sessionStorage.key(i), v=sessionStorage.getItem(k);
+        if(v&&v.length>8) r['ss:'+k]=v.slice(0,1000);
+    }} catch(e){}
+    // Cookies
+    try { r['_cookies']=document.cookie.slice(0,2000); } catch(e){}
+    // Framework state blobs
+    ['__NEXT_DATA__','__REDUX_STATE__','__INITIAL_STATE__','__nuxt',
+     '__APOLLO_STATE__','__APP_STATE__','__PRELOADED_STATE__'].forEach(k=>{
+        try{const v=window[k];
+            if(v) r['state:'+k]=JSON.stringify(v).slice(0,4000);
+        }catch(e){}
+    });
+    // window env objects
+    ['__ENV__','_env_','ENV','REACT_APP_ENV','VUE_APP_ENV'].forEach(k=>{
+        try{const v=window[k];
+            if(v&&typeof v==='object') r['env:'+k]=JSON.stringify(v).slice(0,2000);
+        }catch(e){}
+    });
+    return r;
+}"""
+
+
+def _browser_storage_scan(dom_result: dict, patterns: list, seen: set) -> list:
+    """
+    ENH-F: Scan localStorage, sessionStorage, cookies, Redux/Next state blobs.
+    dom_result should be the result of evaluating _ENH_STORAGE_JS_EVAL.
+    """
+    findings = []
+    for store_key, store_val in (dom_result or {}).items():
+        if not store_val or len(str(store_val)) < 8:
+            continue
+        val_str = str(store_val)
+        label = f"Browser storage [{store_key}]"
+        # Pattern scan
+        for ktype, pat in patterns:
+            m = pat.search(val_str)
+            if m:
+                matched = (m.group(1) if m.lastindex else m.group(0)).strip()
+                dedup = f"{ktype}:{matched[:60]}"
+                if dedup not in seen and len(matched) >= 8:
+                    seen.add(dedup)
+                    findings.append({
+                        "type":   ktype,
+                        "value":  matched[:200],
+                        "source": label,
+                    })
+        # JSON deep scan (state blobs)
+        if val_str.startswith(("{", "[")):
+            for block in _extract_json_blocks_from_text(val_str):
+                _traverse_json_for_keys(block, label, patterns, findings, seen)
+    return findings
+
+
+# ══════════════════════════════════════════════════════════════════════
 # 🌐  SHARED DYNAMIC HELPERS  (Option A + Option B)
 #     Used by: /apikeys /hiddenkeys /paykeys /firebase
 #              /socialkeys /analytics /pushkeys /sitekey
@@ -8933,6 +9361,41 @@ _ENV_INJECT_PATTERNS = [
     ("Webpack env obj",   re.compile(
         r'"(?:REACT_APP|NEXT_PUBLIC|VITE_|VUE_APP)_([A-Z_]+)"\s*:\s*"([A-Za-z0-9_\-+=/]{10,120})"'
     )),
+    # ── ENH-G: Extended Provider Patterns ────────────────────────────
+    ("Azure Storage Key",
+     re.compile(r'(?i)(?:AccountKey|azure.{0,10}key)\s*[=:]\s*["\']?([A-Za-z0-9+/]{86}==)')),
+    ("Azure SAS Token",
+     re.compile(r'(sv=\d{4}-\d{2}-\d{2}&s[sco]=\w+&sp=\w+&se=[\w%:+\-]+&sig=[\w%+=]{20,})')),
+    ("Azure Client Secret",
+     re.compile(r'(?i)AZURE_CLIENT_SECRET\s*[=:]\s*["\']?([A-Za-z0-9~._\-]{34,})')),
+    ("GCP Service Account Key ID",
+     re.compile(r'"private_key_id"\s*:\s*"([a-f0-9]{40})"')),
+    ("Vercel Token",
+     re.compile(r'(?i)vercel.{0,10}token\s*[=:]\s*["\']?([A-Za-z0-9_\-]{24,})')),
+    ("Netlify Access Token",
+     re.compile(r'\b(nfp_[A-Za-z0-9]{40,})\b')),
+    ("Railway Token",
+     re.compile(r'(?i)RAILWAY_TOKEN\s*[=:]\s*["\']?([A-Za-z0-9_\-]{32,})')),
+    ("Stripe Webhook Secret",
+     re.compile(r'\b(whsec_[A-Za-z0-9]{32,})\b')),
+    ("Supabase Service Role Key",
+     re.compile(r'(?i)supabase.{0,20}service.?role\s*[=:]\s*["\']?([A-Za-z0-9._\-]{80,})')),
+    ("Cloudflare API Token",
+     re.compile(r'(?i)(?:cf.?token|cloudflare.?api.?key)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{40})')),
+    ("Algolia Admin API Key",
+     re.compile(r'(?i)algolia.{0,20}(?:admin|api).?key\s*[=:]\s*["\']?([a-f0-9]{32})')),
+    ("Sentry DSN",
+     re.compile(r'https://([a-f0-9]{32})@o\d+\.ingest\.sentry\.io/\d+')),
+    ("Datadog API Key",
+     re.compile(r'(?i)(?:dd|datadog).?api.?key\s*[=:]\s*["\']?([a-f0-9]{32})')),
+    ("New Relic License Key",
+     re.compile(r'\b(NRAK-[A-Z0-9]{27})\b')),
+    ("Pusher App Secret",
+     re.compile(r'(?i)pusher.{0,20}secret\s*[=:]\s*["\']?([a-f0-9]{20,})')),
+    ("Neon/PlanetScale DB URL",
+     re.compile(r'(?:postgresql|mysql)://[^:]+:([^@]{20,})@[^/]+\.(?:neon\.tech|psdb\.cloud)')),
+    ("Telegram Bot Token",
+     re.compile(r'\b(\d{8,12}:[A-Za-z0-9_\-]{35})\b')),
 ]
 
 
@@ -9319,6 +9782,25 @@ def _apikeys_sync(url: str, progress_cb=None) -> dict:
                              f"EXPOSED FILE: {env_path}")
     except Exception:
         pass
+
+    # ── ENH: Deep JSON / Response Header / JWT / WebSocket / GraphQL / Storage ─
+    if progress_cb:
+        progress_cb("🔬 ENH: Deep JSON + Header + JWT + WS scan...")
+    _all_patterns = _API_KEY_PATTERNS
+    # Re-use the same seen set (already populated above) to avoid duplicates
+    enh_network_log = data.get("network_log", [])
+    for ef in _deep_json_response_scan(enh_network_log, _all_patterns, seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _response_header_cookie_scan(enh_network_log, _all_patterns, seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _jwt_payload_scan(_gather_all_text(data), _all_patterns, seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _websocket_deep_scan(live_result, _all_patterns, seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _graphql_response_deep_scan(enh_network_log, _all_patterns, seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _browser_storage_scan(data.get("dom_result") or {}, _all_patterns, seen):
+        _add(ef["type"], ef["value"], ef["source"])
 
     # Phase 3: Live validation of discovered keys
     if progress_cb:
@@ -10745,6 +11227,24 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         except Exception:
             pass
 
+    # ── ENH: Deep JSON / Header / JWT / WebSocket / GraphQL / Storage ─────────
+    if progress_cb:
+        progress_cb("🔬 ENH: Deep JSON + Response Header + JWT + WS scan...")
+    _pay_seen: set = {f["type"] + ":" + f["value"][:80] for f in findings}
+    _enh_net  = data.get("network_log", [])
+    for ef in _deep_json_response_scan(_enh_net, _PAY_PATTERNS, _pay_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _response_header_cookie_scan(_enh_net, _PAY_PATTERNS, _pay_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _jwt_payload_scan(_gather_all_text_v2(data, live_result), _PAY_PATTERNS, _pay_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _websocket_deep_scan(live_result, _PAY_PATTERNS, _pay_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _graphql_response_deep_scan(_enh_net, _PAY_PATTERNS, _pay_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _browser_storage_scan(data.get("dom_result") or {}, _PAY_PATTERNS, _pay_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+
     return {
         "error":    None,
         "findings": findings,
@@ -11010,6 +11510,17 @@ def _socialkeys_sync(url: str, progress_cb=None) -> dict:
             mm = pat.search(s)
             if mm:
                 _add(key_type, (mm.group(1) if mm.lastindex else mm.group(0)), f"window.{k}")
+
+    # ── ENH: Deep JSON + Response Header + JWT scan ───────────────────
+    _ss = {f["type"] + ":" + f["value"][:80] for f in findings}
+    _sn = data.get("network_log", [])
+    for ef in _deep_json_response_scan(_sn, _SOCIAL_PATTERNS, _ss):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _response_header_cookie_scan(_sn, _SOCIAL_PATTERNS, _ss):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _jwt_payload_scan(_gather_all_text(data), _SOCIAL_PATTERNS, _ss):
+        _add(ef["type"], ef["value"], ef["source"])
+
     return {"error": None, "findings": findings, "page_url": data["page_url"],
             "requests": len(data.get("network_log", []))}
 
@@ -11170,6 +11681,15 @@ def _analytics_sync(url: str, progress_cb=None) -> dict:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+
+    # ── ENH: Deep JSON + Response Header scan ─────────────────────────
+    _as = {f["type"] + ":" + f["value"] for f in findings}
+    _an = data.get("network_log", [])
+    for ef in _deep_json_response_scan(_an, _ANALYTICS_PATTERNS, _as):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _response_header_cookie_scan(_an, _ANALYTICS_PATTERNS, _as):
+        _add(ef["type"], ef["value"], ef["source"])
+
     return {"error": None, "findings": findings, "page_url": data["page_url"],
             "requests": len(data.get("network_log", []))}
 
@@ -12630,6 +13150,29 @@ def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
 
         browser.close()
 
+    # ── ENH: Deep JSON / Response Header scan on captured network log ─────────
+    # _hiddenkeys_sync uses Playwright directly; network log stored in live_result
+    _hk_net = live_result.get("live_requests", [])
+    # Build minimal network_log format from live_requests for ENH helpers
+    _hk_net_log = [
+        {"url": r.get("url",""), "response_body": r.get("body",""),
+         "response_headers": r.get("headers",{}), "post_data": r.get("post_data","")}
+        for r in _hk_net
+    ]
+    _hk_seen: set = {f["type"] + ":" + f["value"][:80] for f in findings}
+    _CSRF_PATTERNS = _JS_TOKEN_PATTERNS + _META_TOKEN_PATTERNS
+    for ef in _response_header_cookie_scan(_hk_net_log, [], _hk_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _jwt_payload_scan(
+        [(r.get("body",""), f"Live req: {r.get('url','')[:60]}") for r in _hk_net],
+        [], _hk_seen
+    ):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _websocket_deep_scan(live_result, [], _hk_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _deep_json_response_scan(_hk_net_log, [], _hk_seen):
+        _add(ef["type"], ef["value"], ef["source"])
+
     return {
         "findings": findings,
         "requests": request_count[0],
@@ -13044,6 +13587,15 @@ def _pushkeys_sync(url: str, progress_cb=None) -> dict:
             mm = pat.search(s)
             if mm:
                 _add(key_type, (mm.group(1) if mm.lastindex else mm.group(0)), f"window.{k}")
+
+    # ── ENH: Deep JSON + Response Header scan ─────────────────────────
+    _ps = {f["type"] + ":" + f["value"][:80] for f in findings}
+    _pn = data.get("network_log", [])
+    for ef in _deep_json_response_scan(_pn, _PUSH_PATTERNS, _ps):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _response_header_cookie_scan(_pn, _PUSH_PATTERNS, _ps):
+        _add(ef["type"], ef["value"], ef["source"])
+
     return {"error": None, "findings": findings, "page_url": data["page_url"],
             "requests": len(data.get("network_log", []))}
 
@@ -13181,6 +13733,15 @@ def _chatkeys_sync(url: str, progress_cb=None) -> dict:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+
+    # ── ENH: Deep JSON + Response Header scan ─────────────────────────
+    _cs = {f["type"] + ":" + f["value"][:60] for f in findings}
+    _cn = data.get("network_log", [])
+    for ef in _deep_json_response_scan(_cn, _CHAT_PATTERNS, _cs):
+        _add(ef["type"], ef["value"], ef["source"])
+    for ef in _response_header_cookie_scan(_cn, _CHAT_PATTERNS, _cs):
+        _add(ef["type"], ef["value"], ef["source"])
+
     return {"error": None, "findings": findings, "page_url": data["page_url"],
             "requests": len(data.get("network_log", []))}
 
@@ -20105,6 +20666,67 @@ def _run_keydump_sync(url: str) -> dict:
     except Exception as e:
         out["errors"].append(f"Live stream: {e}")
         out["live_result"] = {"live_requests": [], "live_findings": [], "sse_frames": []}
+
+    # ── ENH: Deep JSON / Response Header / JWT / WebSocket scan on keydump ────
+    try:
+        _kd_live   = out.get("live_result") or {}
+        _kd_net    = [
+            {"url": r.get("url",""), "response_body": r.get("body",""),
+             "response_headers": r.get("headers",{}), "post_data": r.get("post_data","")}
+            for r in _kd_live.get("live_requests", [])
+        ]
+        # Collect all pattern tuples from _KD_PATTERNS for ENH helpers
+        _kd_pats = [(lbl, pat) for lbl, (pat, _) in _KD_PATTERNS.items()]
+        _kd_seen: set = set()
+        # Build all_texts for JWT scan: live request bodies + existing corpus
+        _kd_texts = [
+            (r.get("body","") or r.get("post_data",""),
+             f"Live req: {r.get('url','')[:60]}")
+            for r in _kd_live.get("live_requests", [])
+            if r.get("body") or r.get("post_data")
+        ]
+
+        def _kd_add(typ, val, src):
+            """Add finding into keydump out structure."""
+            val = str(val).strip()
+            if len(val) < 5:
+                return
+            # Find matching _KD_PATTERNS category
+            cat_icon = "🔒"
+            for lbl, (_, ci) in _KD_PATTERNS.items():
+                if lbl in typ:
+                    cat_icon = ci
+                    break
+            bucket = out["by_category"].setdefault(cat_icon, {})
+            bucket.setdefault(typ, [])
+            if val not in bucket[typ]:
+                bucket[typ].append(val[:120])
+            out["raw_hits"].setdefault(typ, [])
+            if val not in out["raw_hits"][typ]:
+                out["raw_hits"][typ].append(val[:120])
+
+        for ef in _deep_json_response_scan(_kd_net, _kd_pats, _kd_seen):
+            _kd_add(ef["type"] + " [JSON response]", ef["value"], ef["source"])
+
+        for ef in _response_header_cookie_scan(_kd_net, _kd_pats, _kd_seen):
+            _kd_add(ef["type"], ef["value"], ef["source"])
+
+        for ef in _jwt_payload_scan(_kd_texts, _kd_pats, _kd_seen):
+            _kd_add(ef["type"], ef["value"], ef["source"])
+
+        for ef in _websocket_deep_scan(_kd_live, _kd_pats, _kd_seen):
+            _kd_add(ef["type"] + " [WebSocket]", ef["value"], ef["source"])
+
+        for ef in _graphql_response_deep_scan(_kd_net, _kd_pats, _kd_seen):
+            _kd_add(ef["type"] + " [GraphQL]", ef["value"], ef["source"])
+
+        # Browser storage from dynamic scan
+        dyn_storage = out.get("dynamic", {}).get("storage", {})
+        for ef in _browser_storage_scan(dyn_storage, _kd_pats, _kd_seen):
+            _kd_add(ef["type"] + " [storage]", ef["value"], ef["source"])
+
+    except Exception as _enh_e:
+        out["errors"].append(f"ENH scan: {_enh_e}")
 
     return out
 
