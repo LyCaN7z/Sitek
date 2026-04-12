@@ -2830,7 +2830,9 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 jr = sess.get(js_url, timeout=8, verify=False, proxies=proxy)
                 if jr.status_code == 200:
-                    js_corpus += jr.text[:50000].lower()
+                    is_obf, _ = _is_obfuscated(jr.text)
+                    if not is_obf:
+                        js_corpus += jr.text[:50000].lower()
                     js_fetched += 1
             except Exception:
                 pass
@@ -5049,17 +5051,21 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'_abck\s*=\s*["\']([A-Za-z0-9+/=]{60,})["\']', re.I),
         re.compile(r'sensor_data|ak_bmsc|bm_sz', re.I),
     ],
-    # ★ NEW: DataDome
+    # ★ NEW: DataDome — improved patterns
     "DataDome": [
         re.compile(r'tag\.datadome\.co/tags\.js', re.I),
-        re.compile(r'datadome\.co/device-check[^"\']*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
-        re.compile(r'DATADOME_CLIENT_KEY\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', re.I),
+        re.compile(r'DATADOME_CLIENT_KEY\s*[=:]\s*["\']([A-Za-z0-9_\-]{32,128})["\']', re.I),
+        re.compile(r'datadome[_\-]?key\s*[=:]\s*["\']([A-Za-z0-9_\-]{32,128})["\']', re.I),
+        re.compile(r'ddClientKey\s*[=:]\s*["\']([A-Za-z0-9_\-]{32,128})["\']', re.I),
+        re.compile(r'api\.datadome\.co/[^"\']*[?&]dd_device_id=([A-Za-z0-9_\-]{20,80})', re.I),
     ],
-    # ★ NEW: PerimeterX / HUMAN
+    # ★ NEW: PerimeterX / HUMAN — improved patterns
     "PerimeterX/HUMAN": [
-        re.compile(r'client\.px-cloud\.net/[A-Za-z0-9]+/main\.min\.js', re.I),
-        re.compile(r'px\.js\?appId=([A-Za-z0-9_\-]{8,40})', re.I),
-        re.compile(r'_pxAppId\s*[=:]\s*["\']([A-Za-z0-9_]{6,20})["\']', re.I),
+        re.compile(r'client\.px-cloud\.net/([A-Za-z0-9]{4,20})/main\.min\.js', re.I),
+        re.compile(r'px-cdn\.net/([A-Za-z0-9]{4,20})/main\.min\.js', re.I),
+        re.compile(r'collector[^"\']*[?&]appId=([A-Za-z0-9]{4,20})', re.I),
+        re.compile(r'_pxAppId\s*[=:]\s*["\']([A-Za-z0-9]{6,20})["\']', re.I),
+        re.compile(r'["\']appId["\']\s*:\s*["\']([A-Za-z0-9]{6,20})["\']', re.I),
     ],
     # ★ NEW: AWS WAF Captcha
     "AWS WAF Captcha": [
@@ -5076,13 +5082,49 @@ _CAPTCHA_PATTERNS = {
 
 # ── Key format validators ──────────────────────────────────────────────────────
 _KEY_VALIDATORS = {
+    # ── reCAPTCHA ──────────────────────────────────────────────────────────
     "reCAPTCHA v2":         lambda k: len(k) == 40 and k[0] in '6L',
     "reCAPTCHA v3":         lambda k: len(k) == 40 and k[0] in '6L',
-    "reCAPTCHA Enterprise": lambda k: len(k) == 40,
-    "hCaptcha":             lambda k: bool(re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', k, re.I)),
+    "reCAPTCHA Enterprise": lambda k: 36 <= len(k) <= 44,
+    # ── hCaptcha (UUID format) ──────────────────────────────────────────────
+    "hCaptcha":             lambda k: bool(re.match(
+        r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', k, re.I)),
+    # ── Cloudflare Turnstile ────────────────────────────────────────────────
     "Cloudflare Turnstile": lambda k: bool(re.match(r'^[01]x[A-Za-z0-9_\-]{20,60}$', k)),
-    "GeeTest":              lambda k: bool(re.match(r'^[0-9a-f]{32}$', k)),
-    "FunCaptcha":           lambda k: bool(re.match(r'^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$', k, re.I)),
+    # ── GeeTest (32-char hex) ───────────────────────────────────────────────
+    "GeeTest":              lambda k: bool(re.match(r'^[0-9a-f]{32}$', k, re.I)),
+    # ── FunCaptcha (UUID uppercase) ─────────────────────────────────────────
+    "FunCaptcha":           lambda k: bool(re.match(
+        r'^[A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12}$', k, re.I)),
+    # ── FriendlyCaptcha (FCAP_ prefix or uppercase alphanum 16-60) ─────────
+    "FriendlyCaptcha":      lambda k: (
+        k.upper().startswith("FCAP_") or
+        (16 <= len(k) <= 60 and bool(re.match(r'^[A-Z0-9_\-]+$', k.upper())))
+    ),
+    # ── MTCaptcha (mtcaptcha-pub prefix) ────────────────────────────────────
+    "MTCaptcha":            lambda k: (
+        k.lower().startswith("mtcaptcha-pub") or
+        (20 <= len(k) <= 80 and bool(re.match(r'^[A-Za-z0-9_\-]+$', k)))
+    ),
+    # ── DataDome client key (32-128 alphanum, not pure hex) ─────────────────
+    "DataDome":             lambda k: (
+        32 <= len(k) <= 128 and
+        bool(re.match(r'^[A-Za-z0-9_\-]+$', k)) and
+        not re.match(r'^[a-f0-9]{32}$', k)
+    ),
+    # ── PerimeterX appId (PX prefix + 6-20 alphanum) ────────────────────────
+    "PerimeterX/HUMAN":     lambda k: (
+        k.upper().startswith("PX") and 6 <= len(k) <= 20 and
+        bool(re.match(r'^[A-Za-z0-9]+$', k))
+    ),
+    # ── Akamai _abck token (60+ chars base64-like) ──────────────────────────
+    "Akamai Bot Manager":   lambda k: (
+        len(k) >= 60 and bool(re.match(r'^[A-Za-z0-9+/=~_\-]+$', k))
+    ),
+    # ── mCaptcha (20-60 alphanum) ────────────────────────────────────────────
+    "mCaptcha":             lambda k: (
+        20 <= len(k) <= 60 and bool(re.match(r'^[A-Za-z0-9_]+$', k))
+    ),
 }
 
 # ENH15: API live validators dict used by _validate_api_key
@@ -5238,6 +5280,31 @@ _CAPTCHA_SCRIPT_SIGS = {
 }
 
 
+# ── Action patterns: matched in ±400-char context around each sitekey ────────
+_ACTION_PATTERNS = [
+    re.compile(r'["\']action["\']\s*:\s*["\']([A-Za-z0-9_/\-]{2,64})["\']',  re.I),
+    re.compile(r'action\s*:\s*["\']([A-Za-z0-9_/\-]{2,64})["\']',            re.I),
+    re.compile(r'grecaptcha\.execute\s*\([^,]+,\s*\{[^}]*action\s*:\s*["\']([A-Za-z0-9_/\-]{2,64})["\']', re.I),
+    re.compile(r'data-action=["\']([A-Za-z0-9_/\-]{2,64})["\']',             re.I),
+]
+# ── Invisible detection patterns ──────────────────────────────────────────────
+_INVISIBLE_PATTERNS = [
+    re.compile(r'data-size=["\']invisible["\']', re.I),
+    re.compile(r'size\s*:\s*["\']invisible["\']', re.I),
+    re.compile(r'data-badge=["\'][^"\']+["\']', re.I),
+]
+# ── min_score patterns ────────────────────────────────────────────────────────
+_MIN_SCORE_PATTERNS = [
+    re.compile(r'["\']?min[_\-]?score["\']?\s*[=:]\s*([0-9]\.[0-9]+)', re.I),
+    re.compile(r'minScore\s*:\s*([0-9]\.[0-9]+)', re.I),
+]
+# ── data-s / s_param patterns ─────────────────────────────────────────────────
+_S_PARAM_PATTERNS = [
+    re.compile(r'data-s=["\']([A-Za-z0-9+/=_\-]{20,})["\']', re.I),
+    re.compile(r'["\']s["\']\s*:\s*["\']([A-Za-z0-9+/=_\-]{20,})["\']', re.I),
+]
+
+
 def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> list:
     """
     Extract captcha site_key / action / page_url from HTML + JS.
@@ -5296,6 +5363,21 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                                 action = cand
                                 break
 
+                    # ── Extract invisible / min_score / s_param from context ──
+                    invisible  = any(p.search(ctx) for p in _INVISIBLE_PATTERNS)
+                    min_score  = ""
+                    for mp in _MIN_SCORE_PATTERNS:
+                        mm = mp.search(ctx)
+                        if mm:
+                            min_score = mm.group(1)
+                            break
+                    s_param = ""
+                    for sp in _S_PARAM_PATTERNS:
+                        sm = sp.search(ctx)
+                        if sm:
+                            s_param = sm.group(1)
+                            break
+
                     findings.append({
                         "type":       cap_type,
                         "site_key":   key,
@@ -5304,11 +5386,11 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
                         "source":     source_label,
                         "theme":      "",
                         "size":       "",
-                        "invisible":  False,
+                        "invisible":  invisible,
                         "badge":      "",
-                        "min_score":  "",
+                        "min_score":  min_score,
                         "enterprise": cap_type == "reCAPTCHA Enterprise",
-                        "s_param":    "",
+                        "s_param":    s_param,
                         "hl":         "",
                         "co":         "",
                         "callback":   "",
@@ -5327,6 +5409,10 @@ def _extract_captcha_info(html: str, page_url: str, js_sources: dict = None) -> 
     # ── 3. Scan external JS sources if provided ───────────────────────────────
     if js_sources:
         for js_url, js_text in js_sources.items():
+            is_obf, obf_reason = _is_obfuscated(js_text)
+            if is_obf:
+                logger.debug("sitekey: skip obfuscated JS %s (%s)", js_url[:60], obf_reason)
+                continue
             _scan_text(js_text, f"JS: {js_url[:60]}")
 
     # ── 4. Script-src detection (captcha present but key not yet found) ───────
@@ -6289,24 +6375,82 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
     return result
 
 
+def _merge_live_results(results: list) -> dict:
+    """
+    ENH S1: Merge multiple live_result dicts into one.
+    All live_requests, live_findings, sse_frames, network_log, response_bodies combined.
+    """
+    merged = {
+        "live_requests":   [],
+        "live_findings":   [],
+        "sse_frames":      [],
+        "network_log":     [],
+        "response_bodies": {},
+    }
+    seen_req_urls = set()
+    for lr in results:
+        if not lr:
+            continue
+        for req in lr.get("live_requests", []):
+            uid = req.get("url", "")[:120]
+            if uid not in seen_req_urls:
+                seen_req_urls.add(uid)
+                merged["live_requests"].append(req)
+        merged["live_findings"].extend(lr.get("live_findings", []))
+        merged["sse_frames"].extend(lr.get("sse_frames", []))
+        merged["network_log"].extend(lr.get("network_log", []))
+        merged["response_bodies"].update(lr.get("response_bodies", {}))
+    return merged
+
+
+def _discover_subpage_links(html: str, base_origin: str) -> list:
+    """
+    ENH S2: Extract actual auth/payment/form page links from HTML <a href>.
+    Returns list of full URLs belonging to same origin, filtered by keywords.
+    """
+    keywords = {
+        "login", "signin", "sign-in", "register", "signup", "sign-up",
+        "checkout", "cart", "payment", "donate", "donate", "donation",
+        "contact", "feedback", "subscribe", "billing", "order", "pay",
+        "auth", "account", "join", "membership", "book", "booking",
+        "upgrade", "pricing", "plans", "gift", "support",
+    }
+    found = set()
+    for m in re.finditer(r'href=["\']([^"\'#?][^"\']*)["\']', html, re.I):
+        href = m.group(1).strip()
+        # Resolve relative URLs
+        if href.startswith("http"):
+            full = href
+        elif href.startswith("/"):
+            full = base_origin + href
+        else:
+            continue
+        # Same-origin only
+        if not full.startswith(base_origin):
+            continue
+        path_lower = urlparse(full).path.lower()
+        if any(kw in path_lower for kw in keywords):
+            found.add(full.split("?")[0])  # strip query params
+    return list(found)[:20]  # cap at 20 discovered links
+
+
 def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     """
-    v18.2: Scan main URL + sub-pages concurrently.
-    FIX Bug1: live_result now returned in result dict.
-    FIX Bug2: _scan_one returns (hits, live_result) tuple — live_result no longer discarded.
-    FIX Bug4: removed dead code after return statement.
+    v20 ENH: Scan main URL + sub-pages concurrently.
+    ENH S1: Merge ALL sub-page live_results (not just best one).
+    ENH S2: Link-driven sub-page discovery from HTML <a href>.
+    ENH S3: Fix js_fetched to reflect actual JS file count.
     """
     parsed      = urlparse(url)
     base_origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    sub_paths = [
+    hardcoded_paths = [
         "/contact", "/donate", "/checkout", "/payment",
         "/register", "/signup", "/login", "/cart", "/donation",
         "/get-involved", "/give", "/contribute",
         "/pricing", "/plans", "/subscribe", "/membership",
         "/join", "/support", "/help", "/feedback",
         "/order", "/pay", "/billing", "/upgrade",
-        # ENH3: additional paths
         "/sign-in", "/sign-up", "/forgot-password", "/reset-password",
         "/create-account", "/account/login", "/user/login",
         "/auth/login", "/auth/register", "/auth/signup",
@@ -6316,18 +6460,15 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
 
     all_findings  = []
     seen_keys     = set()
-    total         = 1 + len(sub_paths)
-    scanned       = [0]
-    # FIX Bug1: track best live_result (use main page's — most requests there)
-    best_live_result = {"live_requests": [], "live_findings": [], "sse_frames": []}
+    all_live_results = []   # ENH S1: collect ALL live results
+    total_js_fetched = [0]  # ENH S3: track actual JS count
 
-    # FIX Bug2: return tuple (hits, live_result) instead of just hits list
     def _scan_one(scan_url: str, label: str) -> tuple:
-        """Scan one URL; return (tagged_findings, live_result)."""
+        """Scan one URL; return (tagged_findings, live_result, js_count)."""
         try:
             res = _sitekey_sync(scan_url)
         except Exception:
-            return [], {}
+            return [], {}, 0
         hits = []
         for f in (res.get("findings") or []):
             dedup = f.get("type", "") + ":" + f.get("site_key", "")
@@ -6337,57 +6478,264 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
             tagged = dict(f)
             tagged["source"] = f"[{label}] " + f.get("source", "")
             hits.append(tagged)
-        scanned[0] += 1
         if progress_cb:
+            scanned[0] += 1
             progress_cb(f"🔍 Scanning {scanned[0]}/{total} pages... ({label})")
-        # FIX Bug2: pass live_result back up the call chain
-        return hits, res.get("live_result") or {}
+        return hits, res.get("live_result") or {}, res.get("js_fetched", 0)
+
+    scanned = [0]
+
+    # ── ENH S2: Fetch main page HTML first to discover real sub-page links ──
+    discovered_urls = []
+    try:
+        _r = requests.get(url, headers=_get_headers(), timeout=10, verify=False,
+                          allow_redirects=True)
+        if _r.status_code == 200:
+            discovered_urls = _discover_subpage_links(_r.text, base_origin)
+            if progress_cb and discovered_urls:
+                progress_cb(f"🔗 Discovered {len(discovered_urls)} sub-pages from HTML links")
+    except Exception:
+        pass
+
+    # Merge discovered + hardcoded, deduplicate
+    all_sub_urls = list(dict.fromkeys(
+        discovered_urls + [base_origin + p for p in hardcoded_paths]
+    ))[:50]  # cap total at 50
+
+    total = 1 + len(all_sub_urls)
 
     # ── Main URL (serial, first) ──────────────────────────────────────────
     if progress_cb:
+        scanned[0] = 1
         progress_cb(f"🔍 Scanning 1/{total} pages... (main URL)")
-    main_hits, main_live = _scan_one(url, "main")
-    scanned[0] = 1
+    main_hits, main_live, main_js = _scan_one(url, "main")
     all_findings.extend(main_hits)
-    # FIX Bug1: keep main page live_result — it has the most network traffic
-    if main_live.get("live_requests") or main_live.get("sse_frames"):
-        best_live_result = main_live
+    all_live_results.append(main_live)          # ENH S1
+    total_js_fetched[0] += main_js              # ENH S3
 
     # ── Sub-pages (concurrent, max 4 workers) ────────────────────────────
-    def _scan_sub(path: str) -> tuple:
-        return _scan_one(base_origin + path, path)
+    def _scan_sub(sub_url: str) -> tuple:
+        label = urlparse(sub_url).path or sub_url
+        return _scan_one(sub_url, label)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
-        futures = {ex.submit(_scan_sub, p): p for p in sub_paths}
+        futures = {ex.submit(_scan_sub, u): u for u in all_sub_urls}
         sub_results = {}
         try:
-            for fut in concurrent.futures.as_completed(futures, timeout=12 * len(sub_paths)):
-                path = futures[fut]
+            for fut in concurrent.futures.as_completed(futures, timeout=12 * len(all_sub_urls)):
+                sub_url = futures[fut]
                 try:
-                    sub_results[path] = fut.result(timeout=12)
+                    sub_results[sub_url] = fut.result(timeout=12)
                 except Exception:
-                    sub_results[path] = ([], {})
+                    sub_results[sub_url] = ([], {}, 0)
         except concurrent.futures.TimeoutError:
             for fut in futures:
                 fut.cancel()
 
-    # ── Merge sub-page findings in path order ─────────────────────────────
-    for path in sub_paths:
-        hits, sub_live = sub_results.get(path, ([], {}))
+    # ── Merge sub-page results ────────────────────────────────────────────
+    for sub_url in all_sub_urls:
+        hits, sub_live, sub_js = sub_results.get(sub_url, ([], {}, 0))
         all_findings.extend(hits)
-        # Use sub-page live_result if main page had no network captures
-        if (not best_live_result.get("live_requests")
-                and (sub_live.get("live_requests") or sub_live.get("sse_frames"))):
-            best_live_result = sub_live
+        all_live_results.append(sub_live)       # ENH S1: collect all
+        total_js_fetched[0] += sub_js           # ENH S3
 
-    # FIX Bug1: include live_result so cmd_sitekey can run confidence cross-reference
+    # ENH S1: Merge ALL live_results into one unified result
+    merged_live = _merge_live_results(all_live_results)
+
     return {
         "findings":    all_findings,
         "page_url":    url,
-        "js_fetched":  len(all_findings),
+        "js_fetched":  total_js_fetched[0],     # ENH S3: real JS count
         "error":       None,
-        "live_result": best_live_result,
+        "live_result": merged_live,             # ENH S1: merged all pages
     }
+
+
+# ══════════════════════════════════════════════════════════════════
+# 🎯  SITEKEY IMPROVEMENT — Bypass Config Generator
+#
+#  Unique approach: ရှာတဲ့ key ကို ဘယ် solver service မှာ ဘယ်လို
+#  call လုပ်ရမယ်ဆိုတဲ့ ready-to-use config ထုတ်ပေးတယ်
+#  + Difficulty score (1-10) တွက်ပေးတယ်
+# ══════════════════════════════════════════════════════════════════
+
+_SITEKEY_DIFFICULTY_MAP = {
+    "reCAPTCHA v2":           2,   # checkbox — easiest
+    "reCAPTCHA v2 Invisible": 4,   # no UI — moderate
+    "reCAPTCHA v3":           5,   # score-based
+    "reCAPTCHA Enterprise":   8,   # enterprise — hard
+    "hCaptcha":               4,
+    "hCaptcha Invisible":     5,
+    "Turnstile":              3,   # Cloudflare — relatively easy
+    "Turnstile Invisible":    5,
+    "FriendlyCaptcha":        6,
+    "GeeTest":                7,
+    "Arkose Labs":            9,   # hardest
+}
+
+def _sitekey_difficulty(finding: dict) -> tuple:
+    """
+    Returns (score: int, label: str, emoji: str)
+    Score 1-10: 1=trivial, 10=near-impossible
+    Adjusted by: min_score, enterprise, invisible flags
+    """
+    cap_type = finding.get("type", "")
+    base = _SITEKEY_DIFFICULTY_MAP.get(cap_type, 5)
+
+    # Adjust for min_score (v3 only)
+    try:
+        ms = float(finding.get("min_score") or 0)
+        if ms >= 0.9:  base = min(10, base + 3)
+        elif ms >= 0.7: base = min(10, base + 2)
+        elif ms >= 0.5: base = min(10, base + 1)
+    except (TypeError, ValueError):
+        pass
+
+    # Adjust for enterprise
+    if finding.get("enterprise"):
+        base = min(10, base + 2)
+
+    # Adjust for invisible
+    if finding.get("invisible"):
+        base = min(10, base + 1)
+
+    if base <= 2:   return base, "Trivial",    "🟢"
+    elif base <= 4: return base, "Easy",       "🟡"
+    elif base <= 6: return base, "Moderate",   "🟠"
+    elif base <= 8: return base, "Hard",       "🔴"
+    else:           return base, "Very Hard",  "⛔"
+
+
+def _sitekey_bypass_configs(finding: dict) -> dict:
+    """
+    Generate solver-service configs for a captcha finding.
+    Returns dict with keys: twocaptcha, capsolver, anticaptcha
+    """
+    cap_type = finding.get("type", "")
+    site_key = finding.get("site_key", "")
+    page_url = finding.get("page_url", "")
+    action   = finding.get("action", "submit")
+    min_score = finding.get("min_score") or "0.3"
+    invisible = finding.get("invisible", False)
+    enterprise = finding.get("enterprise", False)
+
+    configs = {}
+
+    # ── 2captcha ─────────────────────────────────────────────────
+    if "reCAPTCHA v3" in cap_type or "Enterprise" in cap_type:
+        configs["2captcha"] = {
+            "method":    "userrecaptcha",
+            "googlekey": site_key,
+            "pageurl":   page_url,
+            "version":   "v3",
+            "action":    action,
+            "min_score": str(min_score),
+            **({"enterprise": 1} if enterprise else {}),
+        }
+    elif "reCAPTCHA" in cap_type:
+        configs["2captcha"] = {
+            "method":    "userrecaptcha",
+            "googlekey": site_key,
+            "pageurl":   page_url,
+            **({"invisible": 1} if invisible else {}),
+        }
+    elif "hCaptcha" in cap_type:
+        configs["2captcha"] = {
+            "method":  "hcaptcha",
+            "sitekey": site_key,
+            "pageurl": page_url,
+        }
+    elif "Turnstile" in cap_type:
+        configs["2captcha"] = {
+            "method":  "turnstile",
+            "sitekey": site_key,
+            "pageurl": page_url,
+        }
+
+    # ── capsolver ─────────────────────────────────────────────────
+    if "reCAPTCHA v3" in cap_type or "Enterprise" in cap_type:
+        t = "ReCaptchaV3EnterpriseTaskProxyLess" if enterprise else "ReCaptchaV3TaskProxyLess"
+        configs["capsolver"] = {
+            "type":      t,
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+            "pageAction": action,
+            "minScore":  float(min_score) if min_score else 0.3,
+        }
+    elif "reCAPTCHA v2" in cap_type:
+        t = "ReCaptchaV2TaskProxyLess"
+        configs["capsolver"] = {
+            "type":       t,
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+            **({"isInvisible": True} if invisible else {}),
+        }
+    elif "hCaptcha" in cap_type:
+        configs["capsolver"] = {
+            "type":       "HCaptchaTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        }
+    elif "Turnstile" in cap_type:
+        configs["capsolver"] = {
+            "type":       "AntiTurnstileTaskProxyLess",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        }
+
+    # ── anticaptcha ───────────────────────────────────────────────
+    if "reCAPTCHA v3" in cap_type:
+        configs["anticaptcha"] = {
+            "type":        "RecaptchaV3TaskProxyless",
+            "websiteURL":  page_url,
+            "websiteKey":  site_key,
+            "minScore":    float(min_score) if min_score else 0.3,
+            "pageAction":  action,
+        }
+    elif "reCAPTCHA" in cap_type:
+        configs["anticaptcha"] = {
+            "type":       "RecaptchaV2TaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+            **({"isInvisible": True} if invisible else {}),
+        }
+    elif "hCaptcha" in cap_type:
+        configs["anticaptcha"] = {
+            "type":       "HCaptchaTaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        }
+
+    return configs
+
+
+def _format_sitekey_bypass_block(finding: dict) -> list:
+    """
+    Returns Telegram message lines for one finding's bypass section.
+    """
+    score, label, emoji = _sitekey_difficulty(finding)
+    configs = _sitekey_bypass_configs(finding)
+
+    lines = [
+        f"  {emoji} *Difficulty:* `{score}/10` — {label}",
+    ]
+
+    if configs.get("capsolver"):
+        cfg = configs["capsolver"]
+        cfg_str = json.dumps(cfg, indent=2)
+        # Keep it short for Telegram — show key fields only
+        lines.append(f"  🟢 *Capsolver task type:* `{cfg.get('type','')}`")
+
+    if configs.get("2captcha"):
+        cfg = configs["2captcha"]
+        lines.append(f"  🔵 *2captcha method:* `{cfg.get('method','')}`")
+
+    if finding.get("action"):
+        lines.append(f"  🎯 *Action:* `{finding['action']}`")
+    if finding.get("min_score"):
+        lines.append(f"  📊 *min\\_score:* `{finding['min_score']}`")
+
+    return lines
 
 
 def _sitekey_static(url: str, progress_cb=None) -> dict:
@@ -6760,17 +7108,6 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ─── Build report ────────────────────────────
-    lines = [
-        f"🔑 *Site Key Extractor — `{escape_md(domain)}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 Page URL: `{escape_md(page_url)}`",
-        f"📡 Static: `{escape_md(js_count)}` | Live: `{escape_md(live_reqs)}` requests",
-        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live-only: `{len(high_live)}` | ⚠️ Static-only: `{len(static_only)}`",
-        f"🔑 Found: `{len(findings)}` captcha instance(s)",
-        "",
-    ]
-
-    # Type icons
     _TYPE_ICON = {
         "reCAPTCHA v2":          "🔵",
         "reCAPTCHA v3":          "🟣",
@@ -6780,39 +7117,69 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "FunCaptcha":            "🔴",
         "GeeTest":               "🟢",
         "AWS WAF Captcha":       "⚪",
+        "DataDome":              "🟤",
+        "PerimeterX/HUMAN":      "🔶",
+        "FriendlyCaptcha":       "🔷",
+        "MTCaptcha":             "🔹",
+        "Akamai Bot Manager":    "🟥",
     }
 
-    for i, f in enumerate(findings, 1):
-        icon   = next((v for k, v in _TYPE_ICON.items() if k in f["type"]), "🔑")
-        badge  = f.get("confidence", "⚠️ STATIC")
-        lines.append(f"*{icon} [{i}]* {badge} *{f['type']}*")
-        lines.append(f"  🔑 `site_key`  : `{f.get('site_key') or f.get('value') or 'N/A'}`")
-        lines.append(f"  🌐 `page_url`  : `{f.get('page_url', '')}`")
+    # Deduplicated ordering: CONFIRMED → HIGH → STATIC
+    seen_keys = set()
+    ordered   = []
+    for f, badge in (
+        [(f, "✅ CONFIRMED") for f in confirmed] +
+        [(f, "🔴 HIGH-LIVE") for f in high_live if f not in confirmed] +
+        [(f, "⚠️ STATIC")   for f in static_only]
+    ):
+        sk = f.get("site_key", "") or f.get("value", "")
+        if sk and sk in seen_keys:
+            continue
+        seen_keys.add(sk)
+        ordered.append((f, badge))
+    # Include remaining findings not yet categorized
+    for f in findings:
+        sk = f.get("site_key", "") or f.get("value", "")
+        if sk not in seen_keys:
+            seen_keys.add(sk)
+            ordered.append((f, f.get("confidence", "⚠️ STATIC")))
+
+    lines = [
+        f"🔑 *Site Key Extractor — `{escape_md(domain)}`*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 Page URL: `{escape_md(page_url)}`",
+        f"📡 Static: `{escape_md(js_count)}` JS | Live: `{escape_md(live_reqs)}` requests",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live: `{len(high_live)}` | ⚠️ Static: `{len(static_only)}`",
+        f"🔑 Found: `{len(ordered)}` captcha instance(s)",
+        "",
+    ]
+
+    for i, (f, badge) in enumerate(ordered, 1):
+        cap_type = f.get("type", "")
+        sk       = f.get("site_key", "") or f.get("value", "") or "N/A"
+        icon     = next((v for k, v in _TYPE_ICON.items() if k in cap_type), "🔑")
+
+        # Key format validation badge
+        clean_type = cap_type.replace(" ⚠️ (key not found)", "").strip()
+        validator  = _KEY_VALIDATORS.get(clean_type)
+        fmt_ok     = ""
+        if sk and sk != "N/A" and validator:
+            fmt_ok = " ✔️" if validator(sk) else " ✖️fmt?"
+
+        lines.append(f"*{icon} [{i}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
+        lines.append(f"  🔑 `{escape_md(sk)}`")
+        lines.append(f"  🌐 `{f.get('page_url', '')}`")
         if f.get("action"):
-            lines.append(f"  ⚡ `action`     : `{f['action']}`")
+            lines.append(f"  ⚡ action: `{f['action']}`")
         if f.get("invisible"):
-            lines.append(f"  👁️ `invisible`  : `true`")
+            lines.append(f"  👁️ invisible: `true`")
         if f.get("min_score"):
-            lines.append(f"  📊 `min_score` : `{f['min_score']}`")
+            lines.append(f"  📊 min\\_score: `{f['min_score']}`")
         if f.get("enterprise"):
-            lines.append(f"  🏢 `enterprise` : `true`")
-        if f.get("theme"):
-            lines.append(f"  🎨 `theme`      : `{f['theme']}`")
-        if f.get("size") and f["size"] != "normal":
-            lines.append(f"  📐 `size`       : `{f['size']}`")
-        if f.get("badge"):
-            lines.append(f"  🏷️ `badge`      : `{f['badge']}`")
+            lines.append(f"  🏢 enterprise: `true`")
         if f.get("s_param"):
-            lines.append(f"  🔐 `s param`    : `{f['s_param'][:40]}`")
-        if f.get("hl"):
-            lines.append(f"  🌍 `hl`         : `{f['hl']}`")
-        if f.get("co"):
-            lines.append(f"  🏠 `co`         : `{f['co']}`")
-        if f.get("callback"):
-            lines.append(f"  📞 `callback`   : `{f['callback']}`")
-        if f.get("user_agent"):
-            lines.append(f"  🖥️ `user_agent` : `{f['user_agent'][:60]}`")
-        lines.append(f"  📂 Source      : _{f.get('source','')[:70]}_")
+            lines.append(f"  🔐 data-s: `{f['s_param'][:40]}`")
+        lines.append(f"  📂 _{escape_md(f.get('source','')[:70])}_")
         lines.append("")
 
         # ── Solver-ready block (per-service) ──────────────────────
@@ -6822,23 +7189,14 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return "\n".join(f"    `{k}` = `{v}`" for k, v in d.items())
 
         lines.append("  *📋 Solver Params:*")
-
-        # 2captcha
         lines.append("  *🔴 2captcha:*")
         lines.append(_fmt_params(sp["2captcha"]))
-
-        # Anti-Captcha
         lines.append("  *🟠 Anti-Captcha:*")
         lines.append(_fmt_params(sp["anticaptcha"]))
-
-        # CapSolver
         lines.append("  *🟢 CapSolver:*")
         lines.append(_fmt_params(sp["capsolver"]))
-
-        # Ez-Captcha / NextCaptcha
         lines.append("  *🔵 Ez-Captcha / NextCaptcha:*")
         lines.append(_fmt_params(sp["ezcaptcha"]))
-
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
@@ -6870,18 +7228,14 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "static_only": len(static_only),
         "findings": [
             {
-                "type":       f["type"],
-                "site_key":   f["site_key"],
-                "page_url":   f["page_url"],
+                "type":       f.get("type", ""),
+                "sitekey":    f.get("site_key") or f.get("value") or "",
+                "pageurl":    f.get("page_url", ""),
                 "action":     f.get("action", ""),
-                "source":     f.get("source", ""),
-                "theme":      f.get("theme", ""),
-                "size":       f.get("size", ""),
-                "invisible":  f.get("invisible", False),
-                "badge":      f.get("badge", ""),
-                "min_score":  f.get("min_score", ""),
-                "enterprise": f.get("enterprise", False),
-                "s_param":    f.get("s_param", ""),
+                "enterprise": 1 if f.get("enterprise") else 0,
+                "min_score":  float(f["min_score"]) if f.get("min_score") else None,
+                "invisible":  1 if f.get("invisible") else 0,
+                "data-s":     f.get("s_param", ""),
                 "hl":         f.get("hl", ""),
                 "co":         f.get("co", ""),
                 "callback":   f.get("callback", ""),
@@ -7435,13 +7789,21 @@ def _static_extract(url: str) -> dict:
 
 
 def _gather_all_text(data: dict) -> list:
-    """Return list of (text, source_label) from html + all JS."""
+    """Return list of (text, source_label) from html + all JS.
+    Obfuscated JS response bodies are skipped to reduce false positives.
+    """
     texts = []
     if data.get("html"):
         texts.append((data["html"], "HTML source"))
     for entry in data.get("network_log", []):
         if entry.get("response_body"):
-            texts.append((entry["response_body"], f"JS: {entry['url'][:70]}"))
+            body = entry["response_body"]
+            is_obf, obf_reason = _is_obfuscated(body)
+            if is_obf:
+                logger.debug("gather_all_text: skip obfuscated JS %s (%s)",
+                             entry['url'][:70], obf_reason)
+            else:
+                texts.append((body, f"JS: {entry['url'][:70]}"))
         if entry.get("post_data"):
             texts.append((entry["post_data"], f"POST → {entry['url'][:60]}"))
     if data.get("console_log"):
@@ -8257,7 +8619,9 @@ def _gather_all_text_v2(data: dict, live_result: dict | None = None) -> list:
         for field, label in [("body", "Live POST"), ("post_data", "Live XHR body")]:
             text = req.get(field, "")
             if text and len(text) > 10:
-                texts.append((text, f"{label} → {u}"))
+                is_obf, _ = _is_obfuscated(text)
+                if not is_obf:
+                    texts.append((text, f"{label} → {u}"))
 
     # Add SSE stream messages
     sse_combined = "\n".join(
@@ -10140,107 +10504,156 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════
 
 _PAY_PATTERNS = [
-    # ── Stripe ────────────────────────────────────────────────────────────────
-    ("Stripe Publishable Key",      re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Secret Key",           re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Webhook Secret",       re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Restricted Key",       re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
-    ("Stripe Connect Account",      re.compile(r'\b(ca_[A-Za-z0-9]{20,60})\b')),           # NEW
-    ("Stripe Setup Intent",         re.compile(r'\b(seti_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),  # NEW
-    ("PaymentIntent client secret", re.compile(r'\b(pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
-    # ── PayPal ────────────────────────────────────────────────────────────────
-    ("PayPal Client ID",            re.compile(r'(?i)paypal[_-]?(?:client[_-]?)?id\s*[=:]\s*["\']?(A[A-Za-z0-9_-]{47,97})["\']?')),
-    # ── Braintree ─────────────────────────────────────────────────────────────
-    ("Braintree Tokenization",      re.compile(r'(?i)braintree[_-]?(?:client|token|auth)\s*[=:]\s*["\']?([A-Za-z0-9]{20,100})["\']?')),
-    # ── Square ────────────────────────────────────────────────────────────────
-    ("Square App ID",               re.compile(r'\b(sq0idp-[A-Za-z0-9_-]{22,43})\b')),
-    ("Square Access Token",         re.compile(r'\b(sq0atp-[A-Za-z0-9_-]{22,43})\b')),
-    # ── Razorpay ──────────────────────────────────────────────────────────────
-    ("Razorpay Key ID",             re.compile(r'\b(rzp_(?:live|test)_[A-Za-z0-9]{14,20})\b')),
-    # ── Adyen ─────────────────────────────────────────────────────────────────
-    ("Adyen Client Key",            re.compile(r'(?i)adyen[_-]?client[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{20,80})["\']?')),
-    # ── Authorize.net ─────────────────────────────────────────────────────────
-    ("Authorize.net API Login",     re.compile(r'(?i)authorize[_-]?net[_-]?(?:api[_-]?)?login\s*[=:]\s*["\']([A-Za-z0-9]{6,20})["\']')),
-    # ── WooCommerce ───────────────────────────────────────────────────────────
-    ("WooCommerce Consumer Key",    re.compile(r'\b(ck_[a-f0-9]{40})\b')),
-    ("WooCommerce Consumer Secret", re.compile(r'\b(cs_[a-f0-9]{40})\b')),
-    # ── Paddle ────────────────────────────────────────────────────────────────
-    ("Paddle Vendor ID",            re.compile(r'(?i)paddle[_-]?vendor[_-]?id\s*[=:]\s*["\']?(\d{4,10})["\']?')),
-    # ── Mollie ────────────────────────────────────────────────────────────────
-    ("Mollie API Key",              re.compile(r'(?i)mollie[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']?((?:live|test)_[A-Za-z0-9]{30,45})["\']?')),
-    # ── Klarna ────────────────────────────────────────────────────────────────
-    ("Klarna API Username",         re.compile(r'(?i)klarna[_-]?(?:api[_-]?)?username\s*[=:]\s*["\']([A-Za-z0-9_\-@.]{5,60})["\']')),
-    # ── Checkout.com ──────────────────────────────────────────────────────────
-    ("Checkout.com Public Key",     re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b')),
-    # ── Shopify ───────────────────────────────────────────────────────────────
-    ("Shopify Store Domain",        re.compile(r'(?i)shopify[_-]?(?:store[_-]?)?domain\s*[=:]\s*["\']([a-z0-9-]+\.myshopify\.com)["\']')),
-    # ════════════════════ NEW IN v19 ════════════════════
-    # ── Paystack ──────────────────────────────────────────────────────────────
-    ("Paystack Public Key",         re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{30,60})\b')),   # pk_live_ / pk_test_ (longer than Stripe)
-    ("Paystack Secret Key",         re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{30,60})\b')),
-    # ── Flutterwave ───────────────────────────────────────────────────────────
-    ("Flutterwave Public Key",      re.compile(r'\b(FLWPUBK(?:_TEST)?-[A-Za-z0-9]+-X)\b')),
-    ("Flutterwave Secret Key",      re.compile(r'\b(FLWSECK(?:_TEST)?-[A-Za-z0-9]+-X)\b')),
-    # ── Cashfree ──────────────────────────────────────────────────────────────
-    ("Cashfree App ID",             re.compile(r'(?i)cashfree[_-]?(?:app[_-]?)?id\s*[=:]\s*["\']?([A-Za-z0-9]{10,30})["\']?')),
-    ("Cashfree Secret Key",         re.compile(r'(?i)cashfree[_-]?(?:secret|key)\s*[=:]\s*["\']?([A-Za-z0-9+/=]{30,80})["\']?')),
-    # ── PayU ──────────────────────────────────────────────────────────────────
-    ("PayU Merchant Key",           re.compile(r'(?i)payu[_-]?(?:merchant[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9]{6,20})["\']?')),
-    ("PayU Salt",                   re.compile(r'(?i)payu[_-]?salt\s*[=:]\s*["\']?([A-Za-z0-9]{20,50})["\']?')),
-    # ── 2Checkout / Verifone ──────────────────────────────────────────────────
-    ("2Checkout Merchant Code",     re.compile(r'(?i)2checkout[_-]?(?:merchant[_-]?)?(?:code|id)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
-    ("2Checkout Secret",            re.compile(r'(?i)2checkout[_-]?secret\s*[=:]\s*["\']?([A-Za-z0-9]{16,50})["\']?')),
-    # ── Affirm ────────────────────────────────────────────────────────────────
-    ("Affirm Public Key",           re.compile(r'(?i)affirm[_-]?(?:public[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9]{10,50})["\']?')),
-    # ── Afterpay / Clearpay ───────────────────────────────────────────────────
-    ("Afterpay Merchant ID",        re.compile(r'(?i)(?:afterpay|clearpay)[_-]?merchant[_-]?(?:id|reference)\s*[=:]\s*["\']?([A-Za-z0-9_-]{8,40})["\']?')),
-    # ── Sezzle ────────────────────────────────────────────────────────────────
-    ("Sezzle Public Key",           re.compile(r'(?i)sezzle[_-]?(?:public[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{20,60})["\']?')),
-    # ── Coinbase Commerce ─────────────────────────────────────────────────────
-    ("Coinbase Commerce Key",       re.compile(r'(?i)coinbase[_-]?(?:commerce[_-]?)?(?:api[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{30,60})["\']?')),
-    # ── Alipay ────────────────────────────────────────────────────────────────
-    ("Alipay App ID",               re.compile(r'(?i)alipay[_-]?app[_-]?id\s*[=:]\s*["\']?(\d{15,20})["\']?')),
-    # ── WeChat Pay ────────────────────────────────────────────────────────────
-    ("WeChat Pay App ID",           re.compile(r'(?i)wechat[_-]?(?:pay[_-]?)?app[_-]?id\s*[=:]\s*["\']?(wx[A-Za-z0-9]{15,20})["\']?')),
-    # ── Cybersource ───────────────────────────────────────────────────────────
-    ("Cybersource Profile ID",      re.compile(r'(?i)cybersource[_-]?(?:profile[_-]?)?id\s*[=:]\s*["\']?([A-Za-z0-9_-]{10,50})["\']?')),
-    # ── iDEAL / Buckaroo ──────────────────────────────────────────────────────
-    ("Buckaroo Website Key",        re.compile(r'(?i)buckaroo[_-]?(?:website[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9]{10,40})["\']?')),
+    # ══ Stripe ════════════════════════════════════════════════════════════════
+    ("Stripe Publishable Key",       re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Secret Key",            re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Webhook Secret",        re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Restricted Key",        re.compile(r'\b(rk_(?:live|test)_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Connect Account",       re.compile(r'\b(ca_[A-Za-z0-9]{20,60})\b')),
+    ("Stripe Setup Intent",          re.compile(r'\b(seti_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
+    ("PaymentIntent client secret",  re.compile(r'\b(pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24})\b')),
+    ("Stripe Customer Session",      re.compile(r'\b(cuss_[A-Za-z0-9]{24,60})\b')),
+    # ══ PayPal ════════════════════════════════════════════════════════════════
+    ("PayPal Client ID",             re.compile(r'(?i)paypal[_-]?(?:client[_-]?)?id\s*[=:]\s*["\']?(A[A-Za-z0-9_-]{47,97})["\']?')),
+    # ══ Braintree ═════════════════════════════════════════════════════════════
+    ("Braintree Tokenization",       re.compile(r'(?i)braintree[_-]?(?:client|token|auth)\s*[=:]\s*["\']?([A-Za-z0-9]{20,100})["\']?')),
+    # ══ Square ════════════════════════════════════════════════════════════════
+    ("Square App ID",                re.compile(r'\b(sq0idp-[A-Za-z0-9_-]{22,43})\b')),
+    ("Square Access Token",          re.compile(r'\b(sq0atp-[A-Za-z0-9_-]{22,43})\b')),
+    # ══ Razorpay ══════════════════════════════════════════════════════════════
+    ("Razorpay Key ID",              re.compile(r'\b(rzp_(?:live|test)_[A-Za-z0-9]{14,20})\b')),
+    # ══ Adyen ═════════════════════════════════════════════════════════════════
+    ("Adyen Client Key",             re.compile(r'(?i)adyen[_-]?client[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{20,80})["\']?')),
+    # ══ Authorize.net ═════════════════════════════════════════════════════════
+    ("Authorize.net API Login",      re.compile(r'(?i)authorize[_-]?net[_-]?(?:api[_-]?)?login\s*[=:]\s*["\']([A-Za-z0-9]{6,20})["\']')),
+    # ══ WooCommerce ═══════════════════════════════════════════════════════════
+    ("WooCommerce Consumer Key",     re.compile(r'\b(ck_[a-f0-9]{40})\b')),
+    ("WooCommerce Consumer Secret",  re.compile(r'\b(cs_[a-f0-9]{40})\b')),
+    # ══ Paddle ════════════════════════════════════════════════════════════════
+    ("Paddle Vendor ID",             re.compile(r'(?i)paddle[_-]?vendor[_-]?id\s*[=:]\s*["\']?(\d{4,10})["\']?')),
+    ("Paddle Billing Token",         re.compile(r'\b(pdl_(?:live|sbox)_[A-Za-z0-9_]{20,80})\b')),
+    # ══ Mollie ════════════════════════════════════════════════════════════════
+    ("Mollie API Key",               re.compile(r'(?i)mollie[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']?((?:live|test)_[A-Za-z0-9]{30,45})["\']?')),
+    # ══ Klarna ════════════════════════════════════════════════════════════════
+    ("Klarna API Username",          re.compile(r'(?i)klarna[_-]?(?:api[_-]?)?username\s*[=:]\s*["\']([A-Za-z0-9_\-@.]{5,60})["\']')),
+    # ══ Checkout.com ══════════════════════════════════════════════════════════
+    ("Checkout.com Public Key",      re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b')),
+    # ══ Shopify ═══════════════════════════════════════════════════════════════
+    ("Shopify Store Domain",         re.compile(r'(?i)shopify[_-]?(?:store[_-]?)?domain\s*[=:]\s*["\']([a-z0-9-]+\.myshopify\.com)["\']')),
+    ("Shopify Storefront Token",     re.compile(r'\b(shp(?:pa|at|ca)_[A-Za-z0-9]{32,64})\b')),
+    ("Shopify Partner Key",          re.compile(r'\b(shpss_[A-Za-z0-9]{32,64})\b')),
+    # ══ Paystack ══════════════════════════════════════════════════════════════
+    ("Paystack Public Key",          re.compile(r'\b(pk_(?:live|test)_[A-Za-z0-9]{30,60})\b')),
+    ("Paystack Secret Key",          re.compile(r'\b(sk_(?:live|test)_[A-Za-z0-9]{30,60})\b')),
+    # ══ Flutterwave ═══════════════════════════════════════════════════════════
+    ("Flutterwave Public Key",       re.compile(r'\b(FLWPUBK(?:_TEST)?-[A-Za-z0-9]+-X)\b')),
+    ("Flutterwave Secret Key",       re.compile(r'\b(FLWSECK(?:_TEST)?-[A-Za-z0-9]+-X)\b')),
+    # ══ Cashfree — TIGHTENED ══════════════════════════════════════════════════
+    ("Cashfree App ID",              re.compile(r'(?i)cashfree[_-]?(?:app[_-]?)?id\s*[=:]\s*["\']([A-Za-z0-9]{8,25})["\']')),
+    ("Cashfree Secret Key",          re.compile(r'(?i)cashfree[_-]?(?:secret|key)\s*[=:]\s*["\']([A-Za-z0-9+/=]{40,80})["\']')),
+    # ══ PayU — TIGHTENED ══════════════════════════════════════════════════════
+    ("PayU Merchant Key",            re.compile(r'(?i)payu[_-]?(?:merchant[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9]{8,20})["\']')),
+    ("PayU Salt",                    re.compile(r'(?i)payu[_-]?salt\s*[=:]\s*["\']([A-Za-z0-9]{25,50})["\']')),
+    # ══ 2Checkout / Verifone ══════════════════════════════════════════════════
+    ("2Checkout Merchant Code",      re.compile(r'(?i)2checkout[_-]?(?:merchant[_-]?)?(?:code|id)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
+    ("2Checkout Secret",             re.compile(r'(?i)2checkout[_-]?secret\s*[=:]\s*["\']?([A-Za-z0-9]{16,50})["\']?')),
+    # ══ Affirm — TIGHTENED ════════════════════════════════════════════════════
+    ("Affirm Public Key",            re.compile(r'(?i)affirm[_-]?(?:public[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9]{20,50})["\']')),
+    # ══ Afterpay / Clearpay ═══════════════════════════════════════════════════
+    ("Afterpay Merchant ID",         re.compile(r'(?i)(?:afterpay|clearpay)[_-]?merchant[_-]?(?:id|reference)\s*[=:]\s*["\']?([A-Za-z0-9_-]{8,40})["\']?')),
+    # ══ Sezzle — TIGHTENED ════════════════════════════════════════════════════
+    ("Sezzle Public Key",            re.compile(r'(?i)sezzle[_-]?(?:public[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{28,60})["\']')),
+    # ══ Coinbase Commerce ═════════════════════════════════════════════════════
+    ("Coinbase Commerce Key",        re.compile(r'(?i)coinbase[_-]?(?:commerce[_-]?)?(?:api[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9_-]{30,60})["\']?')),
+    # ══ Alipay ════════════════════════════════════════════════════════════════
+    ("Alipay App ID",                re.compile(r'(?i)alipay[_-]?app[_-]?id\s*[=:]\s*["\']?(\d{15,20})["\']?')),
+    # ══ WeChat Pay ════════════════════════════════════════════════════════════
+    ("WeChat Pay App ID",            re.compile(r'(?i)wechat[_-]?(?:pay[_-]?)?app[_-]?id\s*[=:]\s*["\']?(wx[A-Za-z0-9]{15,20})["\']?')),
+    # ══ Cybersource ═══════════════════════════════════════════════════════════
+    ("Cybersource Profile ID",       re.compile(r'(?i)cybersource[_-]?(?:profile[_-]?)?id\s*[=:]\s*["\']?([A-Za-z0-9_-]{10,50})["\']?')),
+    # ══ Buckaroo ══════════════════════════════════════════════════════════════
+    ("Buckaroo Website Key",         re.compile(r'(?i)buckaroo[_-]?(?:website[_-]?)?key\s*[=:]\s*["\']?([A-Za-z0-9]{10,40})["\']?')),
+    # ══ Lemon Squeezy ═════════════════════════════════════════════════════════
+    ("Lemon Squeezy Store ID",       re.compile(r'(?i)lemonsqueezy[_-]?store[_-]?id\s*[=:]\s*["\']?(\d{4,12})["\']?')),
+    # ══ Xendit (SE Asia) ══════════════════════════════════════════════════════
+    ("Xendit Public Key",            re.compile(r'\b(xnd_public_(?:development|production)_[A-Za-z0-9]{30,80})\b')),
+    # ══ Midtrans (Indonesia) ══════════════════════════════════════════════════
+    ("Midtrans Client Key",          re.compile(r'\b((?:Mid-client|SB-Mid-client)-[A-Za-z0-9_\-]{20,50})\b')),
+    # ══ Payhere (Sri Lanka) ═══════════════════════════════════════════════════
+    ("Payhere Merchant ID",          re.compile(r'(?i)payhere[_-]?merchant[_-]?(?:id|secret)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
 ]
 
 # ── Gateway prefix lookup for live/test detection ─────────────────────────
 _LIVE_PREFIXES = {
     "pk_live_", "sk_live_", "rk_live_", "rzp_live_",
     "FLWPUBK-", "FLWSECK-", "_live_", "prod", "production",
-    "sq0atp-",  # Square access tokens are always live
+    "sq0atp-",          # Square access tokens — always live
+    "pdl_live_",        # Paddle Billing live
+    "xnd_public_production_",  # Xendit production
 }
 _TEST_PREFIXES = {
     "pk_test_", "sk_test_", "rk_test_", "rzp_test_",
     "FLWPUBK_TEST-", "FLWSECK_TEST-", "sandbox", "test", "sbox",
+    "pdl_sbox_",        # Paddle Billing sandbox
+    "xnd_public_development_",  # Xendit dev
+    "SB-Mid-client-",   # Midtrans sandbox
 }
 
 def _detect_env(key_type: str, key_value: str) -> str:
-    """Return 🔴 LIVE / 🟡 TEST / ⚪ UNKNOWN"""
-    v = key_value.lower()
+    """Return 🔴 LIVE / 🟡 TEST / ⚪ UNKNOWN  (improved v2)"""
+    v  = key_value.lower()
     kt = key_type.lower()
+
+    # Provider-specific exact rules (highest confidence)
+    if "flutterwave" in kt:
+        return "🟡 TEST" if "_TEST" in key_value else "🔴 LIVE"
+    if "square access" in kt:
+        return "🔴 LIVE"   # sq0atp- always live
+    if "midtrans" in kt:
+        return "🟡 TEST" if key_value.upper().startswith("SB-") else "🔴 LIVE"
+    if "xendit" in kt:
+        return "🔴 LIVE" if "production" in v else "🟡 TEST"
+    if "shopify storefront" in kt or "shopify partner" in kt:
+        return "🔴 LIVE"   # Shopify API tokens always production-scope
+    if "lemon squeezy" in kt:
+        return "🔴 LIVE"   # Lemon Squeezy has no sandbox keys
+
+    # Prefix matching
     for p in _LIVE_PREFIXES:
         if p.lower() in v:
             return "🔴 LIVE"
     for p in _TEST_PREFIXES:
         if p.lower() in v:
             return "🟡 TEST"
-    if "live" in v or "prod" in v:
+
+    # Keyword fallback
+    if any(kw in v for kw in ("live", "prod", "production")):
         return "🔴 LIVE"
-    if "test" in v or "sandbox" in v or "sbox" in v:
+    if any(kw in v for kw in ("test", "sandbox", "sbox", "dev", "staging")):
         return "🟡 TEST"
+
     return "⚪ UNKNOWN"
 
 
 def _validate_payment_key(key_type: str, key_value: str) -> bool:
-    """Secondary validation to filter false positives after regex match."""
-    v = key_value.strip()
+    """Secondary validation to filter false positives after regex match. (IMPROVED)"""
+    v  = key_value.strip()
     kt = key_type.lower()
 
+    # ── Global garbage filters ─────────────────────────────────────────────
+    if re.match(r'^[0-9a-f]{6,8}$', v, re.I) and "geetest" not in kt:
+        return False   # CSS color / short hash
+    if v.startswith("data:image") or v.startswith("/9j/") or v.startswith("iVBORw0KGgo"):
+        return False   # base64 image data
+    _PLACEHOLDERS = {"YOUR_KEY", "YOUR_API_KEY", "XXXX", "TEST", "NULL",
+                     "UNDEFINED", "YOUR_PUBLISHABLE_KEY", "REPLACE_ME",
+                     "YOUR_STRIPE_KEY", "INSERT_KEY_HERE"}
+    if v.upper() in _PLACEHOLDERS:
+        return False
+    if len(set(v)) <= 2 and len(v) > 6:
+        return False   # all-same-char strings (aaaaaaa / 111111)
+
+    # ── Provider-specific validators ──────────────────────────────────────
     if "stripe publishable" in kt or "paystack public" in kt:
         return bool(re.match(r'^pk_(live|test)_[A-Za-z0-9]{20,60}$', v))
     if "stripe secret" in kt or "paystack secret" in kt:
@@ -10253,12 +10666,18 @@ def _validate_payment_key(key_type: str, key_value: str) -> bool:
         return bool(re.match(r'^ca_[A-Za-z0-9]{20,60}$', v))
     if "stripe setup intent" in kt:
         return bool(re.match(r'^seti_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24}$', v))
+    if "stripe customer session" in kt:
+        return bool(re.match(r'^cuss_[A-Za-z0-9]{24,60}$', v))
     if "paypal" in kt:
         return v.startswith('A') and 48 <= len(v) <= 101
     if "braintree" in kt:
-        if re.match(r'^(pk_|cr_|tb_)', v): return True
-        if re.match(r'^[a-f0-9]{32}$', v): return True
-        return len(v) >= 20
+        if re.match(r'^(pk_|cr_|tb_)', v):
+            return True
+        if re.match(r'^[a-f0-9]{32}$', v):
+            return True
+        if len(v) >= 40 and re.match(r'^[A-Za-z0-9+/=]{40,}$', v):
+            return True
+        return False
     if "square app" in kt:
         return bool(re.match(r'^sq0idp-[A-Za-z0-9_-]{22,43}$', v))
     if "square access" in kt:
@@ -10275,8 +10694,12 @@ def _validate_payment_key(key_type: str, key_value: str) -> bool:
         return 20 <= len(v) <= 80 and bool(re.match(r'^[A-Za-z0-9_-]+$', v))
     if "checkout.com" in kt:
         return bool(re.match(r'^pk_(sbox|prod)_[A-Za-z0-9]{20,80}$', v))
-    if "shopify" in kt:
+    if "shopify store domain" in kt:
         return v.endswith('.myshopify.com') and bool(re.match(r'^[a-z0-9-]+\.myshopify\.com$', v))
+    if "shopify storefront" in kt:
+        return bool(re.match(r'^shp(?:pa|at|ca)_[A-Za-z0-9]{32,64}$', v))
+    if "shopify partner" in kt:
+        return bool(re.match(r'^shpss_[A-Za-z0-9]{32,64}$', v))
     if "paymentintent" in kt:
         return bool(re.match(r'^pi_[A-Za-z0-9]{24}_secret_[A-Za-z0-9]{24}$', v))
     if "flutterwave" in kt:
@@ -10285,6 +10708,35 @@ def _validate_payment_key(key_type: str, key_value: str) -> bool:
         return v.startswith('wx') and len(v) <= 32
     if "alipay" in kt:
         return v.isdigit() and 15 <= len(v) <= 20
+    if "paddle billing" in kt:
+        return bool(re.match(r'^pdl_(live|sbox)_[A-Za-z0-9_]{20,80}$', v))
+    if "xendit" in kt:
+        return bool(re.match(r'^xnd_public_(development|production)_[A-Za-z0-9]{30,80}$', v))
+    if "midtrans" in kt:
+        return bool(re.match(r'^(?:SB-)?Mid-client-[A-Za-z0-9_\-]{20,50}$', v))
+
+    # ── TIGHTENED: previously over-permissive ──────────────────────────────
+    if "cashfree app" in kt:
+        return (12 <= len(v) <= 25 and
+                bool(re.match(r'^[A-Za-z0-9]+$', v)) and
+                bool(re.search(r'[0-9]', v)) and
+                bool(re.search(r'[A-Za-z]', v)))
+    if "cashfree secret" in kt:
+        return 40 <= len(v) <= 80 and bool(re.match(r'^[A-Za-z0-9+/=]+$', v))
+    if "payu merchant key" in kt:
+        return (6 <= len(v) <= 20 and
+                bool(re.match(r'^[A-Za-z0-9]+$', v)) and
+                not re.match(r'^[0-9a-f]+$', v, re.I))  # exclude pure hex
+    if "payu salt" in kt:
+        return 25 <= len(v) <= 50 and bool(re.match(r'^[A-Za-z0-9]+$', v))
+    if "affirm" in kt:
+        return (20 <= len(v) <= 50 and
+                bool(re.match(r'^[A-Za-z0-9]+$', v)) and
+                bool(re.search(r'[A-Z]', v)) and
+                bool(re.search(r'[a-z]', v)))
+    if "sezzle" in kt:
+        return 28 <= len(v) <= 60 and bool(re.match(r'^[A-Za-z0-9_-]+$', v))
+
     return True   # unknowns pass through
 
 
@@ -10373,30 +10825,76 @@ def _scan_service_workers(base_url: str, html_text: str, progress_cb=None) -> li
     return results
 
 
+def _discover_payment_subpage_links(html: str, base_root: str) -> list:
+    """
+    ENH P2: Discover actual checkout/payment links from HTML <a href>
+    instead of relying solely on hardcoded paths.
+    Returns list of full same-origin URLs filtered by payment keywords.
+    """
+    pay_keywords = {
+        "checkout", "cart", "payment", "pay", "order", "billing",
+        "purchase", "buy", "shop", "store", "subscribe", "subscription",
+        "donate", "donation", "gift", "pricing", "plans", "upgrade",
+        "basket", "invoice", "receipt",
+    }
+    found = set()
+    for m in re.finditer(r'href=["\']([^"\'#][^"\']*)["\']', html, re.I):
+        href = m.group(1).strip()
+        if href.startswith("http"):
+            full = href
+        elif href.startswith("/"):
+            full = base_root + href
+        else:
+            continue
+        if not full.startswith(base_root):
+            continue
+        path_lower = urlparse(full).path.lower()
+        if any(kw in path_lower for kw in pay_keywords):
+            found.add(full.split("?")[0])
+    return list(found)[:15]
+
+
 def _scan_payment_subpages(base_url: str, progress_cb=None) -> list:
     """
-    Crawl common checkout/payment pages that only load payment SDKs
-    when the payment form is actually rendered.
+    ENH P2: Crawl checkout/payment pages.
+    Combines hardcoded paths + link-discovered paths from main page HTML.
     """
-    parsed   = urlparse(base_url)
+    parsed    = urlparse(base_url)
     base_root = f"{parsed.scheme}://{parsed.netloc}"
-    sub_paths = [
+
+    hardcoded = [
         "/checkout", "/cart", "/payment", "/order", "/billing",
         "/shop/checkout", "/store/checkout", "/pay", "/subscribe",
         "/pricing", "/buy", "/purchase", "/donate", "/gift",
         "/checkout/payment", "/checkout/step/payment",
-        "/wp-admin/admin-ajax.php",   # WooCommerce AJAX endpoint
+        "/wp-admin/admin-ajax.php",
     ]
+
+    # ENH P2: discover real links from main page
+    discovered_urls = []
+    try:
+        _r = requests.get(base_url, headers=HEADERS, timeout=8, verify=False,
+                          allow_redirects=True)
+        if _r.status_code == 200:
+            discovered_urls = _discover_payment_subpage_links(_r.text, base_root)
+    except Exception:
+        pass
+
+    all_urls = list(dict.fromkeys(
+        discovered_urls + [base_root + p for p in hardcoded]
+    ))[:30]
+
     results = []
     if progress_cb:
-        progress_cb(f"🔗 Crawling {len(sub_paths)} payment sub-pages...")
-    for path in sub_paths:
-        url = base_root + path
+        progress_cb(f"🔗 Crawling {len(all_urls)} payment sub-pages ({len(discovered_urls)} discovered)...")
+
+    for url in all_urls:
         try:
             r = requests.get(url, headers=HEADERS, timeout=8, verify=False,
                              allow_redirects=True)
             if r.status_code == 200 and len(r.text) > 200:
-                results.append((r.text, f"subpage: {path}"))
+                path_label = urlparse(url).path
+                results.append((r.text, f"subpage: {path_label}"))
         except Exception:
             pass
     return results
@@ -11074,6 +11572,185 @@ window.__payHook = {
     return result
 
 
+# ══════════════════════════════════════════════════════════════════
+# 💳  PAYKEYS IMPROVEMENT — Payment Gateway Config Analyzer
+#
+#  Unique approach: key တွေ list ထုတ်တာထက် gateway ရဲ့
+#  security configuration ကို assess လုပ်တယ်:
+#   • Test vs Live mode detection (key prefix analysis)
+#   • 3DS / SCA enforcement check (Stripe.js confirmParams)
+#   • Allowed payment methods (cards only vs wallet support)
+#   • PCI scope indicator (client-side card handling = high risk)
+# ══════════════════════════════════════════════════════════════════
+
+# Key prefix → (gateway, is_live, risk_note)
+_PAY_KEY_PREFIX_MAP = [
+    (r"^sk_live_",      "Stripe",       True,  "🔴 SECRET live key — full API access"),
+    (r"^sk_test_",      "Stripe",       False, "🟡 Secret test key"),
+    (r"^pk_live_",      "Stripe",       True,  "🟠 Publishable live key — client-side ok"),
+    (r"^pk_test_",      "Stripe",       False, "⚪ Publishable test key"),
+    (r"^rk_live_",      "Stripe",       True,  "🔴 Restricted live key — scoped access"),
+    (r"^rzp_live_",     "Razorpay",     True,  "🟠 Razorpay live key"),
+    (r"^rzp_test_",     "Razorpay",     False, "⚪ Razorpay test key"),
+    (r"^sandbox",       "PayPal",       False, "⚪ PayPal sandbox"),
+    (r"^live",          "PayPal",       True,  "🟠 PayPal live"),
+    (r"^APA-",          "PayPal",       True,  "🟠 PayPal Access Token (live)"),
+    (r"^sb-",           "PayPal",       False, "⚪ PayPal sandbox"),
+    (r"^[Tt]est_",      "Braintree",    False, "⚪ Braintree sandbox token"),
+    (r"^production_",   "Braintree",    True,  "🟠 Braintree production token"),
+    (r"^sq0[ai]sp",     "Square",       True,  "🟠 Square app id (live)"),
+    (r"^sandbox-sq",    "Square",       False, "⚪ Square sandbox"),
+    (r"^test_",         "Checkout.com", False, "⚪ Checkout.com test key"),
+    (r"^live_",         "Checkout.com", True,  "🟠 Checkout.com live key"),
+    (r"^pk_",           "Stripe/Pay",   None,  "❓ Generic publishable key"),
+    (r"^sk_",           "Stripe/Pay",   None,  "❓ Generic secret key"),
+]
+
+# Payment method signals in JS source
+_PAY_METHOD_SIGNALS = {
+    "Apple Pay":       [r"applePay", r"apple_pay", r"ApplePaySession", r"paymentRequest"],
+    "Google Pay":      [r"googlePay", r"google_pay", r"PaymentRequest.*google"],
+    "SEPA":            [r"sepa", r"iban", r"SEPA"],
+    "iDEAL":           [r"ideal", r"iDEAL"],
+    "BACS/BECS":       [r"bacs_debit", r"becs_debit", r"au_becs"],
+    "ACH":             [r"us_bank_account", r"ach_debit", r"plaid"],
+    "Buy Now Pay Later": [r"afterpay", r"klarna", r"affirm", r"bnpl", r"pay_later"],
+    "Crypto":          [r"coinbase", r"web3", r"wallet_address", r"ETH|BTC|USDC"],
+}
+
+# 3DS / SCA enforcement signals
+_3DS_SIGNALS = {
+    "3DS enforced":       [r"confirmCardPayment", r"handleCardAction", r"payment_intent"],
+    "SCA configured":     [r"payment_method_options.*three_d_secure",
+                           r"three_d_secure.*required", r"sca"],
+    "3DS bypass risk":    [r"charge.*capture", r"confirm.*without.*redirect",
+                           r"skipThreeDSecure|skip_3ds|disable_3ds"],
+    "Card data client-side": [r"cardNumber|card_number|cvv|cvc|expiry",
+                               r"stripe\.createToken\s*\(card\)",
+                               r"Elements.*card\b"],
+}
+
+# PCI risk indicators
+_PCI_RISK_SIGNALS = [
+    (r"cardNumber|card_number",          "🔴 Card number handled client-side — PCI scope HIGH"),
+    (r"cvv|cvc|security.?code",          "🔴 CVV handled client-side — PCI violation risk"),
+    (r"stripe\.createToken",             "🟠 Raw Stripe token creation — PCI scope elevated"),
+    (r"stripe\.createPaymentMethod",     "🟢 Payment Method API — PCI compliant path"),
+    (r"stripe\.(confirmCard|handleCard)","🟢 Payment Intent flow — PCI compliant"),
+]
+
+
+def _pay_gateway_profile(findings: list, all_texts: list) -> dict:
+    """
+    Analyze payment findings + JS source to build a gateway security profile.
+    Returns a dict with mode, methods, 3ds_status, pci_risk.
+    """
+    profile = {
+        "gateways":   [],
+        "live_keys":  [],
+        "test_keys":  [],
+        "unknown_mode": [],
+        "methods":    [],
+        "threeds":    [],
+        "pci_risks":  [],
+    }
+
+    # ── Key mode detection ────────────────────────────────────────────────────
+    for f in findings:
+        val = f.get("value", "")
+        gw  = f.get("type", "")
+        matched = False
+        for pat, gw_name, is_live, note in _PAY_KEY_PREFIX_MAP:
+            if re.match(pat, val, re.I):
+                entry = {"gateway": gw_name, "key_preview": val[:16] + "…", "note": note}
+                if is_live is True:
+                    profile["live_keys"].append(entry)
+                elif is_live is False:
+                    profile["test_keys"].append(entry)
+                else:
+                    profile["unknown_mode"].append(entry)
+                if gw_name not in profile["gateways"]:
+                    profile["gateways"].append(gw_name)
+                matched = True
+                break
+        if not matched and gw and gw not in profile["gateways"]:
+            profile["gateways"].append(gw)
+
+    # ── Combine all JS+HTML text for signal detection ─────────────────────────
+    combined = "\n".join(text for text, _ in all_texts)
+
+    # ── Payment method detection ──────────────────────────────────────────────
+    for method_name, patterns in _PAY_METHOD_SIGNALS.items():
+        for p in patterns:
+            if re.search(p, combined, re.I):
+                if method_name not in profile["methods"]:
+                    profile["methods"].append(method_name)
+                break
+
+    # ── 3DS / SCA detection ───────────────────────────────────────────────────
+    for signal_name, patterns in _3DS_SIGNALS.items():
+        for p in patterns:
+            if re.search(p, combined, re.I):
+                if signal_name not in profile["threeds"]:
+                    profile["threeds"].append(signal_name)
+                break
+
+    # ── PCI risk scan ─────────────────────────────────────────────────────────
+    for pat, note in _PCI_RISK_SIGNALS:
+        if re.search(pat, combined, re.I):
+            if note not in profile["pci_risks"]:
+                profile["pci_risks"].append(note)
+
+    return profile
+
+
+def _format_pay_gateway_profile(profile: dict) -> list:
+    """Render gateway profile as Telegram message lines."""
+    lines = ["", "💳 *Payment Gateway Profile*", "━━━━━━━━━━━━━━━━━━━━"]
+
+    # Gateways detected
+    if profile["gateways"]:
+        lines.append(f"🏦 *Gateways:* {', '.join(profile['gateways'])}")
+
+    # Key mode summary
+    live_count = len(profile["live_keys"])
+    test_count = len(profile["test_keys"])
+    if live_count and test_count:
+        lines.append(f"⚠️ *Mixed mode:* `{live_count}` live + `{test_count}` test keys")
+    elif live_count:
+        lines.append(f"🔴 *Mode: LIVE* — `{live_count}` live key(s) detected")
+    elif test_count:
+        lines.append(f"🟢 *Mode: TEST* — `{test_count}` test key(s) only")
+
+    for e in profile["live_keys"][:3]:
+        lines.append(f"  {e['note']} `{escape_md(e['key_preview'])}`")
+    for e in profile["test_keys"][:2]:
+        lines.append(f"  {e['note']}")
+
+    # Payment methods
+    if profile["methods"]:
+        lines.append(f"💰 *Payment Methods:* {', '.join(profile['methods'])}")
+
+    # 3DS status
+    if profile["threeds"]:
+        lines.append("🔐 *3DS / SCA Status:*")
+        for s in profile["threeds"]:
+            icon = "✅" if "enforce" in s.lower() or "sca" in s.lower() else "⚠️"
+            lines.append(f"  {icon} {s}")
+
+    # PCI risk
+    if profile["pci_risks"]:
+        lines.append("🏷️ *PCI Scope:*")
+        for r in profile["pci_risks"][:4]:
+            lines.append(f"  {r}")
+
+    if not any([profile["live_keys"], profile["test_keys"],
+                profile["methods"], profile["threeds"], profile["pci_risks"]]):
+        lines.append("⚪ No gateway configuration signals detected in JS source")
+
+    return lines
+
+
 def _paykeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
     if data.get("error"):
@@ -11122,8 +11799,14 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
 
     if progress_cb: progress_cb("🔍 Scanning HTML + JS + live + source maps + workers...")
 
-    # ── 1. HTML + JS bundles + live bodies ──
+    # ── 1. HTML + JS bundles (live bodies already merged via _gather_all_text_v2) ──
+    # FIX P3: _gather_all_text_v2 includes live_result bodies — don't re-scan separately
+    _all_texts_seen: set = set()
     for text, label in _gather_all_text_v2(data, live_result):
+        text_id = label[:60]
+        if text_id in _all_texts_seen:
+            continue       # skip duplicates (live bodies may appear twice)
+        _all_texts_seen.add(text_id)
         for key_type, pat in _PAY_PATTERNS:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
@@ -11245,6 +11928,10 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     for ef in _browser_storage_scan(data.get("dom_result") or {}, _PAY_PATTERNS, _pay_seen):
         _add(ef["type"], ef["value"], ef["source"])
 
+    # ── Gateway Profile (unique to v18) ───────────────────────────────────────
+    all_texts_for_profile = _gather_all_text_v2(data, live_result)
+    gateway_profile = _pay_gateway_profile(findings, all_texts_for_profile)
+
     return {
         "error":    None,
         "findings": findings,
@@ -11253,6 +11940,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         "js_count": sum(1 for e in data.get("network_log",[]) if ".js" in e["url"]),
         "dynamic":  dyn_pw,
         "live_result": live_result,
+        "gateway_profile": gateway_profile,
         "extra_scans": {
             "sourcemaps": len(sourcemap_texts),
             "service_workers": len(sw_texts),
@@ -11361,7 +12049,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Build enhanced report ──────────────────────────────────────────────
     lines = [
-        f"💳 *Payment Keys v19 — `{escape_md(domain)}`*",
+        f"💳 *Payment Keys — `{escape_md(domain)}`*",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🌐 `{escape_md(page_url[:60])}`",
         f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
@@ -11369,29 +12057,45 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`\n",
     ]
 
-    ordered = (
+    # Deduplicated ordering: CONFIRMED → LIVE → STATIC
+    seen_vals = set()
+    ordered   = []
+    for f, badge in (
         [(f, "✅ CONFIRMED") for f in confirmed] +
-        [(f, "🔴 LIVE")      for f in high_live  if f not in confirmed] +
+        [(f, "🔴 LIVE")      for f in high_live if f not in confirmed] +
         [(f, "⚠️ STATIC")   for f in static_only]
-    )
+    ):
+        k = f.get("value", "")
+        if k not in seen_vals:
+            seen_vals.add(k)
+            ordered.append((f, badge))
 
-    for i, (f, badge) in enumerate(ordered[:25], 1):
-        val     = f["value"]
+    for i, (f, badge) in enumerate(ordered[:50], 1):
+        val     = f.get("value", "")
         env     = f.get("env", _detect_env(f["type"], val))
-        vfy     = f.get("verified","")
+        vfy     = f.get("verified", "")
         vfy_tag = " ✔️" if vfy == "VALID" else (" ✖️" if vfy == "INVALID" else "")
-        conf    = f.get("confidence","")
+        conf    = f.get("confidence", "")
         src_tag = ""
         if "SOURCEMAP" in conf: src_tag = " 🗺️"
-        elif "SW" in conf:      src_tag = " ⚙️"
+        elif "SW"      in conf: src_tag = " ⚙️"
         elif "SUBPAGE" in conf: src_tag = " 🔗"
         elif "GRAPHQL" in conf: src_tag = " 📐"
 
-        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag} `{escape_md(f['type'])}`")
-        lines.append(f"  `{escape_md(val[:80])}`")
-        lines.append(f"  _📂 {escape_md(f.get('source','')[:60])}_\n")
+        env_warn = " ⚠️" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
+
+        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
+        lines.append(f"  📌 `{escape_md(f['type'])}`")
+        lines.append(f"  🔑 `{escape_md(val[:80])}`")
+        lines.append(f"  📂 _{escape_md(f.get('source','')[:60])}_\n")
 
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+
+    # ── Gateway Profile block (v18 unique) ─────────────────────────────────
+    gw_profile = result.get("gateway_profile")
+    if gw_profile:
+        lines += _format_pay_gateway_profile(gw_profile)
+
     report = "\n".join(lines)
 
     await safe_markdown_reply(msg, _truncate_safe_md(report))
@@ -12581,6 +13285,180 @@ _CSRF_PATTERNS = [
 ]
 
 # New JS eval string — add IndexedDB scan
+# ══════════════════════════════════════════════════════════════════
+# 🔄  HIDDENKEYS IMPROVEMENT — Token Stability Analysis
+#
+#  Unique approach: Page ကို 2 ကြိမ် fetch ပြီး token တွေကို
+#  နှိုင်းယှဉ်တယ် — Burp Suite CSRF scanner လုပ်တဲ့ approach
+#
+#  Results:
+#   ROTATING  → token ပြောင်းနေ = good security practice
+#   STATIC    → token မပြောင်း = potential CSRF weakness
+#   ABSENT    → token မရှိ = unprotected form
+# ══════════════════════════════════════════════════════════════════
+
+# Token field names to track across fetches
+_STABILITY_TOKEN_NAMES = [
+    # CSRF tokens
+    "_token", "csrf_token", "csrftoken", "_csrf", "xsrf_token",
+    "authenticity_token", "__RequestVerificationToken",
+    "csrfmiddlewaretoken", "_csrfToken", "csrf_hash",
+    # Nonces
+    "nonce", "csp-nonce", "wp-nonce",
+    # Session/state tokens
+    "state", "form_token", "form_key",
+    # Framework-specific
+    "__VIEWSTATE", "__EVENTVALIDATION",
+]
+
+_STABILITY_META_NAMES = [
+    "csrf-token", "xsrf-token", "_token", "csrf_token",
+    "x-csrf-token", "x-xsrf-token",
+]
+
+
+def _token_stability_check(url: str, progress_cb=None) -> dict:
+    """
+    Fetch the page twice with independent sessions and compare
+    CSRF tokens, nonces, and hidden form values.
+
+    Returns:
+        {
+          "rotating": [{"name":..., "val1":..., "val2":...}],
+          "static":   [{"name":..., "value":...}],
+          "absent":   [form_action_url, ...],
+          "error":    str | None
+        }
+    """
+    result = {"rotating": [], "static": [], "absent": [], "error": None}
+
+    def _fetch_tokens(session) -> dict:
+        """Return {token_name: value} from HTML of one fetch."""
+        tokens = {}
+        try:
+            r = session.get(url, timeout=15, verify=False,
+                            allow_redirects=True)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            # ── Hidden inputs ────────────────────────────────────────────
+            for inp in soup.find_all("input", {"type": "hidden"}):
+                name = (inp.get("name") or "").lower().strip()
+                val  = inp.get("value", "").strip()
+                if name and len(val) >= 6:
+                    # Only track known token field names + high-entropy values
+                    is_known = any(t in name for t in _STABILITY_TOKEN_NAMES)
+                    is_ent   = len(val) > 10 and _entropy(val) > 3.0
+                    if is_known or is_ent:
+                        tokens[f"input:{name}"] = val
+
+            # ── Meta tags ────────────────────────────────────────────────
+            for meta in soup.find_all("meta"):
+                name = (meta.get("name") or meta.get("property") or "").lower()
+                val  = (meta.get("content") or "").strip()
+                if name and len(val) >= 8:
+                    if any(t in name for t in _STABILITY_META_NAMES):
+                        tokens[f"meta:{name}"] = val
+
+            # ── Forms without any token (ABSENT detection) ────────────────
+            for form in soup.find_all("form",
+                                      attrs={"method": re.compile(r"post", re.I)}):
+                action = form.get("action", url)[:80]
+                has_tok = any(
+                    any(t in (inp.get("name") or "").lower()
+                        for t in _STABILITY_TOKEN_NAMES)
+                    for inp in form.find_all("input", {"type": "hidden"})
+                )
+                if not has_tok:
+                    result["absent"].append(action)
+
+        except Exception as e:
+            result["error"] = str(e)
+        return tokens
+
+    if progress_cb:
+        progress_cb("🔄 Fetch #1 — capturing tokens...")
+
+    sess1 = requests.Session()
+    sess1.headers.update(_get_headers())
+    tokens1 = _fetch_tokens(sess1)
+
+    if result["error"]:
+        return result
+
+    if progress_cb:
+        progress_cb("🔄 Fetch #2 — comparing token stability...")
+
+    # Small delay to allow server-side token rotation
+    import time as _time
+    _time.sleep(1.5)
+
+    sess2 = requests.Session()
+    sess2.headers.update(_get_headers())
+    tokens2 = _fetch_tokens(sess2)
+
+    # ── Compare ──────────────────────────────────────────────────────────────
+    all_names = set(tokens1) | set(tokens2)
+    for name in sorted(all_names):
+        v1 = tokens1.get(name)
+        v2 = tokens2.get(name)
+        if v1 is None or v2 is None:
+            continue   # only present in one fetch — skip
+        if v1 != v2:
+            result["rotating"].append({
+                "name":  name,
+                "val1":  v1[:20] + "…" if len(v1) > 20 else v1,
+                "val2":  v2[:20] + "…" if len(v2) > 20 else v2,
+                "entropy_v1": round(_entropy(v1), 2),
+            })
+        else:
+            result["static"].append({
+                "name":    name,
+                "value":   v1[:30] + "…" if len(v1) > 30 else v1,
+                "entropy": round(_entropy(v1), 2),
+            })
+
+    # Dedup absent list
+    result["absent"] = list(dict.fromkeys(result["absent"]))[:10]
+    return result
+
+
+def _format_stability_block(stab: dict) -> list:
+    """Render token stability results as Telegram message lines."""
+    if stab.get("error"):
+        return [f"⚠️ Stability check error: `{escape_md(stab['error'][:60])}`"]
+
+    lines = ["", "🔄 *Token Stability Analysis*", "━━━━━━━━━━━━━━━━━━━━"]
+
+    rotating = stab.get("rotating", [])
+    static   = stab.get("static",   [])
+    absent   = stab.get("absent",   [])
+
+    if rotating:
+        lines.append(f"✅ *ROTATING* — `{len(rotating)}` token(s) change per request")
+        for t in rotating[:5]:
+            lines.append(f"  🟢 `{escape_md(t['name'])}` H=`{t['entropy_v1']}`")
+            lines.append(f"     `{escape_md(t['val1'])}` → `{escape_md(t['val2'])}`")
+
+    if static:
+        lines.append(f"\n⚠️ *STATIC* — `{len(static)}` token(s) never rotate")
+        for t in static[:5]:
+            h = t["entropy"]
+            risk = "🔴 low entropy" if h < 3.0 else ("🟡 medium entropy" if h < 4.0 else "🟠 high entropy but static")
+            lines.append(f"  {risk} `{escape_md(t['name'])}` H=`{h}`")
+            lines.append(f"     Value: `{escape_md(t['value'])}`")
+
+    if absent:
+        lines.append(f"\n🔴 *ABSENT* — `{len(absent)}` POST form(s) with no CSRF token")
+        for a in absent[:4]:
+            lines.append(f"  ⛔ `{escape_md(a[:70])}`")
+
+    if not rotating and not static and not absent:
+        lines.append("⚪ No token fields detected across 2 fetches")
+
+    return lines
+
+
 def _hiddenkeys_sync(url: str, progress_cb=None) -> dict:
     """
     2026 Enhanced hidden key scanner.
@@ -19747,6 +20625,81 @@ _KD_SEVERITY = {
     "🌐": "MEDIUM",     # Generic (context-dependent)
 }
 
+# ── Exploitability Hints — unique to /keydump ─────────────────────────────────
+# Per key type: what can an attacker do if they have this?
+_KD_EXPLOIT_HINTS = {
+    # Cloud
+    "AWS Access Key ID":         "List S3 buckets, query IAM, launch EC2 (+ secret key needed)",
+    "AWS Secret Access Key":     "Full AWS API access — exfil data, pivot infra, create backdoors",
+    "AWS Session Token":         "Temporary AWS creds — lateral movement within session TTL",
+    "GCP/Firebase API Key":      "Call GCP APIs — may access Firestore, Storage, Maps billing",
+    "GCP Service Account":       "Impersonate service — admin access to GCP project possible",
+    "Azure Client Secret":       "Authenticate as app principal — access Azure resources/Graph API",
+    "DigitalOcean Token":        "Full DO API — list droplets, SSH keys, databases",
+    "Cloudflare API Token":      "Modify DNS, firewall rules, page rules — site takeover possible",
+    "Vercel Token":              "Deploy arbitrary code to Vercel project, access env vars",
+    # AI / ML
+    "OpenAI API Key":            "Query GPT-4/DALL-E at account cost — billing abuse + data access",
+    "Anthropic API Key":         "Query Claude at account cost — billing abuse",
+    "Hugging Face Token":        "Access private models/datasets, push malicious models",
+    "Replicate API Token":       "Run GPU workloads at account expense — billing abuse",
+    # Database
+    "MongoDB URI":               "Direct DB read/write — dump all collections, drop data",
+    "PostgreSQL URI":            "Direct DB connection — full CRUD, pg_read_file if superuser",
+    "MySQL URI":                 "Direct DB connection — dump schemas, read sensitive tables",
+    "Redis URI":                 "Flush cache, inject poisoned cache entries, read session data",
+    "Supabase Service Key":      "Bypass RLS — read/write all Supabase tables as admin",
+    "Firebase Admin SDK":        "Bypass security rules — read/write all Firestore + Auth tokens",
+    # Auth
+    "JWT Secret":                "Forge any JWT — impersonate any user incl. admin",
+    "Auth0 Client Secret":       "Generate tokens for any Auth0 user — account takeover",
+    "Okta API Token":            "Manage users/groups in Okta org — privilege escalation",
+    "Stripe Secret Key":         "Charge cards, refund, access customer PII, transfer funds",
+    "Stripe Webhook Secret":     "Forge Stripe webhook events — trigger payment flows",
+    # Payment
+    "PayPal Client Secret":      "Generate PayPal OAuth tokens — access merchant account",
+    "Braintree Private Key":     "Full Braintree API — transactions, vaulted cards",
+    "Square Access Token":       "Full Square API — transactions, inventory, customer data",
+    # Comms
+    "SendGrid API Key":          "Send emails as domain, read contact lists — phishing / exfil",
+    "Twilio Auth Token":         "Send SMS/calls as account, read message logs",
+    "Mailgun API Key":           "Send phishing emails from verified domain",
+    "Slack Bot Token":           "Read all channels/DMs, post messages, access files",
+    "Discord Bot Token":         "Full Discord bot API — read messages, join servers",
+    # Observability
+    "Sentry DSN":                "Inject fake errors, read existing error logs with PII",
+    "Datadog API Key":           "Read metrics/logs, inject fake events",
+    # VCS
+    "GitHub Personal Token":     "Access private repos, push code, read secrets/actions",
+    "GitLab Personal Token":     "Same scope as GitHub — CI/CD pipeline access",
+    "Bitbucket App Password":    "Clone private repos, push code",
+    # Generic
+    "Private Key (RSA/EC)":      "Decrypt TLS traffic, sign arbitrary data, SSH access",
+    "Generic API Key":           "Context-dependent — enumerate endpoints to assess scope",
+}
+
+def _kd_exploit_hint(label: str) -> str:
+    """Return exploit hint for a key label, or empty string."""
+    # Exact match first
+    if label in _KD_EXPLOIT_HINTS:
+        return _KD_EXPLOIT_HINTS[label]
+    # Partial match
+    for k, v in _KD_EXPLOIT_HINTS.items():
+        if k.lower() in label.lower() or label.lower() in k.lower():
+            return v
+    return ""
+
+
+# ── Risk tier ordering for keydump output ─────────────────────────────────────
+_KD_TIER_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+_KD_TIER_EMOJI = {
+    "CRITICAL": "🔴 CRITICAL",
+    "HIGH":     "🟠 HIGH",
+    "MEDIUM":   "🟡 MEDIUM",
+    "LOW":      "🔵 LOW",
+}
+
+
 # Compile patterns once
 _KD_COMPILED = {
     label: (re.compile(pat, re.IGNORECASE | re.MULTILINE), icon)
@@ -19881,6 +20834,74 @@ def _fp_validate_token(value: str, name: str = "") -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 🛡️  OBFUSCATION DETECTOR — False Positive Reducer
+#   Obfuscated JS ကို static regex scan မလုပ်ဘဲ skip မယ်
+#   Playwright DOM eval က runtime values ကိုသာ ဖမ်းမယ်
+# ═══════════════════════════════════════════════════════════════
+
+def _is_obfuscated(js_text: str) -> tuple:
+    """
+    Detect obfuscated / heavily packed JS.
+    Returns (is_obfuscated: bool, reason: str).
+
+    Scoring (threshold = 4):
+      +3  _0x hex variable names  (obfuscator.io style)
+      +3  eval(function(p,a,c,k   (JScrambler / packer style)
+      +3  string array + rotation  (common obfuscator pattern)
+      +2  avg token length > 15   (long hex strings everywhere)
+      +2  semicolon density > 5%  (minifier artifact)
+      +1  very low whitespace     (< 2% of text)
+    """
+    if not js_text or len(js_text) < 200:
+        return False, ""
+
+    score = 0
+    reasons = []
+    sample = js_text[:120_000]   # first 120KB သာ စစ် (speed)
+
+    # ── _0x hex var names (obfuscator.io) ──────────────────────
+    _0x_count = len(re.findall(r'\b_0x[0-9a-f]{3,6}\b', sample))
+    if _0x_count >= 5:
+        score += 3
+        reasons.append(f"_0x vars={_0x_count}")
+
+    # ── eval(function(p,a,c,k,e,d) packer ──────────────────────
+    if re.search(r'eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k', sample):
+        score += 3
+        reasons.append("eval packer")
+
+    # ── String array + rotation pattern ────────────────────────
+    # e.g. var _0xabc=['str1','str2',...]; _0xabc[0x1];
+    if re.search(r"var\s+_0x[0-9a-f]+\s*=\s*\[(?:'[^']*'|\"[^\"]*\"|,\s*){5,}\]", sample):
+        score += 3
+        reasons.append("string array")
+
+    # ── Average token length (hex-packed code is dense) ────────
+    tokens = re.findall(r'[A-Za-z0-9_$]+', sample)
+    if tokens:
+        avg_len = sum(len(t) for t in tokens) / len(tokens)
+        if avg_len > 15:
+            score += 2
+            reasons.append(f"avg_token={avg_len:.1f}")
+
+    # ── Semicolon density ───────────────────────────────────────
+    if len(sample) > 0:
+        sc_ratio = sample.count(';') / len(sample)
+        if sc_ratio > 0.05:
+            score += 2
+            reasons.append(f"sc_density={sc_ratio:.3f}")
+
+    # ── Whitespace poverty ──────────────────────────────────────
+    ws_ratio = sum(1 for c in sample if c in ' \n\t\r') / max(len(sample), 1)
+    if ws_ratio < 0.02:
+        score += 1
+        reasons.append(f"ws={ws_ratio:.3f}")
+
+    is_obf = score >= 4
+    return is_obf, (f"score={score} [{', '.join(reasons)}]" if is_obf else "")
+
+
+# ═══════════════════════════════════════════════════════════════
 
 def _entropy(s: str) -> float:
     """Calculate Shannon entropy of a string."""
@@ -19895,27 +20916,83 @@ def _entropy(s: str) -> float:
 
 # ─── High-entropy string finder ───────────────────────────────
 def _find_high_entropy(text: str, threshold: float = 4.2) -> list:
-    """Find high-entropy strings (> threshold) — likely secrets. v18: threshold 4.2, hex patterns, limit 30."""
+    """
+    ENH K1: Context-aware entropy scan — filters false positives.
+    - Skip strings adjacent to CSS/asset keywords (className, url, src, hash)
+    - Skip known-safe patterns (hex color codes, version strings, UUIDs used as IDs)
+    - Apply higher threshold (4.5) for short strings (20-32 chars) to cut noise
+    - Tag each result with context snippet for review
+    """
+    _FP_CONTEXT = re.compile(
+        r'(?i)(?:className|class_name|classname|font|color|background|'
+        r'url\s*\(|src\s*=|href\s*=|import\s+|require\s*\(|'
+        r'version|hash|checksum|integrity|nonce|csrf|_token\b)',
+        re.I
+    )
+    _FP_VALUE = re.compile(
+        r'^(?:[0-9a-f]{6}|[0-9a-f]{8}|[0-9a-f]{3})$',  # CSS hex colors
+        re.I
+    )
+    _SECRET_CONTEXT = re.compile(
+        r'(?i)(?:key|secret|token|api|auth|pass|cred|private|access|'
+        r'bearer|client_secret|webhook|signing)',
+        re.I
+    )
+
     candidates = []
     # Scan quoted strings
     for m in re.finditer(r'["\']([A-Za-z0-9+/=_\-]{20,120})["\']', text):
         s = m.group(1)
+        if _FP_VALUE.match(s):
+            continue
+        # Extract surrounding context (±80 chars)
+        ctx_start = max(0, m.start() - 80)
+        ctx_end   = min(len(text), m.end() + 80)
+        ctx       = text[ctx_start:ctx_end]
+        # Skip if adjacent to CSS/asset keywords
+        if _FP_CONTEXT.search(ctx):
+            continue
         ent = _entropy(s)
-        if ent >= threshold:
-            candidates.append({"value": s, "entropy": round(ent, 2), "type": "quoted_string"})
-    # v18: bare hex-32 (API keys, tokens, MD5 hashes with secrets)
+        # Higher threshold for shorter strings unless secret context found
+        min_ent = threshold if _SECRET_CONTEXT.search(ctx) else (4.6 if len(s) < 40 else threshold)
+        if ent >= min_ent:
+            candidates.append({
+                "value":   s,
+                "entropy": round(ent, 2),
+                "type":    "quoted_string",
+                "context": ctx.strip()[:80],
+            })
+    # hex-32 (API keys, tokens — but not MD5 of static assets)
     for m in re.finditer(r'\b([0-9a-f]{32})\b', text, re.I):
         s = m.group(1)
+        ctx_start = max(0, m.start() - 60)
+        ctx       = text[ctx_start: m.end() + 60]
+        if _FP_CONTEXT.search(ctx):
+            continue
         ent = _entropy(s)
-        if ent >= threshold:
-            candidates.append({"value": s, "entropy": round(ent, 2), "type": "hex32"})
-    # v18: bare hex-64 (SHA-256 secrets, long tokens)
+        if ent >= 3.8:   # hex-32 is bounded — lower bar with context guard
+            candidates.append({
+                "value":   s,
+                "entropy": round(ent, 2),
+                "type":    "hex32",
+                "context": ctx.strip()[:80],
+            })
+    # hex-64 (SHA-256 secrets, long tokens)
     for m in re.finditer(r'\b([0-9a-f]{64})\b', text, re.I):
         s = m.group(1)
+        ctx_start = max(0, m.start() - 60)
+        ctx       = text[ctx_start: m.end() + 60]
+        if _FP_CONTEXT.search(ctx):
+            continue
         ent = _entropy(s)
         if ent >= threshold:
-            candidates.append({"value": s, "entropy": round(ent, 2), "type": "hex64"})
-    # Deduplicate
+            candidates.append({
+                "value":   s,
+                "entropy": round(ent, 2),
+                "type":    "hex64",
+                "context": ctx.strip()[:80],
+            })
+    # Deduplicate and return top 30
     seen = set()
     out  = []
     for c in candidates:
@@ -20464,23 +21541,37 @@ def _run_keydump_sync(url: str) -> dict:
     out["js_count"]      = len(data["js_sources"])
     out["inline_scripts"] = len(inline_scripts)
 
-    # ── 2. Pattern scan ───────────────────────────────────────────────────────
-    for label, (pat, cat_icon) in _KD_PATTERNS.items():
-        try:
-            raw = re.findall(pat, corpus, re.IGNORECASE)
-        except Exception:
-            continue
-        flat = []
-        for m in raw:
-            if isinstance(m, tuple):
-                flat.extend([x.strip() for x in m if x and len(x) > 4])
-            else:
-                if m and len(m) > 4:
-                    flat.append(m.strip())
-        unique = list(dict.fromkeys(flat))[:8]
-        if unique:
-            out["raw_hits"][label] = unique
-            out["by_category"].setdefault(cat_icon, {})[label] = unique
+    # ── 2. Pattern scan — with global dedup set ──────────────────────────────
+    _global_kd_seen: set = set()   # ENH K4: dedup across all scan phases
+
+    def _kd_pattern_scan(text_corpus: str, source_tag: str = "") -> None:
+        """Scan corpus through all _KD_PATTERNS, add to out with dedup."""
+        for label, (pat, cat_icon) in _KD_PATTERNS.items():
+            try:
+                raw = re.findall(pat, text_corpus, re.IGNORECASE)
+            except Exception:
+                continue
+            flat = []
+            for m in raw:
+                if isinstance(m, tuple):
+                    flat.extend([x.strip() for x in m if x and len(x) > 4])
+                else:
+                    if m and len(m) > 4:
+                        flat.append(m.strip())
+            for val in flat:
+                dedup_key = label + ":" + val[:80]
+                if dedup_key in _global_kd_seen:
+                    continue
+                _global_kd_seen.add(dedup_key)
+                tag_label = f"{label}{' ' + source_tag if source_tag else ''}"
+                out["raw_hits"].setdefault(tag_label, [])
+                if len(out["raw_hits"][tag_label]) < 8:
+                    out["raw_hits"][tag_label].append(val)
+                out["by_category"].setdefault(cat_icon, {}).setdefault(tag_label, [])
+                if len(out["by_category"][cat_icon][tag_label]) < 8:
+                    out["by_category"][cat_icon][tag_label].append(val)
+
+    _kd_pattern_scan(corpus)  # main corpus
 
     # ── 3. High-entropy — threshold 4.2 (was 4.5) ────────────────────────────
     # Lowering from 4.5 → 4.2 catches more real secrets (AWS, GCP tokens,
@@ -20492,24 +21583,7 @@ def _run_keydump_sync(url: str) -> dict:
         maps = _fetch_source_maps(data["js_sources"], url)
         if maps:
             for js_url, map_text in maps:
-                for label, (pat, cat_icon) in _KD_PATTERNS.items():
-                    try:
-                        raw = re.findall(pat, map_text, re.IGNORECASE)
-                    except Exception:
-                        continue
-                    flat = []
-                    for m in raw:
-                        if isinstance(m, tuple):
-                            flat.extend([x.strip() for x in m if x and len(x) > 4])
-                        else:
-                            if m and len(m) > 4:
-                                flat.append(m.strip())
-                    if flat:
-                        sm_label = f"{label} (sourcemap)"
-                        existing = out["by_category"].setdefault(cat_icon, {}).get(sm_label, [])
-                        out["by_category"][cat_icon][sm_label] = list(
-                            dict.fromkeys(existing + flat[:4])
-                        )
+                _kd_pattern_scan(map_text, f"(sourcemap: {js_url[-40:]})")
             out["source_maps"] = [js_url for js_url, _ in maps]
     except Exception as e:
         out["errors"].append(f"Sourcemap: {e}")
@@ -20518,22 +21592,8 @@ def _run_keydump_sync(url: str) -> dict:
     try:
         env_files = _probe_env_files(url)
         out["env_files"] = env_files
-        # Scan found .env content through _KD_PATTERNS too
         for env_path, env_body in env_files:
-            for label, (pat, cat_icon) in _KD_PATTERNS.items():
-                try:
-                    raw = re.findall(pat, env_body, re.IGNORECASE)
-                except Exception:
-                    continue
-                flat = [x.strip() if not isinstance(x, tuple) else
-                        next((g.strip() for g in x if g), "") for x in raw]
-                flat = [v for v in flat if len(v) > 4]
-                if flat:
-                    env_label = f"{label} ({env_path})"
-                    existing  = out["by_category"].setdefault(cat_icon, {}).get(env_label, [])
-                    out["by_category"][cat_icon][env_label] = list(
-                        dict.fromkeys(existing + flat[:6])
-                    )
+            _kd_pattern_scan(env_body, f"({env_path})")
     except Exception as e:
         out["errors"].append(f"Env probe: {e}")
 
@@ -20592,12 +21652,17 @@ def _run_keydump_sync(url: str) -> dict:
 
     # ── ENH6: WASM binary secret scan ─────────────────────────────────────────
     try:
-        wasm_hits = _scan_wasm_secrets(url, data.get("network_log_raw", data.get("js_sources", [])))
+        # FIX K3: js_sources is list of (url, text) tuples — pass correctly
+        wasm_hits = _scan_wasm_secrets(url, data.get("js_sources", []))
         if wasm_hits:
             bucket = out["by_category"].setdefault("🔒", {})
             for wh in wasm_hits:
                 label = f"{wh.get('type','WASM secret')} (wasm)"
-                bucket.setdefault(label, []).append(wh.get("value","")[:80])
+                val   = wh.get("value", "")[:80]
+                dedup_key = label + ":" + val
+                if dedup_key not in _global_kd_seen:
+                    _global_kd_seen.add(dedup_key)
+                    bucket.setdefault(label, []).append(val)
     except Exception as e:
         out["errors"].append(f"WASM scan: {e}")
 
@@ -20609,19 +21674,11 @@ def _run_keydump_sync(url: str) -> dict:
         for store_name, store_data in dyn.get("storage", {}).items():
             if not isinstance(store_data, dict):
                 continue
-            for k, v in store_data.items():
-                if not v:
-                    continue
-                for label, (pat, cat_icon) in _KD_PATTERNS.items():
-                    try:
-                        if re.search(pat, str(v), re.IGNORECASE):
-                            store_label = f"{label} ({store_name})"
-                            bucket = out["by_category"].setdefault(cat_icon, {})
-                            bucket.setdefault(store_label, []).append(
-                                f"{k}={str(v)[:60]}"
-                            )
-                    except Exception:
-                        pass
+            store_corpus = "\n".join(
+                f"{k}={v}" for k, v in store_data.items() if v
+            )
+            if store_corpus:
+                _kd_pattern_scan(store_corpus, f"({store_name})")
     except Exception as e:
         out["errors"].append(f"Dynamic: {e}")
 
@@ -20635,31 +21692,16 @@ def _run_keydump_sync(url: str) -> dict:
             if req.get("body") or req.get("post_data")
         )
         if live_corpus:
-            for label, (pat, cat_icon) in _KD_PATTERNS.items():
-                try:
-                    raw = re.findall(pat, live_corpus, re.IGNORECASE)
-                except Exception:
-                    continue
-                flat = []
-                for m in raw:
-                    if isinstance(m, tuple):
-                        flat.extend([x.strip() for x in m if x and len(x) > 4])
-                    else:
-                        if m and len(m) > 4:
-                            flat.append(m.strip())
-                if flat:
-                    live_label = f"{label} [live stream]"
-                    bucket = out["by_category"].setdefault(cat_icon, {})
-                    existing = bucket.get(live_label, [])
-                    bucket[live_label] = list(dict.fromkeys(existing + flat[:4]))
-                    out["raw_hits"].setdefault(live_label, []).extend(flat[:4])
+            # ENH K4: use shared scan fn — dedup across all phases
+            _kd_pattern_scan(live_corpus, "[live stream]")
         # Entropy scan on live bodies too
         if live_corpus:
             live_entropy = _find_high_entropy(live_corpus, threshold=4.2)
-            # Merge — tag live entropy findings
             for item in live_entropy:
                 item["source"] = "live stream"
-            out["high_entropy"].extend(live_entropy)
+                # ENH K4: dedup entropy hits too
+                if item["value"] not in {e["value"] for e in out["high_entropy"]}:
+                    out["high_entropy"].append(item)
             out["high_entropy"] = sorted(
                 out["high_entropy"], key=lambda x: -x.get("entropy", 0)
             )[:50]
@@ -20865,20 +21907,34 @@ def _format_keydump_report(result: dict) -> tuple:
             f"🔍 High-entropy strings checked: `{len(entropy)}`",
         ]
     else:
-        # ── Per-category results with confidence badge ────────────────────────
+        # ── Per-category results with confidence badge + exploit hint ─────────
+        # Group by severity tier first (CRITICAL → HIGH → MEDIUM → LOW)
+        tier_buckets: dict = {"CRITICAL": [], "HIGH": [], "MEDIUM": [], "LOW": []}
         for cat_icon, cat_name in _KD_CATEGORIES.items():
             if cat_icon not in cats:
                 continue
-            cat_data = cats[cat_icon]
-            count = sum(len(v) for v in cat_data.values())
-            lines.append(f"{cat_icon} *{cat_name}* `({count})`")
-            for label, vals in cat_data.items():
-                # Show confidence badge for first value (representative)
-                badge, _ = _kd_confidence(label, vals[0]) if vals else ("⚪ LOW", "LOW")
-                lines.append(f"  ┌ {badge} *{label}*")
-                for v in vals[:3]:
-                    safe = v.replace("`", "'")
-                    lines.append(f"  └ `{escape_md(safe[:70])}`")
+            sev = _KD_SEVERITY.get(cat_icon, "MEDIUM")
+            tier_buckets.setdefault(sev, []).append((cat_icon, cat_name, cats[cat_icon]))
+
+        for tier in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+            bucket = tier_buckets.get(tier, [])
+            if not bucket:
+                continue
+            tier_label = _KD_TIER_EMOJI.get(tier, tier)
+            lines.append(f"┌─ {tier_label} ─────────────────")
+            for cat_icon, cat_name, cat_data in bucket:
+                count = sum(len(v) for v in cat_data.values())
+                lines.append(f"{cat_icon} *{cat_name}* `({count})`")
+                for label, vals in cat_data.items():
+                    badge, _ = _kd_confidence(label, vals[0]) if vals else ("⚪ LOW", "LOW")
+                    lines.append(f"  ┌ {badge} *{label}*")
+                    for v in vals[:3]:
+                        safe = v.replace("`", "'")
+                        lines.append(f"  └ `{escape_md(safe[:70])}`")
+                    # ── Exploit hint (unique to v18) ──────────────────────
+                    hint = _kd_exploit_hint(label)
+                    if hint:
+                        lines.append(f"  ⚡ _{escape_md(hint[:90])}_")
             lines.append("")
 
         # ── .env file hits (Phase 2) ─────────────────────────────────────────
@@ -21019,8 +22075,11 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
-    # Cache result for export callbacks
-    _kd_cache[uid] = result
+    # ENH K5: Cache key = uid+timestamp to prevent concurrent-run overwrite
+    import time as _time
+    cache_key = f"{uid}_{int(_time.time())}"
+    _kd_cache[uid] = result          # still keep uid lookup for callbacks
+    _kd_cache[cache_key] = result    # timestamped key for concurrent safety
 
     report, _ = _format_keydump_report(result)
 
