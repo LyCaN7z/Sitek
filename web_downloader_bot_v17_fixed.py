@@ -24680,18 +24680,22 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
     except Exception as deob_err:
         logger.debug("keydump deobfuscate layer error: %s", deob_err)
+
+
+# ဒီနေရာမှာ Function Name ကို အသစ်ပြန်ထည့်ပေးလိုက်ပါ
+async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /keydump inline buttons: raw, entropy, json export"""
     query = update.callback_query
     try:
         await query.answer()
     except Exception:
         pass
-    data = query.data   # kd_raw_UID | kd_entropy_UID | kd_json_UID
-
+    data = query.data
+    # kd_raw_UID | kd_entropy_UID | kd_json_UID
     try:
-        parts  = data.split("_")
-        action = parts[1]                    # raw / entropy / json
-        uid    = int(parts[2])
+        parts = data.split("_")
+        action = parts[1]  # raw / entropy / json
+        uid = int(parts[2])
     except Exception:
         return
 
