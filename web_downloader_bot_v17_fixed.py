@@ -7798,10 +7798,12 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fmt_ok = " ✔️" if validator(sk) else " ✖️"
 
         lines.append(f"*{icon} [{entry_num}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
-        lines.append(f"  🔑 `{sk}`")
+        _sk_safe = sk.replace("`", "'")
+        lines.append(f"  🔑 `{_sk_safe}`")
         page = f.get("page_url", "")
         if page:
-            lines.append(f"  🌐 `{page[:80]}`")
+            _pg_safe = page[:80].replace("`", "'")
+            lines.append(f"  🌐 `{_pg_safe}`")
         if f.get("action"):
             lines.append(f"  ⚡ `{f['action']}`")
         if f.get("invisible"):
@@ -7839,7 +7841,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pad    = " " * (max_klen - len(k))
             comma  = "," if idx2 < len(keys) - 1 else ""
             if isinstance(v, str):
-                json_rows.append(f'  "{k}":{pad} "{v}"{comma}')
+                v_safe = v.replace("`", "'").replace("\\", "/")
+                json_rows.append(f'  "{k}":{pad} "{v_safe}"{comma}')
             else:
                 json_rows.append(f'  "{k}":{pad} {v}{comma}')
         json_block = "\n".join(["{"] + json_rows + ["}"])
@@ -7907,11 +7910,33 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.warning("Sitekey export error: %s", e)
 
-
-
-
-# ══════════════════════════════════════════════════
-# 🗝️  KEY EXTRACTOR ENGINE — Shared Playwright runner
+    # ── Deobfuscation layer — obfuscated JS ထဲ ဖျောက်ထားတဲ့ keys ရှာ ─────────
+    try:
+        texts_for_deob = {}
+        for item in result.get("network_log", []):
+            if item.get("content_type","").startswith(("application/javascript","text/javascript")):
+                body = item.get("response_body","") or ""
+                if body:
+                    lbl = item.get("url","?").split("/")[-1][:40]
+                    texts_for_deob[lbl] = body
+        # Also include HTML
+        texts_for_deob["[HTML]"] = result.get("html", "")
+        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
+        if deob_findings:
+            high_deob = [f for f in deob_findings if f["in_secret_context"] and f["entropy"] >= 4.5]
+            if high_deob:
+                deob_lines = [f"\n🧩 *Deobfuscated Secrets — `{escape_md(domain)}`*",
+                              "━━━━━━━━━━━━━━━━━━━━",
+                              f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
+                for i, f in enumerate(high_deob[:8], 1):
+                    deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
+                    deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
+                    deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
+                deob_lines.append("⚠️ _Authorized testing only_")
+                await update.effective_message.reply_text(
+                    _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
+    except Exception as deob_err:
+        logger.debug("sitekey deobfuscate layer error: %s", deob_err)
 # ══════════════════════════════════════════════════
 
 def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
@@ -11136,6 +11161,1215 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════
+# 🔥  /firecheck — Firebase Misconfiguration Scanner
+# ══════════════════════════════════════════════════
+
+def _firecheck_sync(project_id: str, api_key: str = "") -> dict:
+    """
+    Test Firebase Realtime Database for public read/write misconfiguration.
+    Also checks Firestore REST API and Firebase Storage bucket.
+    """
+    results = {}
+    rtdb_url = f"https://{project_id}-default-rtdb.firebaseio.com/.json"
+
+    # ── Realtime Database: Public Read ─────────────────────────────
+    try:
+        r = requests.get(rtdb_url, timeout=12, verify=False,
+                         headers={**HEADERS, "Accept": "application/json"})
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                if data is None:
+                    results["rtdb_read"] = {"status": "🟡 OPEN (empty)", "detail": "Database exists but is empty"}
+                else:
+                    preview   = json.dumps(data, ensure_ascii=False)[:200]
+                    key_count = len(data) if isinstance(data, dict) else "N/A"
+                    results["rtdb_read"] = {
+                        "status":  "🔴 VULNERABLE — Public Read",
+                        "detail":  f"Root keys: {key_count}",
+                        "preview": preview,
+                    }
+            except Exception:
+                results["rtdb_read"] = {"status": "🟡 OPEN (non-JSON)", "detail": r.text[:100]}
+        elif r.status_code == 401:
+            results["rtdb_read"] = {"status": "✅ PROTECTED — Auth required", "detail": "401 Unauthorized"}
+        elif r.status_code == 403:
+            results["rtdb_read"] = {"status": "✅ PROTECTED — Permission denied", "detail": "403 Forbidden"}
+        elif r.status_code == 404:
+            results["rtdb_read"] = {"status": "⚪ NOT FOUND", "detail": "RTDB not enabled or wrong project-id"}
+        else:
+            results["rtdb_read"] = {"status": f"⚠️ HTTP {r.status_code}", "detail": r.text[:80]}
+    except requests.RequestException as e:
+        results["rtdb_read"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:80]}
+
+    # ── Realtime Database: Public Write test ───────────────────────
+    try:
+        probe_path = f"https://{project_id}-default-rtdb.firebaseio.com/firecheck_probe.json"
+        wr = requests.put(probe_path, json={"_probe": True}, timeout=10,
+                          headers={**HEADERS, "Content-Type": "application/json"}, verify=False)
+        if wr.status_code in (200, 201):
+            results["rtdb_write"] = {
+                "status": "🔴 VULNERABLE — Public Write",
+                "detail": "Unauthenticated write succeeded",
+            }
+            try:
+                requests.delete(probe_path, timeout=8, verify=False)
+            except Exception:
+                pass
+        elif wr.status_code in (401, 403):
+            results["rtdb_write"] = {"status": "✅ PROTECTED — Write denied", "detail": f"HTTP {wr.status_code}"}
+        else:
+            results["rtdb_write"] = {"status": f"⚠️ HTTP {wr.status_code}", "detail": wr.text[:60]}
+    except requests.RequestException as e:
+        results["rtdb_write"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:60]}
+
+    # ── Firestore REST API ─────────────────────────────────────────
+    if api_key:
+        fs_url = (
+            f"https://firestore.googleapis.com/v1/projects/{project_id}"
+            f"/databases/(default)/documents?key={api_key}"
+        )
+        try:
+            fr = requests.get(fs_url, timeout=10, headers=HEADERS, verify=False)
+            if fr.status_code == 200:
+                docs = fr.json().get("documents", [])
+                results["firestore"] = {
+                    "status": "🔴 VULNERABLE — Firestore Public Read",
+                    "detail": f"{len(docs)} document(s) accessible",
+                }
+            elif fr.status_code == 403:
+                results["firestore"] = {"status": "✅ PROTECTED", "detail": "Firestore requires auth"}
+            else:
+                results["firestore"] = {"status": f"⚪ HTTP {fr.status_code}", "detail": ""}
+        except Exception as e:
+            results["firestore"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:60]}
+    else:
+        results["firestore"] = {"status": "⚪ SKIPPED", "detail": "apiKey မပေးဘဲ Firestore check မလုပ်နိုင်"}
+
+    # ── Firebase Storage ───────────────────────────────────────────
+    storage_url = f"https://storage.googleapis.com/{project_id}.appspot.com/"
+    try:
+        sr = requests.get(storage_url, timeout=10, headers=HEADERS, verify=False)
+        if sr.status_code == 200:
+            results["storage"] = {
+                "status":  "🔴 VULNERABLE — Storage Public",
+                "detail":  "Bucket listing accessible",
+                "preview": sr.text[:150],
+            }
+        elif sr.status_code == 403:
+            results["storage"] = {"status": "✅ PROTECTED", "detail": "Storage not public"}
+        elif sr.status_code == 404:
+            results["storage"] = {"status": "⚪ NOT FOUND", "detail": "Bucket does not exist"}
+        else:
+            results["storage"] = {"status": f"⚪ HTTP {sr.status_code}", "detail": ""}
+    except Exception as e:
+        results["storage"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:60]}
+
+    return results
+
+
+@user_guard
+async def cmd_firecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/firecheck <project_id> [api_key] — Firebase misconfiguration scanner"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            "  `/firecheck <project-id>`\n"
+            "  `/firecheck <project-id> <apiKey>`\n\n"
+            "🔥 *Tests:*\n"
+            "  • Realtime Database — Public Read\n"
+            "  • Realtime Database — Public Write\n"
+            "  • Firestore REST API _(apiKey လိုသည်)_\n"
+            "  • Firebase Storage bucket listing\n\n"
+            "💡 _projectId နဲ့ apiKey ကို `/firebase <url>` မှ ရနိုင်သည်_\n\n"
+            "⚠️ _Authorized security testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    project_id = context.args[0].strip().lower()
+    api_key    = context.args[1].strip() if len(context.args) > 1 else ""
+
+    if not re.match(r'^[a-z0-9\-]{3,80}$', project_id):
+        await update.effective_message.reply_text("🚫 Invalid project-id format", parse_mode='Markdown')
+        return
+
+    msg = await update.effective_message.reply_text(
+        f"🔥 *Firebase Misconfig Scanner*\n"
+        f"🆔 `{escape_md(project_id)}`\n\n"
+        "⏳ Testing RTDB Read, Write, Firestore, Storage...",
+        parse_mode='Markdown'
+    )
+
+    try:
+        res = await asyncio.to_thread(_firecheck_sync, project_id, api_key)
+    except Exception as e:
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+
+    vuln_count = sum(1 for v in res.values() if "VULNERABLE" in v.get("status", ""))
+    overall    = "🔴 MISCONFIGURED" if vuln_count else "✅ SECURE"
+
+    lines = [
+        "🔥 *Firebase Misconfig Report*",
+        f"🆔 `{escape_md(project_id)}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Overall: *{overall}* | Vulns: `{vuln_count}`",
+        "",
+        "*🗄️ Realtime Database — Read*",
+        f"  {res['rtdb_read']['status']}",
+    ]
+    if res['rtdb_read'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['rtdb_read']['detail'])}_")
+    if res['rtdb_read'].get('preview'):
+        _prev = res['rtdb_read']['preview'][:120].replace('`', "'")
+        lines.append(f"```\n{_prev}\n```")
+
+    lines += ["", "*✏️ Realtime Database — Write*", f"  {res['rtdb_write']['status']}"]
+    if res['rtdb_write'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['rtdb_write']['detail'])}_")
+
+    lines += ["", "*📂 Firestore REST API*", f"  {res['firestore']['status']}"]
+    if res['firestore'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['firestore']['detail'])}_")
+
+    lines += ["", "*🗂️ Firebase Storage*", f"  {res['storage']['status']}"]
+    if res['storage'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['storage']['detail'])}_")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        ("🔴 *Misconfiguration တွေ့ပါသည်*\n_Firebase Console → Database Rules စစ်ဆေးပါ_"
+         if vuln_count else "✅ _Firebase resources properly secured_"),
+        "⚠️ _Authorized testing only_",
+    ]
+
+    report = "\n".join(lines)
+    await safe_markdown_reply(msg, _truncate_safe_md(report))
+
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "project_id": project_id,
+                "scanned_at": datetime.now().isoformat(),
+                "vulnerable": vuln_count > 0,
+                "vuln_count": vuln_count,
+                "results":    res,
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"firecheck_{project_id}_{ts}.json",
+            caption=(
+                f"🔥 Firebase Misconfig — `{escape_md(project_id)}`\n"
+                f"Vulns: `{vuln_count}` | {overall}"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("firecheck export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🔬  /entropy — High Entropy Secret Hunter
+# ══════════════════════════════════════════════════
+
+def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> dict:
+    """
+    Shannon Entropy-based secret hunter.
+    Scans HTML + JS bundles for high-entropy strings likely to be secrets.
+    Classifies results by risk tier and string type.
+    """
+    if progress_cb: progress_cb("🌐 Fetching HTML...")
+
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
+        html  = resp.text
+        final_url = resp.url
+    except Exception as e:
+        return {"error": str(e), "findings": [], "js_count": 0}
+
+    texts = [html]
+    js_urls: set = set()
+    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        abs_src = urljoin(final_url, src)
+        if abs_src.startswith("http"):
+            js_urls.add(abs_src)
+
+    if progress_cb: progress_cb(f"📦 Fetching {len(js_urls)} JS bundles...")
+    for js_url in list(js_urls)[:20]:
+        try:
+            r = requests.get(js_url, headers=HEADERS,
+                             proxies=proxy_manager.get_proxy(), timeout=TIMEOUT, verify=False)
+            if r.status_code == 200:
+                texts.append(r.text)
+        except Exception:
+            pass
+
+    if progress_cb: progress_cb("🔬 Running Shannon entropy analysis...")
+
+    _CANDIDATE_RE = re.compile(
+        r'["\']([A-Za-z0-9+/=_\-\.]{16,120})["\']'
+        r'|(?:key|secret|token|pass|api|auth|credential|private|access)'
+        r'[_\-]?\s*["\s:=]+\s*["\']([A-Za-z0-9+/=_\-\.]{8,120})["\']',
+        re.I
+    )
+    _CONTEXT_RE = re.compile(
+        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|bearer|'
+        r'client_secret|webhook|signing|encryption|sk_|pk_|AKIA|ya29|eyJ)',
+        re.I
+    )
+    _FP_RE = re.compile(
+        r'^(?:[0-9a-f]{3,8})$'
+        r'|^(?:true|false|null|undefined)$'
+        r'|\.(js|css|png|jpg|svg|woff|html|json)$'
+        r'|^https?://',
+        re.I
+    )
+
+    seen = set()
+    findings = []
+
+    for text in texts:
+        for m in _CANDIDATE_RE.finditer(text):
+            val = (m.group(1) or m.group(2) or "").strip()
+            if not val or val in seen or len(val) < 12:
+                continue
+            if _FP_RE.search(val):
+                continue
+            seen.add(val)
+
+            score = _entropy(val)
+            if score < threshold:
+                continue
+
+            ctx_start = max(0, m.start() - 80)
+            ctx       = text[ctx_start: m.start() + len(val) + 80]
+            ctx       = re.sub(r'\s+', ' ', ctx).strip()
+            in_ctx    = bool(_CONTEXT_RE.search(ctx))
+
+            risk = ("🔴 HIGH" if (score >= 4.8 and in_ctx) else
+                    "🟡 MED"  if (score >= 4.4 or in_ctx) else
+                    "⚪ LOW")
+
+            kind = "Unknown"
+            if re.match(r'^eyJ', val):               kind = "JWT"
+            elif re.match(r'^sk_|^pk_|^rk_', val):  kind = "Stripe-like"
+            elif re.match(r'^AKIA', val):             kind = "AWS Key"
+            elif re.match(r'^ya29\.', val):           kind = "Google Token"
+            elif re.match(r'^[0-9a-fA-F]+$', val):   kind = "Hex"
+            elif re.match(r'^[A-Za-z0-9+/]+=*$', val) and len(val) % 4 == 0:
+                kind = "Base64"
+
+            findings.append({
+                "value":              val,
+                "entropy":            round(score, 3),
+                "risk":               risk,
+                "kind":               kind,
+                "context":            ctx[:100],
+                "in_secret_context":  in_ctx,
+            })
+
+    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
+
+    return {
+        "url":       url,
+        "final_url": final_url,
+        "js_count":  len(js_urls),
+        "threshold": threshold,
+        "findings":  findings,
+    }
+
+
+@user_guard
+async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/entropy <url> [threshold] — High entropy secret hunter"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            "  `/entropy https://example.com`\n"
+            "  `/entropy https://example.com 4.5`  ← threshold\n\n"
+            "🔬 *Shannon Entropy Secret Hunter:*\n"
+            "  • HTML + JS bundle scan\n"
+            "  • Entropy ≥ 4.2 (default) ကိုသာ ပြသည်\n"
+            "  • Secret context detection (key/token/auth)\n"
+            "  • Base64 / Hex / JWT / AWS / Stripe classification\n"
+            "  • 🔴 HIGH / 🟡 MED / ⚪ LOW risk tiers\n\n"
+            "💡 _Regex နဲ့ မရနိုင်တဲ့ custom keys, rotating tokens တွေကို ရှာဖွေသည်_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    threshold = 4.2
+    if len(context.args) > 1:
+        try:
+            threshold = max(3.0, min(6.0, float(context.args[1])))
+        except ValueError:
+            pass
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔬 *Entropy Secret Hunter*\n"
+        f"🌐 `{escape_md(domain)}`\n"
+        f"📊 Threshold: `{threshold}`\n\n"
+        "⏳ Scanning HTML + JS bundles...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🔬 *Entropy Hunter — `{escape_md(domain)}`*\n\n{t}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(
+            _entropy_hunt_sync, url, threshold, lambda t: progress_q.append(t)
+        )
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    findings = result["findings"]
+    high   = [f for f in findings if f["risk"] == "🔴 HIGH"]
+    medium = [f for f in findings if f["risk"] == "🟡 MED"]
+    low    = [f for f in findings if f["risk"] == "⚪ LOW"]
+
+    if not findings:
+        await safe_markdown_reply(msg,
+            f"🔬 *Entropy Hunter — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 High-entropy strings မတွေ့ပါ (threshold ≥ {threshold})\n"
+            f"📦 JS bundles scanned: `{result['js_count']}`"
+        )
+        return
+
+    lines = [
+        f"🔬 *Entropy Secret Hunter — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Threshold: `{threshold}` | JS: `{result['js_count']}` bundles",
+        f"🔴 HIGH: `{len(high)}` | 🟡 MED: `{len(medium)}` | ⚪ LOW: `{len(low)}`",
+        f"📈 Total: `{len(findings)}` high-entropy strings",
+        "",
+    ]
+
+    shown = 0
+    for tier_label, tier_list in [("🔴 HIGH RISK", high), ("🟡 MEDIUM RISK", medium), ("⚪ LOW RISK", low)]:
+        if not tier_list:
+            continue
+        lines.append(f"*{tier_label}*")
+        for f in tier_list[:8]:
+            _val = f["value"][:70].replace("`", "'")
+            _ctx = f.get("context", "")[:60].replace("`", "'").replace("\n", " ")
+            lines.append(f"  H=`{f['entropy']}` [{escape_md(f['kind'])}]")
+            lines.append(f"  └ `{_val}`")
+            if _ctx and f["in_secret_context"]:
+                lines.append(f"  📌 _{escape_md(_ctx)}_")
+            lines.append("")
+            shown += 1
+            if shown >= 20:
+                break
+        if shown >= 20:
+            break
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
+        "_High entropy = likely secret — manual review လိုသည်_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps(result, indent=2, ensure_ascii=False).encode()),
+            filename=f"entropy_{safe_d}_{ts}.json",
+            caption=(
+                f"🔬 Entropy Secrets — `{escape_md(domain)}`\n"
+                f"🔴 HIGH: `{len(high)}` | Total: `{len(findings)}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("entropy export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🧩  /deobfuscate — JavaScript Secret De-obfuscator
+# ══════════════════════════════════════════════════
+
+def _deobfuscate_sync(url: str, progress_cb=None) -> dict:
+    """
+    Detect and decode obfuscated API keys/secrets in JavaScript files.
+    Handles: Base64 atob(), Hex escapes, Unicode escapes,
+             Array split/join tricks, String.fromCharCode().
+    """
+    import base64 as _b64
+
+    if progress_cb: progress_cb("🌐 Fetching page...")
+
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
+        html  = resp.text
+        final_url = resp.url
+    except Exception as e:
+        return {"error": str(e), "findings": [], "js_count": 0}
+
+    texts_map = {"[HTML]": html}
+    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        abs_src = urljoin(final_url, src)
+        if abs_src.startswith("http"):
+            try:
+                r = requests.get(abs_src, headers=HEADERS,
+                                 proxies=proxy_manager.get_proxy(),
+                                 timeout=TIMEOUT, verify=False)
+                if r.status_code == 200 and len(r.text) < 5_000_000:
+                    key = abs_src.split("/")[-1][:40]
+                    texts_map[key] = r.text
+            except Exception:
+                pass
+
+    if progress_cb: progress_cb(f"🧩 Decoding {len(texts_map)} files...")
+
+    _SECRET_KW = re.compile(
+        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|sk_|pk_|'
+        r'AKIA|bearer|webhook|signing|encrypt|password)',
+        re.I
+    )
+
+    seen_decoded: set = set()
+    findings = []
+
+    def _record(method: str, raw: str, decoded: str, source: str, context: str = ""):
+        val = decoded.strip()
+        if val in seen_decoded or len(val) < 8:
+            return
+        score = _entropy(val)
+        if score < 3.5:
+            return
+        seen_decoded.add(val)
+        findings.append({
+            "method":              method,
+            "raw":                 raw[:80],
+            "decoded":             val[:120],
+            "entropy":             round(score, 3),
+            "source":              source,
+            "context":             context[:80],
+            "in_secret_context":   bool(_SECRET_KW.search(context + raw)),
+        })
+
+    for source, text in texts_map.items():
+
+        # Pattern 1: Base64 atob() / Buffer.from(...,'base64')
+        for m in re.finditer(
+            r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']',
+            text
+        ):
+            raw = m.group(1)
+            try:
+                decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Base64 atob()", raw, decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 2: Hex escape sequences \x73\x6b...
+        for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){6,})"', text):
+            raw = m.group(1)
+            try:
+                decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                                  lambda hm: chr(int(hm.group(1), 16)), raw)
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Hex Escape \\x", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 3: Raw hex string that decodes to printable secret
+        for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
+            raw = m.group(1)
+            if len(raw) % 2 != 0:
+                continue
+            try:
+                decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
+                if decoded.isprintable() and _SECRET_KW.search(decoded):
+                    ctx = text[max(0, m.start()-60): m.start()+60]
+                    _record("Raw Hex", raw, decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 4: Unicode escape \u0073\u006b...
+        for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){5,})"', text):
+            raw = m.group(1)
+            try:
+                decoded = raw.encode('utf-8').decode('unicode_escape')
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Unicode \\u", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 5: Array join trick ["sk","_live","_xx"].join("")
+        for m in re.finditer(
+            r'\[([^\]]{10,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
+        ):
+            raw = m.group(1)
+            try:
+                parts   = re.findall(r'["\']([^"\']*)["\']', raw)
+                decoded = "".join(parts)
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Array join()", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 6: String.fromCharCode(115,107,95,...)
+        for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{10,300})\)', text):
+            raw = m.group(1)
+            try:
+                codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
+                decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("String.fromCharCode", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
+
+    return {
+        "url":      url,
+        "js_count": len(texts_map) - 1,
+        "findings": findings,
+    }
+
+
+@user_guard
+async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deobfuscate <url> — Detect & decode obfuscated secrets in JS"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/deobfuscate https://example.com`\n\n"
+            "🧩 *Secret De-obfuscator — Handles:*\n"
+            "  • `atob()` / `Buffer.from(..,'base64')` — Base64 keys\n"
+            "  • `\\x73\\x6b...` — Hex escape sequences\n"
+            "  • `\\u0073\\u006b...` — Unicode escape sequences\n"
+            "  • `['sk','_live','_xx'].join('')` — Array join tricks\n"
+            "  • `String.fromCharCode(115,107,...)` — Char code arrays\n\n"
+            "💡 _Minified JS ထဲ ဖျောက်ထားတဲ့ API keys တွေကို decode လုပ်ပေးသည်_\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🧩 *Secret De-obfuscator*\n"
+        f"🌐 `{escape_md(domain)}`\n\n"
+        "⏳ Fetching JS bundles + decoding obfuscation...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🧩 *De-obfuscator — `{escape_md(domain)}`*\n\n{t}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(
+            _deobfuscate_sync, url, lambda t: progress_q.append(t)
+        )
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    findings = result["findings"]
+    if not findings:
+        await safe_markdown_reply(msg,
+            f"🧩 *De-obfuscator — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 Obfuscated secrets မတွေ့ပါ\n"
+            f"📦 JS bundles scanned: `{result['js_count']}`"
+        )
+        return
+
+    high   = [f for f in findings if f["in_secret_context"] and f["entropy"] >= 4.5]
+    medium = [f for f in findings if f not in high and f["entropy"] >= 4.0]
+    other  = [f for f in findings if f not in high and f not in medium]
+
+    lines = [
+        f"🧩 *Secret De-obfuscator — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📦 JS bundles: `{result['js_count']}` | Decoded: `{len(findings)}`",
+        f"🔴 High risk: `{len(high)}` | 🟡 Medium: `{len(medium)}` | ⚪ Other: `{len(other)}`",
+        "",
+    ]
+
+    shown = 0
+    for tier_label, tier_list in [("🔴 HIGH RISK", high), ("🟡 MEDIUM", medium), ("⚪ OTHER", other)]:
+        if not tier_list:
+            continue
+        lines.append(f"*{tier_label}*")
+        for f in tier_list[:6]:
+            _raw = f["raw"][:60].replace("`", "'")
+            _dec = f["decoded"][:70].replace("`", "'")
+            lines.append(f"  🔓 `{escape_md(f['method'])}`  📂 _{escape_md(f['source'])}_")
+            lines.append(f"  🔒 Raw:     `{_raw}`")
+            lines.append(f"  ✅ Decoded: `{_dec}`")
+            lines.append(f"  H=`{f['entropy']}`")
+            lines.append("")
+            shown += 1
+            if shown >= 15:
+                break
+        if shown >= 15:
+            break
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "url":        result["url"],
+                "scanned_at": datetime.now().isoformat(),
+                "js_count":   result["js_count"],
+                "findings":   findings,
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"deobfuscate_{safe_d}_{ts}.json",
+            caption=(
+                f"🧩 De-obfuscated Secrets — `{escape_md(domain)}`\n"
+                f"🔴 High: `{len(high)}` | Total: `{len(findings)}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("deobfuscate export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🧩  SHARED — Deobfuscation layer (called by sitekey/keydump/paykeys)
+# ══════════════════════════════════════════════════
+
+def _deobfuscate_layer(texts_map: dict, progress_cb=None) -> list:
+    """
+    Pre-fetched JS text တွေပေါ် deobfuscation scan ပြုလုပ်တယ်။
+    sitekey / keydump / paykeys ရဲ့ already-fetched JS ကို reuse လုပ်တာမို့
+    ထပ်ခါ network request မလုပ်တော့ပါ။
+
+    Returns: list of finding dicts — method, raw, decoded, entropy, source, context
+    """
+    import base64 as _b64
+
+    _SECRET_KW = re.compile(
+        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|'
+        r'sk_|pk_|AKIA|bearer|webhook|signing|encrypt|password|client_secret)',
+    )
+    seen_decoded: set = set()
+    findings: list   = []
+
+    def _ent(s: str) -> float:
+        if not s: return 0.0
+        import math
+        freq = {}
+        for c in s: freq[c] = freq.get(c, 0) + 1
+        l = len(s)
+        return -sum(v/l * math.log2(v/l) for v in freq.values())
+
+    def _record(method: str, raw: str, decoded: str, source: str, ctx: str = ""):
+        val = decoded.strip()
+        if val in seen_decoded or len(val) < 8: return
+        score = _ent(val)
+        if score < 3.5: return
+        seen_decoded.add(val)
+        findings.append({
+            "method":            method,
+            "raw":               raw[:80],
+            "decoded":           val[:120],
+            "entropy":           round(score, 3),
+            "source":            source,
+            "context":           ctx[:80],
+            "in_secret_context": bool(_SECRET_KW.search(ctx + raw)),
+        })
+
+    for source, text in texts_map.items():
+        if not isinstance(text, str) or len(text) < 20:
+            continue
+
+        # ── 1. Base64 atob() / Buffer.from(...,'base64') ─────────────────
+        for m in re.finditer(
+            r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']', text
+        ):
+            raw = m.group(1)
+            try:
+                decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
+                _record("Base64 atob()", raw, decoded, source,
+                        text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 2. Hex escape \x73\x6b... ────────────────────────────────────
+        for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){6,})"', text):
+            raw = m.group(1)
+            try:
+                decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                                 lambda hm: chr(int(hm.group(1), 16)), raw)
+                _record("Hex \\x", raw[:80], decoded, source,
+                        text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 3. Raw hex string ─────────────────────────────────────────────
+        for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
+            raw = m.group(1)
+            if len(raw) % 2 != 0: continue
+            try:
+                decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
+                if decoded.isprintable() and _SECRET_KW.search(decoded):
+                    _record("Raw Hex", raw, decoded, source,
+                            text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 4. Unicode escape \u0073\u006b... ────────────────────────────
+        for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){5,})"', text):
+            raw = m.group(1)
+            try:
+                decoded = raw.encode('utf-8').decode('unicode_escape')
+                _record("Unicode \\u", raw[:80], decoded, source,
+                        text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 5. Array join() trick ["sk","_live","_xx"].join("") ──────────
+        for m in re.finditer(
+            r'\[([^\]]{10,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
+        ):
+            raw = m.group(1)
+            try:
+                parts   = re.findall(r'["\']([^"\']*)["\']', raw)
+                decoded = "".join(parts)
+                _record("Array join()", raw[:80], decoded, source,
+                        text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 6. String.fromCharCode(115,107,95,...) ───────────────────────
+        for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{10,300})\)', text):
+            raw = m.group(1)
+            try:
+                codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
+                decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
+                _record("fromCharCode", raw[:80], decoded, source,
+                        text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 7. Reverse string "...".split("").reverse().join("") ─────────
+        for m in re.finditer(
+            r'["\']([A-Za-z0-9+/=_\-]{16,120})["\']'
+            r'\s*\.split\s*\(\s*["\']["\']?\s*\)\s*\.reverse\(\)\s*\.join\s*\(\s*["\']["\']?\s*\)',
+            text
+        ):
+            raw = m.group(1)
+            try:
+                decoded = raw[::-1]
+                _record("Reversed string", raw[:80], decoded, source,
+                        text[max(0, m.start()-60): m.start()+60])
+            except Exception:
+                pass
+
+        # ── 8. btoa-encoded segments: split("").map(c=>c.charCodeAt(0)) ──
+        for m in re.finditer(
+            r'\.map\s*\(\s*(?:function\s*\(\s*\w+\s*\)|[\w]+\s*=>)\s*'
+            r'\w+\.charCodeAt\s*\(\s*0\s*\)\s*[+\-]\s*(\d+)\s*\)',
+            text
+        ):
+            # Caesar / ROT-N shift detection
+            try:
+                shift = int(m.group(1))
+                ctx   = text[max(0, m.start()-120): m.start()+120]
+                str_m = re.search(r'["\']([A-Za-z0-9+/=_\-]{16,})["\']', ctx)
+                if str_m:
+                    raw     = str_m.group(1)
+                    decoded = "".join(chr(max(0, ord(c) - shift)) for c in raw)
+                    _record(f"Caesar-{shift}", raw[:80], decoded, source, ctx[:80])
+            except Exception:
+                pass
+
+    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
+    if progress_cb:
+        progress_cb(f"🧩 Deobfuscate: {len(findings)} decoded string(s) found")
+    return findings
+
+
+# ══════════════════════════════════════════════════
+# 💳  /payconfig — Payment Gateway Public Config Extractor
+# ══════════════════════════════════════════════════
+
+# JS-source patterns for gateway SDK init config objects (public/frontend only)
+_PAYCONFIG_PATTERNS = [
+    # Stripe
+    ("Stripe",     "publishableKey",  re.compile(r'Stripe\s*\(\s*["\']([^"\']{10,80})["\']', re.I)),
+    ("Stripe",     "stripeAccount",   re.compile(r'stripeAccount\s*:\s*["\']([^"\']{5,40})["\']', re.I)),
+    ("Stripe",     "locale",          re.compile(r'(?:Stripe\b.{0,200})locale\s*:\s*["\']([a-z\-]{2,10})["\']', re.I|re.S)),
+    ("Stripe",     "currency",        re.compile(r'(?:Stripe\b.{0,200})currency\s*:\s*["\']([a-z]{3})["\']', re.I|re.S)),
+    ("Stripe",     "apiVersion",      re.compile(r'apiVersion\s*:\s*["\'](\d{4}-\d{2}-\d{2})["\']', re.I)),
+
+    # PayPal
+    ("PayPal",     "clientId",        re.compile(r'client[-_]?id\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,80})["\']', re.I)),
+    ("PayPal",     "currency",        re.compile(r'(?:paypal|PAYPAL).{0,300}currency\s*:\s*["\']([A-Z]{3})["\']', re.I|re.S)),
+    ("PayPal",     "intent",          re.compile(r'intent\s*:\s*["\']([a-z]+)["\']', re.I)),
+    ("PayPal",     "merchantId",      re.compile(r'merchant[-_]?id\s*[=:]\s*["\']([A-Za-z0-9\-_]{5,60})["\']', re.I)),
+
+    # Braintree
+    ("Braintree",  "authorization",   re.compile(r'(?:braintree|dropin).{0,100}authorization\s*:\s*["\']([^"\']{10,120})["\']', re.I|re.S)),
+    ("Braintree",  "container",       re.compile(r'container\s*:\s*["\']([^"\']{1,60})["\']', re.I)),
+
+    # Square
+    ("Square",     "applicationId",   re.compile(r'applicationId\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,60})["\']', re.I)),
+    ("Square",     "locationId",      re.compile(r'locationId\s*[=:]\s*["\']([A-Za-z0-9]{8,30})["\']', re.I)),
+    ("Square",     "environment",     re.compile(r'(?:square|Square).{0,100}environment\s*[=:]\s*["\']([a-z]+)["\']', re.I|re.S)),
+
+    # Razorpay (public config fields only — key_id prefix rzp_ is public)
+    ("Razorpay",   "key_id",          re.compile(r'["\']?key[_\s]?id["\']?\s*[=:]\s*["\']?(rzp_(?:live|test)_[A-Za-z0-9]{14,})["\']?', re.I)),
+    ("Razorpay",   "currency",        re.compile(r'(?:Razorpay|razorpay).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
+    ("Razorpay",   "name",            re.compile(r'(?:Razorpay|razorpay).{0,200}name\s*[=:]\s*["\']([^"\']{2,60})["\']', re.I|re.S)),
+    ("Razorpay",   "theme_color",     re.compile(r'theme\s*[=:]\s*\{[^}]*color\s*[=:]\s*["\']([^"\']{3,20})["\']', re.I|re.S)),
+
+    # Adyen
+    ("Adyen",      "environment",     re.compile(r'(?:AdyenCheckout|adyen).{0,100}environment\s*[=:]\s*["\']([a-zA-Z]+)["\']', re.I|re.S)),
+    ("Adyen",      "clientKey",       re.compile(r'clientKey\s*[=:]\s*["\']([^"\']{10,80})["\']', re.I)),
+    ("Adyen",      "countryCode",     re.compile(r'countryCode\s*[=:]\s*["\']([A-Z]{2})["\']', re.I)),
+    ("Adyen",      "currency",        re.compile(r'(?:AdyenCheckout|adyen).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
+
+    # Klarna
+    ("Klarna",     "client_id",       re.compile(r'(?:Klarna|klarna).{0,100}client[-_]?id\s*[=:]\s*["\']([^"\']{8,60})["\']', re.I|re.S)),
+    ("Klarna",     "purchase_country",re.compile(r'purchase_country\s*[=:]\s*["\']([A-Z]{2})["\']', re.I)),
+    ("Klarna",     "purchase_currency",re.compile(r'purchase_currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I)),
+
+    # Mollie
+    ("Mollie",     "profileId",       re.compile(r'profileId\s*[=:]\s*["\']([^"\']{5,40})["\']', re.I)),
+
+    # Paddle
+    ("Paddle",     "vendorId",        re.compile(r'(?:Paddle|paddle).{0,100}vendor(?:Id|ID)\s*[=:]\s*["\']?(\d{4,10})["\']?', re.I|re.S)),
+    ("Paddle",     "environment",     re.compile(r'(?:Paddle|paddle).{0,100}environment\s*[=:]\s*["\']([a-z]+)["\']', re.I|re.S)),
+
+    # Paystack
+    ("Paystack",   "key",             re.compile(r'(?:PaystackPop|paystack).{0,100}key\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I|re.S)),
+    ("Paystack",   "currency",        re.compile(r'(?:PaystackPop|paystack).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
+]
+
+
+def _payconfig_sync(url: str, progress_cb=None) -> dict:
+    """
+    Payment gateway SDK init config ကို JS source ထဲမှ ထုတ်ယူတယ်။
+    Frontend/public config fields သာ — API key/secret မဟုတ်ပါ။
+    """
+    if progress_cb: progress_cb("🌐 Fetching page HTML...")
+
+    try:
+        proxy    = proxy_manager.get_proxy()
+        resp     = requests.get(url, headers=HEADERS, proxies=proxy,
+                                timeout=TIMEOUT, verify=False)
+        html     = resp.text
+        final_url = resp.url
+    except Exception as e:
+        return {"error": str(e), "findings": {}, "js_count": 0}
+
+    texts_map: dict = {"[HTML]": html}
+
+    # Collect JS bundle URLs
+    js_urls: list = []
+    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        abs_src = urljoin(final_url, src)
+        if abs_src.startswith("http"):
+            js_urls.append(abs_src)
+
+    if progress_cb: progress_cb(f"📦 Fetching {len(js_urls)} JS bundles...")
+    for js_url in js_urls[:30]:
+        try:
+            r = requests.get(js_url, headers=HEADERS,
+                             proxies=proxy_manager.get_proxy(),
+                             timeout=TIMEOUT, verify=False)
+            if r.status_code == 200 and len(r.text) < 5_000_000:
+                key = js_url.split("/")[-1][:40] or js_url[-40:]
+                texts_map[key] = r.text
+        except Exception:
+            pass
+
+    # Also try known public config endpoints
+    config_paths = [
+        "/payment-config.json", "/checkout-config.json",
+        "/static/payment.js",   "/assets/checkout.js",
+        "/js/payment.js",       "/__payment_config",
+    ]
+    for path in config_paths:
+        try:
+            r = requests.get(urljoin(final_url, path), headers=HEADERS,
+                             proxies=proxy_manager.get_proxy(),
+                             timeout=8, verify=False)
+            if r.status_code == 200 and len(r.text) < 2_000_000:
+                texts_map[path] = r.text
+        except Exception:
+            pass
+
+    if progress_cb: progress_cb("🔍 Extracting gateway SDK config objects...")
+
+    # gateway → {field: [values]}
+    gw_configs: dict = {}
+    all_text = "\n".join(texts_map.values())
+
+    for gateway, field, pattern in _PAYCONFIG_PATTERNS:
+        for m in pattern.finditer(all_text):
+            val = m.group(1).strip()
+            if not val or len(val) < 2:
+                continue
+            if gateway not in gw_configs:
+                gw_configs[gateway] = {}
+            if field not in gw_configs[gateway]:
+                gw_configs[gateway][field] = []
+            if val not in gw_configs[gateway][field]:
+                gw_configs[gateway][field].append(val)
+
+    # Also run deobfuscate layer to catch hidden config values
+    if progress_cb: progress_cb("🧩 Running deobfuscation layer...")
+    deob = _deobfuscate_layer(texts_map, progress_cb)
+    # Classify deobfuscated results back into gateway buckets if recognizable
+    for f in deob:
+        dec = f.get("decoded", "")
+        if re.match(r'^pk_(live|test)_', dec):
+            gw_configs.setdefault("Stripe", {}).setdefault("decoded_publishable", []).append(dec[:40])
+        elif re.match(r'^rzp_(live|test)_', dec):
+            gw_configs.setdefault("Razorpay", {}).setdefault("decoded_key_id", []).append(dec[:40])
+        elif re.match(r'^[A-Z]{2}\d{6}[A-Z0-9]{10,}$', dec):
+            gw_configs.setdefault("Adyen", {}).setdefault("decoded_clientKey", []).append(dec[:40])
+
+    return {
+        "error":     None,
+        "page_url":  final_url,
+        "js_count":  len(texts_map) - 1,
+        "findings":  gw_configs,
+        "deob_count": len(deob),
+    }
+
+
+async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payconfig <url> — Extract payment gateway SDK public config from JS source"""
+    if not await check_force_join(update, context): return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/payconfig https://example.com`\n\n"
+            "⚙️ *Payment SDK Config Extractor:*\n"
+            "  JS source ထဲမှ payment gateway public init config ထုတ်ယူသည်\n\n"
+            "💳 *Supported gateways:*\n"
+            "  🔵 Stripe  🟡 PayPal  🟠 Braintree  🟣 Square\n"
+            "  🔴 Razorpay  🟢 Adyen  🟤 Klarna  ⚫ Mollie\n"
+            "  🔵 Paddle  🟠 Paystack\n\n"
+            "🔍 *Extracts (frontend/public fields only):*\n"
+            "  publishableKey · clientId · merchantId · locationId\n"
+            "  applicationId · currency · locale · environment\n"
+            "  countryCode · SDK version · theme config\n\n"
+            "🧩 Deobfuscation layer ပါဝင်သည်\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"): url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"⚙️ *Payment Config Extractor*\n🌐 `{escape_md(domain)}`\n\n"
+        "⏳ Scanning JS bundles...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"⚙️ *PayConfig — `{escape_md(domain)}`*\n\n{escape_md(t)}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await asyncio.to_thread(_payconfig_sync, url, lambda t: progress_q.append(t))
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    findings  = result["findings"]
+    page_url  = result["page_url"]
+    js_count  = result["js_count"]
+    deob_count= result["deob_count"]
+
+    if not findings:
+        await safe_markdown_reply(msg,
+            f"⚙️ *PayConfig — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 Payment SDK config မတွေ့ပါ\n"
+            f"📦 JS bundles: `{js_count}` | 🧩 Deob: `{deob_count}`\n"
+            f"🌐 `{escape_md(page_url[:80])}`"
+        )
+        return
+
+    lines = [
+        f"⚙️ *Payment SDK Config — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(page_url[:70])}`",
+        f"📦 JS: `{js_count}` | 🧩 Deob: `{deob_count}` | 💳 Gateways: `{len(findings)}`\n",
+    ]
+
+    _GW_EMOJI = {
+        "Stripe": "🔵", "PayPal": "🟡", "Braintree": "🟠", "Square": "🟣",
+        "Razorpay": "🔴", "Adyen": "🟢", "Klarna": "🟤", "Mollie": "⚫",
+        "Paddle": "🔵", "Paystack": "🟠",
+    }
+
+    for gw, fields in findings.items():
+        emoji = _GW_EMOJI.get(gw, "💳")
+        lines.append(f"*{emoji} {gw}*")
+        for field, vals in fields.items():
+            for v in vals[:3]:
+                lines.append(f"  `{escape_md(field)}`: `{escape_md(str(v)[:70])}`")
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Frontend/public config only — API secrets မပါပါ_",
+        "⚠️ _Authorized testing only_",
+    ]
+
+    report = "\n".join(lines)
+    await safe_markdown_reply(msg, _truncate_safe_md(report))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "domain": domain, "page_url": page_url,
+                "scanned_at": datetime.now().isoformat(),
+                "js_count": js_count, "deob_count": deob_count,
+                "findings": findings,
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"payconfig_{safe_d}_{ts}.json",
+            caption=f"⚙️ Payment Config — `{escape_md(domain)}`",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("payconfig export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
 # 💳  3. /paykeys — Payment Key Extractor  [v19 Enhanced]
 # ══════════════════════════════════════════════════
 # NEW IN v19:
@@ -12898,7 +14132,8 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 `{escape_md(page_url[:60])}`",
         f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
         f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | ⚙️ SW: `{extra.get('service_workers',0)}` | 🔗 Pages: `{extra.get('subpages',0)}`",
-        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`\n",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`",
+        "",
     ]
 
     # Deduplicated ordering: CONFIRMED → LIVE → STATIC
@@ -12930,8 +14165,11 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
         lines.append(f"  📌 `{escape_md(f['type'])}`")
-        lines.append(f"  🔑 `{val[:80]}`")
-        lines.append(f"  📂 _{escape_md(f.get('source','')[:60])}_\n")
+        _val_safe = val[:80].replace("`", "'")
+        lines.append(f"  🔑 `{_val_safe}`")
+        _src_safe = f.get('source', '')[:60]
+        lines.append(f"  📂 _{escape_md(_src_safe)}_")
+        lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
 
@@ -13012,6 +14250,34 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
             parse_mode='Markdown'
         )
+
+    # ── Deobfuscation layer — fetched JS ထဲ obfuscated keys ရှာ ─────────────
+    try:
+        texts_for_deob = {}
+        for item in result.get("requests_log", result.get("network_log", [])):
+            ct   = item.get("content_type", "") or ""
+            body = item.get("response_body", "") or item.get("body", "") or ""
+            if ("javascript" in ct or item.get("url","").endswith(".js")) and body:
+                lbl = item.get("url","?").split("/")[-1][:40]
+                texts_for_deob[lbl] = body
+        texts_for_deob["[HTML]"] = result.get("html", "")
+        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
+        high_deob = [f for f in deob_findings
+                     if f["in_secret_context"] and f["entropy"] >= 4.5]
+        if high_deob:
+            deob_lines = [f"🧩 *Deobfuscated Keys — `{escape_md(domain)}`*",
+                          "━━━━━━━━━━━━━━━━━━━━",
+                          f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
+            for i, f in enumerate(high_deob[:8], 1):
+                deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
+                deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
+                deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
+            deob_lines.append("⚠️ _Authorized testing only_")
+            await update.effective_message.reply_text(
+                _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
+    except Exception as deob_err:
+        logger.debug("paykeys deobfuscate layer error: %s", deob_err)
+
 
 # ══════════════════════════════════════════════════
 # 💳  /verifykeys — Payment Key Validator (Read-Only)
@@ -23215,7 +24481,7 @@ def _format_keydump_report(result: dict) -> tuple:
                     lines.append(f"  ┌ {badge} *{label}*")
                     for v in vals[:3]:
                         safe = v.replace("`", "'")
-                        lines.append(f"  └ `{escape_md(safe[:70])}`")
+                        lines.append(f"  └ `{safe[:70]}`")
                     # ── Exploit hint (unique to v18) ──────────────────────
                     hint = _kd_exploit_hint(label)
                     if hint:
@@ -23253,7 +24519,9 @@ def _format_keydump_report(result: dict) -> tuple:
             lines.append(f"🍪 *Auth Cookies* `({len(interesting_cookies)})`")
             for c in interesting_cookies[:5]:
                 badge, _ = _kd_confidence("Token", c["value"])
-                lines.append(f"  {badge} `{c['name']}` = `{c['value'][:50]}`")
+                _cn = c['name'].replace('`', "'")
+                _cv = c['value'][:50].replace('`', "'")
+                lines.append(f"  {badge} `{_cn}` = `{_cv}`")
             lines.append("")
 
         # ── High-entropy strings ──────────────────────────────────────────────
@@ -23261,8 +24529,9 @@ def _format_keydump_report(result: dict) -> tuple:
             lines.append(f"🔬 *High-Entropy Strings* `(H≥4.2)` — `{len(entropy)}` found")
             for item in entropy[:6]:
                 badge, _ = _kd_confidence("entropy", item["value"])
+                _ev = item['value'][:55].replace('`', "'")
                 lines.append(
-                    f"  {badge} H=`{item['entropy']}` `{item['value'][:55]}`"
+                    f"  {badge} H=`{item['entropy']}` `{_ev}`"
                 )
             lines.append("")
 
@@ -23384,8 +24653,33 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             _truncate_safe_md(report), parse_mode="Markdown")
 
-
-async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ── Deobfuscation layer — keydump JS ထဲ obfuscated secrets ရှာ ──────────
+    try:
+        texts_for_deob = {}
+        for item in result.get("network_log", []):
+            ct   = item.get("content_type", "") or ""
+            body = item.get("response_body", "") or item.get("body", "") or ""
+            if ("javascript" in ct or item.get("url","").endswith(".js")) and body:
+                lbl = item.get("url","?").split("/")[-1][:40]
+                texts_for_deob[lbl] = body
+        texts_for_deob["[HTML]"] = result.get("html", "")
+        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
+        # Only report HIGH risk — in_secret_context + entropy >= 4.5
+        high_deob = [f for f in deob_findings
+                     if f["in_secret_context"] and f["entropy"] >= 4.5]
+        if high_deob:
+            deob_lines = [f"🧩 *Deobfuscated Secrets — `{escape_md(domain)}`*",
+                          "━━━━━━━━━━━━━━━━━━━━",
+                          f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
+            for i, f in enumerate(high_deob[:10], 1):
+                deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
+                deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
+                deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
+            deob_lines.append("⚠️ _Authorized testing only_")
+            await update.effective_message.reply_text(
+                _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
+    except Exception as deob_err:
+        logger.debug("keydump deobfuscate layer error: %s", deob_err)
     """Handle /keydump inline buttons: raw, entropy, json export"""
     query = update.callback_query
     try:
@@ -24996,7 +26290,11 @@ def main():
     # ── Key Extractor commands ────────────────────────
     app.add_handler(CommandHandler("apikeys",         cmd_apikeys))
     app.add_handler(CommandHandler("firebase",        cmd_firebase))
+    app.add_handler(CommandHandler("firecheck",       cmd_firecheck))
+    app.add_handler(CommandHandler("entropy",         cmd_entropy))
+    app.add_handler(CommandHandler("deobfuscate",     cmd_deobfuscate))
     app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
+    app.add_handler(CommandHandler("payconfig",       cmd_payconfig))
     app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
@@ -25091,7 +26389,11 @@ def main():
                     BotCommand("keydump",     "All-in-one key dump"),
                     BotCommand("apikeys",     "API key extractor"),
                     BotCommand("firebase",    "Firebase config extractor"),
+                    BotCommand("firecheck",   "Firebase misconfig scanner"),
+                    BotCommand("entropy",     "High entropy secret hunter"),
+                    BotCommand("deobfuscate", "JS secret de-obfuscator"),
                     BotCommand("paykeys",     "Payment key extractor"),
+                    BotCommand("payconfig",   "Payment SDK public config extractor"),
                     BotCommand("verifykeys",  "Payment key validator (read-only)"),
                     BotCommand("socialkeys",  "OAuth / social key extractor"),
                     BotCommand("analytics",   "Analytics ID extractor"),
