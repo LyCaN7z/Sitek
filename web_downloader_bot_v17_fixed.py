@@ -17769,7 +17769,7 @@ ALL_API_PATHS = list(dict.fromkeys(
 
 # ── API URL patterns in JS bundles ─────────────
 _JS_API_PATTERNS = [
-    re.compile(r"""(?:fetch|axios\\.(?:get|post|put|delete|patch))\\s*\\(\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
+    re.compile(r"""(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*['"`]([^'"`\s]{5,200})['"`]"""),
     re.compile(r"""(?:url|endpoint|baseURL|apiUrl|API_URL)\\s*[:=]\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
     re.compile(r"""['"`](/api/[^\\s'"`\\?#]{3,100})['"`]"""),
     re.compile(r"""['"`](/rest/[^\\s'"`\\?#]{3,100})['"`]"""),
