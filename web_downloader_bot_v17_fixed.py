@@ -7154,64 +7154,86 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
     ]
 
-    for i, (f, badge) in enumerate(ordered, 1):
+    _CAPTCHA_TYPES = {
+        "reCAPTCHA", "hCaptcha", "Turnstile", "FunCaptcha",
+        "GeeTest", "AWS WAF", "DataDome", "PerimeterX",
+        "FriendlyCaptcha", "MTCaptcha", "Akamai",
+    }
+
+    entry_num = 0
+    for f, badge in ordered:
         cap_type = f.get("type", "")
         sk       = f.get("site_key", "") or f.get("value", "") or "N/A"
-        icon     = next((v for k, v in _TYPE_ICON.items() if k in cap_type), "🔑")
 
-        # Key format validation badge
+        # JWT / non-captcha tokens ဖယ်ရှား
+        if not any(ct in cap_type for ct in _CAPTCHA_TYPES):
+            continue
+
+        entry_num += 1
+        icon = next((v for k, v in _TYPE_ICON.items() if k in cap_type), "🔑")
+
+        # Key format validation
         clean_type = cap_type.replace(" ⚠️ (key not found)", "").strip()
         validator  = _KEY_VALIDATORS.get(clean_type)
         fmt_ok     = ""
         if sk and sk != "N/A" and validator:
-            fmt_ok = " ✔️" if validator(sk) else " ✖️fmt?"
+            fmt_ok = " ✔️" if validator(sk) else " ✖️"
 
-        lines.append(f"*{icon} [{i}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
-        lines.append(f"  🔑 `{escape_md(sk)}`")
-        lines.append(f"  🌐 `{f.get('page_url', '')}`")
+        lines.append(f"*{icon} [{entry_num}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
+        lines.append(f"  🔑 `{sk}`")
+        page = f.get("page_url", "")
+        if page:
+            lines.append(f"  🌐 `{page[:80]}`")
         if f.get("action"):
-            lines.append(f"  ⚡ action: `{f['action']}`")
+            lines.append(f"  ⚡ `{f['action']}`")
         if f.get("invisible"):
-            lines.append(f"  👁️ invisible: `true`")
+            lines.append(f"  👁️ invisible")
         if f.get("min_score"):
-            lines.append(f"  📊 min\\_score: `{f['min_score']}`")
+            lines.append(f"  📊 score: `{f['min_score']}`")
         if f.get("enterprise"):
-            lines.append(f"  🏢 enterprise: `true`")
+            lines.append(f"  🏢 enterprise")
+        src = f.get("source", "")[:60]
+        if src:
+            lines.append(f"  📂 _{escape_md(src)}_")
+
+        # ── Clean JSON-style solver params ──────────────────────
+        sp_fields = {}
+        sp_fields["type"]    = cap_type
+        sp_fields["sitekey"] = sk
+        if page:
+            sp_fields["pageurl"] = page
+        if f.get("action"):
+            sp_fields["action"]    = f["action"]
+        if f.get("enterprise"):
+            sp_fields["enterprise"] = 1
+        if f.get("min_score"):
+            sp_fields["min_score"]  = float(f["min_score"])
+        if f.get("invisible"):
+            sp_fields["invisible"]  = 1
         if f.get("s_param"):
-            lines.append(f"  🔐 data-s: `{f['s_param'][:40]}`")
-        lines.append(f"  📂 _{escape_md(f.get('source','')[:70])}_")
-        lines.append("")
+            sp_fields["data-s"]     = f["s_param"][:40]
 
-        # ── Solver-ready block (per-service) ──────────────────────
-        sp = _get_solver_params(f)
-
-        def _fmt_params(d: dict) -> str:
-            return "\n".join(f"    `{k}` = `{v}`" for k, v in d.items())
-
-        lines.append("  *📋 Solver Params:*")
-        lines.append("  *🔴 2captcha:*")
-        lines.append(_fmt_params(sp["2captcha"]))
-        lines.append("  *🟠 Anti-Captcha:*")
-        lines.append(_fmt_params(sp["anticaptcha"]))
-        lines.append("  *🟢 CapSolver:*")
-        lines.append(_fmt_params(sp["capsolver"]))
-        lines.append("  *🔵 Ez-Captcha / NextCaptcha:*")
-        lines.append(_fmt_params(sp["ezcaptcha"]))
+        # Align values like JSON
+        max_klen = max(len(k) for k in sp_fields)
+        json_rows = []
+        keys = list(sp_fields.keys())
+        for idx2, (k, v) in enumerate(sp_fields.items()):
+            pad    = " " * (max_klen - len(k))
+            comma  = "," if idx2 < len(keys) - 1 else ""
+            if isinstance(v, str):
+                json_rows.append(f'  "{k}":{pad} "{v}"{comma}')
+            else:
+                json_rows.append(f'  "{k}":{pad} {v}{comma}')
+        json_block = "\n".join(["{"] + json_rows + ["}"])
+        lines.append(f"```\n{json_block}\n```")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append("⚠️ _Authorized testing only_")
+    lines.append("📄 _Full solver params — JSON export ကိုကြည့်ပါ_")
 
     report = "\n".join(lines)
-
-    try:
-        if len(report) <= 4000:
-            await safe_markdown_reply(msg, _truncate_safe_md(report))
-        else:
-            await safe_markdown_reply(msg, _truncate_safe_md(report))
-            await update.effective_message.reply_text(report[4000:8000], parse_mode='Markdown')
-    except BadRequest:
-        await update.effective_message.reply_text(_truncate_safe_md(report), parse_mode='Markdown')
+    await safe_markdown_reply(msg, _truncate_safe_md(report))
 
     # ─── Export JSON ─────────────────────────────
     import io as _io
@@ -10765,6 +10787,170 @@ def _verify_stripe_key_live(key: str) -> str:
         return "ERROR"
 
 
+def _verify_3ds_stripe(pk_key: str, combined_js: str = "") -> dict:
+    """
+    3DS/SCA Enforcement Verifier — Phase 1 (API) + Phase 2 (Static)
+
+    Phase 1: Stripe API probe using pk key.
+      - Creates a test PaymentMethod with 3DS test card.
+      - Checks card.three_d_secure_usage.supported field.
+    Phase 2: Static JS analysis with confidence scoring.
+      - Detects real 3DS implementation patterns.
+      - Detects 3DS bypass / skip patterns.
+
+    Returns dict:
+      api_status   : VALID | INVALID | ERROR | UNKNOWN
+      card_3ds     : required | recommended | optional | not_supported
+      enforced     : True | False | None (None = depends on Radar rules)
+      confidence   : HIGH | MEDIUM | LOW
+      signals      : list of (emoji, description) tuples
+      note         : human-readable summary
+    """
+    result = {
+        "api_status": "UNKNOWN",
+        "card_3ds":   "UNKNOWN",
+        "enforced":   None,
+        "confidence": "LOW",
+        "signals":    [],
+        "note":       "",
+    }
+
+    # ── Phase 1: Stripe API probe ─────────────────────────────────────────
+    try:
+        # Create PaymentMethod with 3DS-required test card (4000002500003155)
+        r = requests.post(
+            "https://api.stripe.com/v1/payment_methods",
+            data={
+                "type":                 "card",
+                "card[number]":         "4000002500003155",
+                "card[exp_month]":      "12",
+                "card[exp_year]":       "2030",
+                "card[cvc]":            "123",
+            },
+            headers={"Authorization": f"Bearer {pk_key}"},
+            timeout=10,
+        )
+        data = r.json()
+        if r.status_code == 200 and data.get("id"):
+            result["api_status"] = "VALID"
+            card = data.get("card", {})
+            usage = card.get("three_d_secure_usage", {})
+            supported = usage.get("supported", False)
+            if supported:
+                result["card_3ds"]   = "supported"
+                result["enforced"]   = None   # depends on Radar rules
+                result["confidence"] = "MEDIUM"
+                result["note"]       = "3DS capable — enforcement depends on site Radar rules"
+            else:
+                result["card_3ds"]   = "not_supported"
+                result["enforced"]   = False
+                result["confidence"] = "HIGH"
+                result["note"]       = "3DS not supported for this card via this account"
+        elif r.status_code in (400, 401):
+            err = data.get("error", {})
+            if err.get("type") == "invalid_request_error" and "No such" not in err.get("message",""):
+                result["api_status"] = "VALID"
+                result["note"]       = "Key valid but PaymentMethod creation blocked"
+            else:
+                result["api_status"] = "INVALID"
+                result["note"]       = err.get("message", "Key rejected")[:80]
+        else:
+            result["api_status"] = "ERROR"
+            result["note"]       = data.get("error", {}).get("message", f"HTTP {r.status_code}")[:80]
+    except requests.exceptions.Timeout:
+        result["api_status"] = "TIMEOUT"
+        result["note"]       = "Stripe API timeout"
+    except Exception as e:
+        result["api_status"] = "ERROR"
+        result["note"]       = str(e)[:60]
+
+    # ── Phase 2: Static JS analysis ──────────────────────────────────────
+    if not combined_js:
+        return result
+
+    signals = []
+
+    # Strong enforcement signals
+    _ENFORCE_PATTERNS = [
+        (r"handleNextAction|handleCardAction",          "✅ 3DS action handler found"),
+        (r"confirmCardPayment.*return_url",             "✅ 3DS redirect flow (return_url)"),
+        (r"payment_intent.*requires_action",            "✅ PaymentIntent requires_action path"),
+        (r"confirmCardSetup|confirmSetupIntent",        "✅ SetupIntent 3DS flow"),
+        (r"stripe\.confirmPayment",                    "✅ Stripe.js confirmPayment (3DS aware)"),
+        (r"three_d_secure.*required|require.*3ds",      "✅ Explicit 3DS required config"),
+    ]
+    for pat, desc in _ENFORCE_PATTERNS:
+        if re.search(pat, combined_js, re.I):
+            signals.append(desc)
+
+    # Bypass / risk signals
+    _BYPASS_PATTERNS = [
+        (r"skipThreeDSecure|skip_3ds|disable_3ds",      "🔴 3DS skip/disable detected"),
+        (r"charge\s*\([^)]*amount",                    "⚠️ Direct charge API (bypasses 3DS)"),
+        (r"confirm.*without.*redirect",                 "⚠️ Confirm without redirect"),
+        (r"stripe\.createToken\s*\(",                  "⚠️ createToken path (pre-3DS method)"),
+    ]
+    for pat, desc in _BYPASS_PATTERNS:
+        if re.search(pat, combined_js, re.I):
+            signals.append(desc)
+
+    result["signals"] = signals
+
+    # Update confidence based on signals
+    enforce_count = sum(1 for s in signals if s.startswith("✅"))
+    bypass_count  = sum(1 for s in signals if "🔴" in s or "⚠️" in s)
+
+    if enforce_count >= 2 and bypass_count == 0:
+        result["enforced"]   = True
+        result["confidence"] = "HIGH"
+    elif enforce_count >= 1 and bypass_count == 0:
+        result["enforced"]   = True
+        result["confidence"] = "MEDIUM"
+    elif bypass_count >= 1 and enforce_count == 0:
+        result["enforced"]   = False
+        result["confidence"] = "MEDIUM"
+    elif enforce_count > 0 and bypass_count > 0:
+        result["enforced"]   = None
+        result["confidence"] = "LOW"
+        result["note"]       = (result["note"] + " | Mixed signals").strip(" |")
+
+    return result
+
+
+def _fmt_3ds_result(r3: dict) -> list:
+    """Format _verify_3ds_stripe result into Telegram message lines."""
+    lines = []
+    lines.append("🔐 *3DS / SCA Verification*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    # API status
+    api_icon = {"VALID": "✅", "INVALID": "🔴", "TIMEOUT": "⏱️",
+                "ERROR": "❌", "UNKNOWN": "❓"}.get(r3["api_status"], "❓")
+    lines.append(f"{api_icon} *Stripe API:* `{r3['api_status']}`")
+    if r3.get("card_3ds") and r3["card_3ds"] != "UNKNOWN":
+        lines.append(f"💳 *3DS card support:* `{r3['card_3ds']}`")
+
+    # Enforcement verdict
+    if r3["enforced"] is True:
+        verdict = "🔴 *3DS ENFORCED* — payment requires authentication"
+    elif r3["enforced"] is False:
+        verdict = "🟢 *3DS NOT enforced* — bypass possible"
+    else:
+        verdict = "🟡 *3DS UNKNOWN* — depends on site Radar rules"
+    lines.append(verdict)
+    lines.append(f"📊 *Confidence:* `{r3['confidence']}`")
+    if r3.get("note"):
+        lines.append(f"📝 _{r3['note']}_")
+
+    # Signals
+    if r3.get("signals"):
+        lines.append("\n🔍 *Signals found:*")
+        for s in r3["signals"]:
+            lines.append(f"  {s}")
+
+    return lines
+
+
 def _scan_sourcemaps(base_url: str, html_text: str, progress_cb=None) -> list:
     """
     Scan .js.map source map files referenced in JS bundle comments.
@@ -11662,7 +11848,7 @@ def _pay_gateway_profile(findings: list, all_texts: list) -> dict:
         matched = False
         for pat, gw_name, is_live, note in _PAY_KEY_PREFIX_MAP:
             if re.match(pat, val, re.I):
-                entry = {"gateway": gw_name, "key_preview": val[:16] + "…", "note": note}
+                entry = {"gateway": gw_name, "key_preview": val, "note": note}
                 if is_live is True:
                     profile["live_keys"].append(entry)
                 elif is_live is False:
@@ -11723,7 +11909,7 @@ def _format_pay_gateway_profile(profile: dict) -> list:
         lines.append(f"🟢 *Mode: TEST* — `{test_count}` test key(s) only")
 
     for e in profile["live_keys"][:3]:
-        lines.append(f"  {e['note']} `{escape_md(e['key_preview'])}`")
+        lines.append(f"  {e['note']} `{e['key_preview']}`")
     for e in profile["test_keys"][:2]:
         lines.append(f"  {e['note']}")
 
@@ -11932,6 +12118,17 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     all_texts_for_profile = _gather_all_text_v2(data, live_result)
     gateway_profile = _pay_gateway_profile(findings, all_texts_for_profile)
 
+    # ── 3DS / SCA Verification (v19 new) ────────────────────────────────────
+    combined_js_for_3ds = "\n".join(t for t, _ in all_texts_for_profile)
+    tds_result = None
+    if stripe_findings:
+        pk = stripe_findings[0]["value"]
+        if progress_cb: progress_cb("🔐 Verifying 3DS/SCA enforcement via Stripe API...")
+        try:
+            tds_result = _verify_3ds_stripe(pk, combined_js_for_3ds)
+        except Exception as _tds_err:
+            logger.debug("3DS verify error: %s", _tds_err)
+
     return {
         "error":    None,
         "findings": findings,
@@ -11941,6 +12138,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         "dynamic":  dyn_pw,
         "live_result": live_result,
         "gateway_profile": gateway_profile,
+        "tds_result":     tds_result,
         "extra_scans": {
             "sourcemaps": len(sourcemap_texts),
             "service_workers": len(sw_texts),
@@ -12086,7 +12284,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
         lines.append(f"  📌 `{escape_md(f['type'])}`")
-        lines.append(f"  🔑 `{escape_md(val[:80])}`")
+        lines.append(f"  🔑 `{val[:80]}`")
         lines.append(f"  📂 _{escape_md(f.get('source','')[:60])}_\n")
 
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
@@ -12095,6 +12293,12 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     gw_profile = result.get("gateway_profile")
     if gw_profile:
         lines += _format_pay_gateway_profile(gw_profile)
+
+    # ── 3DS / SCA Verification block ────────────────────────────────────────
+    tds_result = result.get("tds_result")
+    if tds_result:
+        lines.append("")
+        lines += _fmt_3ds_result(tds_result)
 
     report = "\n".join(lines)
 
