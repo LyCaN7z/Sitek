@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║     Website Downloader Bot  v17.2  (FP-Fixed + Hang-Free)   ║
+# ║       Website Downloader Bot  v17.0  (Secure+Full Edition)  ║
 # ║  ✅ SSRF Protection       ✅ Path Traversal Fix             ║
 # ║  ✅ DB Race Condition Fix  ✅ Rate Limiting                  ║
 # ║  ✅ Subprocess Injection   ✅ Log Sanitization              ║
@@ -7168,22 +7168,10 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     total_js_fetched = [0]  # ENH S3: track actual JS count
 
     def _scan_one(scan_url: str, label: str) -> tuple:
-        """Scan one URL; return (tagged_findings, live_result, js_count).
-        v17-patch: per-URL hard timeout (30s) + proper error logging.
-        """
+        """Scan one URL; return (tagged_findings, live_result, js_count)."""
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(_sitekey_sync, scan_url)
-                try:
-                    res = _fut.result(timeout=30)  # was: no timeout — could hang 130s
-                except concurrent.futures.TimeoutError:
-                    logger.warning("_scan_one timeout url=%s label=%s (30s)", scan_url, label)
-                    return [], {}, 0
-                except Exception as exc:
-                    logger.warning("_scan_one error url=%s label=%s: %s", scan_url, label, exc)
-                    return [], {}, 0
-        except Exception as exc:
-            logger.warning("_scan_one executor error url=%s: %s", scan_url, exc)
+            res = _sitekey_sync(scan_url)
+        except Exception:
             return [], {}, 0
         hits = []
         for f in (res.get("findings") or []):
@@ -7237,18 +7225,14 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(_scan_sub, u): u for u in all_sub_urls}
         sub_results = {}
-        # v17-patch: cap total subpage scan time at 120s regardless of count
-        _outer_timeout = min(35 * len(all_sub_urls), 120)
         try:
-            for fut in concurrent.futures.as_completed(futures, timeout=_outer_timeout):
+            for fut in concurrent.futures.as_completed(futures, timeout=12 * len(all_sub_urls)):
                 sub_url = futures[fut]
                 try:
-                    sub_results[sub_url] = fut.result(timeout=35)  # was 12s — too short for Playwright
+                    sub_results[sub_url] = fut.result(timeout=12)
                 except Exception:
                     sub_results[sub_url] = ([], {}, 0)
         except concurrent.futures.TimeoutError:
-            logger.warning("_sitekey_with_subpages outer timeout (%ss) — %d/%d pages done",
-                           _outer_timeout, len(sub_results), len(all_sub_urls))
             for fut in futures:
                 fut.cancel()
 
@@ -7733,18 +7717,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prog.cancel()
         await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
         return
-    except asyncio.TimeoutError as e:
-        prog.cancel()
-        logger.error("sitekey timeout uid=%s url=%s: %s", uid, url, e)
-        await msg.edit_text(
-            f"⏱️ *Scan Timeout*\n`{escape_md(domain)}`\n\n"
-            "Scan ၁၈၀s ကျော်သွားသောကြောင့် ရပ်လိုက်သည်\n"
-            "_Sub-page count များလွန်း သို့မဟုတ် site နှေးနေသည်_",
-            parse_mode='Markdown')
-        return
     except Exception as e:
         prog.cancel()
-        logger.error("sitekey error uid=%s url=%s: %s", uid, url, e, exc_info=True)
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
@@ -7832,18 +7806,13 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seen_keys.add(sk)
             ordered.append((f, f.get("confidence", "⚠️ STATIC")))
 
-    _total_found = sum(1 for f, _ in ordered if any(
-        ct in f.get("type", "") for ct in _CAPTCHA_TYPES))
     lines = [
-        f"🔑 *SITE KEY EXTRACTOR*",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 *Domain:*  `{escape_md(domain)}`",
-        f"🔗 *Page URL:* `{escape_md(page_url[:70])}`",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📡 Static JS: `{escape_md(js_count)}`  |  Live Reqs: `{escape_md(live_reqs)}`",
-        f"📊 Results:  ✅ `{len(confirmed)}` Confirmed  🔴 `{len(high_live)}` Live  ⚠️ `{len(static_only)}` Static",
-        f"🎯 Total Captcha Instances: *`{_total_found}`*",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 *Site Key Extractor — `{escape_md(domain)}`*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 Page URL: `{escape_md(page_url)}`",
+        f"📡 Static: `{escape_md(js_count)}` JS | Live: `{escape_md(live_reqs)}` requests",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live: `{len(high_live)}` | ⚠️ Static: `{len(static_only)}`",
+        f"🔑 Found: `{len(ordered)}` captcha instance(s)",
         "",
     ]
 
@@ -7872,52 +7841,61 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sk and sk != "N/A" and validator:
             fmt_ok = " ✔️" if validator(sk) else " ✖️"
 
-        # ── Enhanced Pro-style per-entry block ──────────────────
+        lines.append(f"*{icon} [{entry_num}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
+        _sk_safe = sk.replace("`", "'")
+        lines.append(f"  🔑 `{_sk_safe}`")
         page = f.get("page_url", "")
-        _sk_safe  = sk.replace("`", "'")
-        _pg_safe  = page[:75].replace("`", "'") if page else ""
-
-        lines.append(f"╔══ {icon} *#{entry_num}  {escape_md(cap_type)}*{fmt_ok}")
-        lines.append(f"║  {badge}")
-        lines.append(f"║")
-        lines.append(f"║  🔑 `{_sk_safe}`")
-        if _pg_safe:
-            lines.append(f"║  🌐 `{_pg_safe}`")
-
-        # Optional metadata
-        meta = []
+        if page:
+            _pg_safe = page[:80].replace("`", "'")
+            lines.append(f"  🌐 `{_pg_safe}`")
         if f.get("action"):
-            meta.append(f"⚡ action=`{f['action']}`")
+            lines.append(f"  ⚡ `{f['action']}`")
         if f.get("invisible"):
-            meta.append("👁 invisible")
+            lines.append(f"  👁️ invisible")
         if f.get("min_score"):
-            meta.append(f"📊 score≥`{f['min_score']}`")
+            lines.append(f"  📊 score: `{f['min_score']}`")
         if f.get("enterprise"):
-            meta.append("🏢 enterprise")
-        if meta:
-            lines.append(f"║  " + "  ".join(meta))
-
-        src = f.get("source", "")[:55]
+            lines.append(f"  🏢 enterprise")
+        src = f.get("source", "")[:60]
         if src:
-            lines.append(f"║  📂 _{escape_md(src)}_")
+            lines.append(f"  📂 _{escape_md(src)}_")
 
-        # ── Compact solver params (single line per key) ──────────
-        sp_parts = [f"type={escape_md(cap_type)}", f"sitekey={_sk_safe[:30]}"]
-        if _pg_safe:
-            sp_parts.append(f"pageurl=…")
+        # ── Clean JSON-style solver params ──────────────────────
+        sp_fields = {}
+        sp_fields["type"]    = cap_type
+        sp_fields["sitekey"] = sk
+        if page:
+            sp_fields["pageurl"] = page
         if f.get("action"):
-            sp_parts.append(f"action={f['action']}")
+            sp_fields["action"]    = f["action"]
         if f.get("enterprise"):
-            sp_parts.append("enterprise=1")
+            sp_fields["enterprise"] = 1
         if f.get("min_score"):
-            sp_parts.append(f"min_score={f['min_score']}")
-        lines.append(f"║  📋 `{'  |  '.join(sp_parts)}`")
-        lines.append(f"╚{'═'*38}")
+            sp_fields["min_score"]  = float(f["min_score"])
+        if f.get("invisible"):
+            sp_fields["invisible"]  = 1
+        if f.get("s_param"):
+            sp_fields["data-s"]     = f["s_param"][:40]
+
+        # Align values like JSON
+        max_klen = max(len(k) for k in sp_fields)
+        json_rows = []
+        keys = list(sp_fields.keys())
+        for idx2, (k, v) in enumerate(sp_fields.items()):
+            pad    = " " * (max_klen - len(k))
+            comma  = "," if idx2 < len(keys) - 1 else ""
+            if isinstance(v, str):
+                v_safe = v.replace("`", "'").replace("\\", "/")
+                json_rows.append(f'  "{k}":{pad} "{v_safe}"{comma}')
+            else:
+                json_rows.append(f'  "{k}":{pad} {v}{comma}')
+        json_block = "\n".join(["{"] + json_rows + ["}"])
+        lines.append(f"```\n{json_block}\n```")
         lines.append("")
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized security testing only_")
-    lines.append("📥 _Full JSON exported automatically_")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Authorized testing only_")
+    lines.append("📄 _Full solver params — JSON export ကိုကြည့်ပါ_")
 
     report = "\n".join(lines)
     await safe_markdown_reply(msg, _truncate_safe_md(report))
@@ -11505,28 +11483,11 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
         r'client_secret|webhook|signing|encryption|sk_|pk_|AKIA|ya29|eyJ)',
         re.I
     )
-    # v17-patch: expanded FP filter for entropy hunt
     _FP_RE = re.compile(
-        r'^(?:[0-9a-f]{3,20})$'                       # hex hashes (up to 20)
-        r'|^(?:true|false|null|undefined|none|NaN)$'
-        r'|\.(?:js|css|png|jpg|svg|woff|ttf|json|html|map|gz)\b'
-        r'|^https?://'
-        r'|^[a-z]{4,24}$'                             # plain lowercase word
-        r'|^v?\d+\.\d+(\.\d+)?$'                 # semver
-        r'|^[A-Z][A-Z0-9_]{4,40}$'                   # ENV_VAR_NAME
-        r'|^sha(?:256|384|512)-',                     # SRI hash
-        re.I
-    )
-    # Additional context FP signals — skip if value sits next to these
-    _FP_ASSET_CONTEXT = re.compile(
-        r'(?i)(?:className|class_name|classname|fontFamily|font-family'
-        r'|backgroundColor|background-color|borderColor|border-color'
-        r'|data-testid|data-cy|data-qa|aria-label|htmlFor'
-        r'|import\s+|require\(|from\s+'
-        r'|@keyframes|animation|transition|transform'
-        r'|\.chunk\.|webpack|__webpack|_next/static'
-        r'|integrity=|crossorigin=|nonce=|async defer'
-        r'|version:|revision:|buildId:|chunkId:)',
+        r'^(?:[0-9a-f]{3,8})$'
+        r'|^(?:true|false|null|undefined)$'
+        r'|\.(js|css|png|jpg|svg|woff|html|json)$'
+        r'|^https?://',
         re.I
     )
 
@@ -11550,14 +11511,6 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
             ctx       = text[ctx_start: m.start() + len(val) + 80]
             ctx       = re.sub(r'\s+', ' ', ctx).strip()
             in_ctx    = bool(_CONTEXT_RE.search(ctx))
-
-            # v17-patch: skip if adjacent to CSS/asset/framework keywords
-            if _FP_ASSET_CONTEXT.search(ctx):
-                continue
-            # v17-patch: for non-secret-context short strings raise threshold
-            effective_threshold = threshold if in_ctx else max(threshold, 4.5)
-            if score < effective_threshold:
-                continue
 
             risk = ("🔴 HIGH" if (score >= 4.8 and in_ctx) else
                     "🟡 MED"  if (score >= 4.4 or in_ctx) else
@@ -11632,33 +11585,9 @@ _PAY_CSP_DOMAINS = {
     "flutterwave.com":       "Flutterwave",
     "checkout.com":          "Checkout.com",
     "coinbase.com/commerce": "Coinbase Commerce",
-        "affirm.com":            "Affirm",
+    "affirm.com":            "Affirm",
     "afterpay.com":          "Afterpay",
     "clearpay.co.uk":        "Clearpay",
-    # v17-patch: additional gateways
-    "xendit.co":             "Xendit",
-    "api.xendit.co":         "Xendit API",
-    "midtrans.com":          "Midtrans",
-    "app.midtrans.com":      "Midtrans App",
-    "paymongo.com":          "PayMongo",
-    "api.paymongo.com":      "PayMongo API",
-    "payhere.lk":            "PayHere",
-    "sezzle.com":            "Sezzle",
-    "widget.sezzle.com":     "Sezzle Widget",
-    "2checkout.com":         "2Checkout",
-    "www.2checkout.com":     "2Checkout",
-    "authorize.net":         "Authorize.net",
-    "js.authorize.net":      "Authorize.net JS",
-    "accept.authorize.net":  "Authorize.net Accept.js",
-    "cybersource.com":       "CyberSource",
-    "secure.cybersource.com":"CyberSource Secure",
-    "payfast.co.za":         "PayFast",
-    "www.payfast.co.za":     "PayFast",
-    "iyzico.com":            "Iyzico",
-    "sandbox.iyzipay.com":   "Iyzico Sandbox",
-    "opay.com":              "OPay",
-    "rapyd.net":             "Rapyd",
-    "checkout.rapyd.net":    "Rapyd Checkout",
 }
 
 # ── Webhook URL patterns ───────────────────────────────────────────────────
@@ -11692,28 +11621,17 @@ _FORM_FIELD_SIGNALS = {
 
 # ── PCI SAQ level heuristics ──────────────────────────────────────────────
 def _pci_saq_estimate(form_fields: list, gateways: list, csp_gateways: list) -> str:
-    """Estimate PCI DSS SAQ type from integration signals. (v17-patch: improved)"""
-    all_gw = gateways + csp_gateways
-    # Iframe/redirect gateways (SAQ A eligible)
-    _IFRAME_GW = {"Stripe", "Braintree", "Square", "Adyen", "PayPal",
-                  "Checkout.com", "Razorpay", "Xendit", "Midtrans",
-                  "Authorize.net", "CyberSource", "Klarna", "Mollie"}
-    has_iframe_gw = any(any(gw in g for gw in _IFRAME_GW) for g in all_gw)
-    has_card_num  = any("Card Number" in f for f in form_fields)
-    has_cvv       = any("CVV" in f for f in form_fields)
-    has_expiry    = any("Expiry" in f for f in form_fields)
-    has_raw_fields = has_card_num or has_cvv or has_expiry
+    """Estimate PCI DSS SAQ type from integration signals."""
+    has_iframe = any("Stripe" in g or "Braintree" in g or "Square" in g or "Adyen" in g
+                     for g in gateways + csp_gateways)
+    has_raw_fields = any("Card Number" in f or "CVV" in f or "Expiry" in f for f in form_fields)
 
-    if has_raw_fields and has_card_num and has_cvv:
-        return "🔴 SAQ D (full raw card data in DOM — HIGHEST PCI scope)"
-    elif has_raw_fields and not has_iframe_gw:
-        return "⚠️ SAQ C or D (raw card fields without iframe gateway — HIGH PCI scope)"
-    elif has_raw_fields and has_iframe_gw:
-        return "⚠️ SAQ A-EP (raw fields + iframe gateway — mixed pattern — verify integration)"
-    elif has_iframe_gw:
-        return "✅ SAQ A (iframe/redirect gateway — reduced PCI scope)"
+    if has_raw_fields and not has_iframe:
+        return "⚠️ SAQ D (raw card fields in DOM — PCI scope FULL)"
+    elif has_iframe or has_raw_fields is False:
+        return "✅ SAQ A or A-EP (iframe/redirect — reduced PCI scope)"
     else:
-        return "⚪ SAQ unclear — manual review needed (no card fields or gateway detected)"
+        return "⚪ SAQ unclear — manual review needed"
 
 
 def _payconfig_sync(url: str, progress_cb=None) -> dict:
@@ -12001,18 +11919,8 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prog.cancel()
         await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
         return
-    except asyncio.TimeoutError:
-        prog.cancel()
-        logger.error("payconfig timeout uid=%s url=%s", uid, url)
-        await msg.edit_text(
-            f"⏱️ *Scan Timeout*\n`{escape_md(domain)}`\n\n"
-            "PayConfig scan 180s ကျော်သောကြောင့် ရပ်လိုက်သည်",
-            parse_mode='Markdown'
-        )
-        return
     except Exception as e:
         prog.cancel()
-        logger.error("payconfig error uid=%s url=%s: %s", uid, url, e, exc_info=True)
         await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
         return
     finally:
@@ -12028,118 +11936,91 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     overall_env = ("🔴 LIVE" if live_count else "🟢 TEST" if test_count else "⚪ UNKNOWN")
 
     lines = [
-        f"💳 *PAYMENT CONFIG AUDIT*",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 *Domain:*  `{escape_md(domain)}`",
-        f"🔗 *Page URL:* `{escape_md(result['page_url'][:70])}`",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🏦 Gateways detected: `{len(result['gateways'])}`",
-        f"🔑 Key Mode: *{overall_env}*  |  🔒 3DS signals: `{len(result['threeds'])}`",
-        f"🚨 PCI Risks: `{vuln_pci}`",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💳 *Payment Config Audit — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(result['page_url'][:80])}`",
+        f"🏦 Gateways: `{len(result['gateways'])}` detected | Mode: *{overall_env}*",
+        f"⚠️ PCI Risks: `{vuln_pci}` | 3DS signals: `{len(result['threeds'])}`",
         "",
     ]
 
     # SDKs
     if result["sdk_scripts"]:
-        lines.append(f"▌🏦 *PAYMENT SDKs DETECTED*  ({len(result['sdk_scripts'])})")
-        lines.append("│")
+        lines.append("*🏦 Payment SDK Scripts:*")
         for gw in result["sdk_scripts"]:
-            lines.append(f"│  ✅  {escape_md(gw)}")
-        lines.append(f"└{'─'*32}")
+            lines.append(f"  ✅ {gw}")
         lines.append("")
 
     # CSP gateways
     if result["csp_gateways"]:
-        lines.append(f"▌🔐 *CSP-WHITELISTED GATEWAYS*  ({len(result['csp_gateways'])})")
-        lines.append("│")
+        lines.append("*🔐 CSP-Whitelisted Gateways:*")
         for gw in result["csp_gateways"]:
-            lines.append(f"│  📋  {escape_md(gw)}")
-        lines.append(f"└{'─'*32}")
+            lines.append(f"  📋 {gw}")
         lines.append("")
 
     # Key modes
     if result["key_modes"]["live"] or result["key_modes"]["test"]:
-        live_c = len(result["key_modes"]["live"])
-        test_c = len(result["key_modes"]["test"])
-        lines.append(f"▌🔑 *KEY MODE FINGERPRINT*  (🔴 Live: {live_c}  |  🟢 Test: {test_c})")
-        lines.append("│")
+        lines.append("*🔑 Key Mode Fingerprint:*")
         for e in result["key_modes"]["live"][:5]:
             _m = e["masked"].replace("`", "'")
-            lines.append(f"│  🔴 LIVE   {escape_md(e['label'])}  `{_m}`")
+            lines.append(f"  🔴 LIVE — {escape_md(e['label'])} `{_m}`")
         for e in result["key_modes"]["test"][:5]:
-            lines.append(f"│  🟢 TEST   {escape_md(e['label'])}")
+            lines.append(f"  🟢 TEST — {escape_md(e['label'])}")
         for e in result["key_modes"]["unknown"][:3]:
-            lines.append(f"│  ⚪ UNKN   {escape_md(e['label'])}")
-        lines.append(f"└{'─'*32}")
+            lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
         lines.append("")
 
     # Currencies
     if result["currencies"]:
         _cur = escape_md(", ".join(result["currencies"][:15]))
-        lines.append(f"▌💱 *CURRENCIES DETECTED*")
-        lines.append(f"│  `{_cur}`")
-        lines.append(f"└{'─'*32}")
+        lines.append(f"*💱 Currencies detected:* `{_cur}`")
         lines.append("")
 
     # Webhook URLs
     if result["webhooks"]:
-        lines.append(f"▌🔗 *WEBHOOK / CALLBACK URLs*  ({len(result['webhooks'])})")
-        lines.append("│")
+        lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
         for wh in result["webhooks"][:6]:
-            _wu = wh["url"][:65].replace("`", "'")
-            lines.append(f"│  {escape_md(wh['type'])}:  `{_wu}`")
-        lines.append(f"└{'─'*32}")
+            _wu = wh["url"][:70].replace("`", "'")
+            lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
         lines.append("")
 
     # Form fields
     if result["form_fields"]:
-        lines.append(f"▌📋 *PAYMENT FORM FIELDS*  ({len(result['form_fields'])})")
-        lines.append("│")
+        lines.append("*📋 Payment Form Fields:*")
         for ff in result["form_fields"]:
-            lines.append(f"│  📄  {escape_md(ff)}")
-        lines.append(f"└{'─'*32}")
+            lines.append(f"  📄 {ff}")
         lines.append("")
 
     # 3DS signals
     if result["threeds"]:
-        lines.append(f"▌🔒 *3DS / SCA SIGNALS*  ({len(result['threeds'])})")
-        lines.append("│")
+        lines.append("*🔒 3DS / SCA Signals:*")
         for s in result["threeds"][:5]:
-            lines.append(f"│  ✅  {escape_md(s)}")
-        lines.append(f"└{'─'*32}")
+            lines.append(f"  ✅ {escape_md(s)}")
         lines.append("")
 
     # PCI risks
     if result["pci_risks"]:
-        lines.append(f"▌🚨 *PCI RISK FINDINGS*  ({len(result['pci_risks'])})")
-        lines.append("│")
+        lines.append("*🚨 PCI Risk Findings:*")
         for r in result["pci_risks"][:6]:
-            lines.append(f"│  ⚠️  {escape_md(r)}")
-        lines.append(f"└{'─'*32}")
+            lines.append(f"  {escape_md(r)}")
         lines.append("")
 
     # PCI SAQ
     if result["pci_saq"]:
-        lines.append(f"▌🏷️ *PCI SAQ ESTIMATE*")
-        lines.append(f"│  {escape_md(result['pci_saq'])}")
-        lines.append(f"└{'─'*32}")
+        lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
         lines.append("")
 
     # Security headers
     if result["security_headers"]:
-        lines.append(f"▌🛡️ *SECURITY HEADERS*  ({len(result['security_headers'])})")
-        lines.append("│")
+        lines.append("*🛡️ Security Headers:*")
         for k, v in result["security_headers"].items():
-            _v = v[:55].replace("`", "'")
-            lines.append(f"│  `{escape_md(k)}`  _{escape_md(_v)}_")
-        lines.append(f"└{'─'*32}")
+            _v = v[:60].replace("`", "'")
+            lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
         lines.append("")
 
     lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ _Authorized security testing only_",
-        "📥 _Full JSON exported automatically_",
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
     ]
 
     await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
@@ -12250,18 +12131,8 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prog.cancel()
         await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
         return
-    except asyncio.TimeoutError:
-        prog.cancel()
-        logger.error("entropy timeout uid=%s url=%s", uid, url)
-        await msg.edit_text(
-            f"⏱️ *Scan Timeout*\n`{escape_md(domain)}`\n\n"
-            "Entropy scan 180s ကျော်သောကြောင့် ရပ်လိုက်သည်",
-            parse_mode='Markdown'
-        )
-        return
     except Exception as e:
         prog.cancel()
-        logger.error("entropy error uid=%s url=%s: %s", uid, url, e, exc_info=True)
         await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
         return
     finally:
@@ -12901,15 +12772,6 @@ def _validate_payment_key(key_type: str, key_value: str) -> bool:
     if "sezzle" in kt:
         return 28 <= len(v) <= 60 and bool(re.match(r'^[A-Za-z0-9_-]+$', v))
 
-    # ── v17-patch: generic fallback with entropy + placeholder guard ─────────
-    # For any unrecognized key type, apply FP checks before passing through
-    ent = _entropy(v) if len(v) >= 8 else 0.0
-    is_fp, _ = _fp_is_placeholder(v, key_type)
-    if is_fp:
-        return False
-    # Very low entropy generic string is almost always a FP (CSS class, build ID, etc.)
-    if ent < 3.2 and len(v) < 50:
-        return False
     return True   # unknowns pass through
 
 
@@ -14120,25 +13982,19 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     seen = set()
 
     def _add(t, v, src, confidence=None, verified=None):
-        # v17-patch: normalize, length-guard, dedup by value (not type:value[:80])
-        v = v.strip().rstrip("'\",:;\\" + ' ')  # strip trailing quotes/punctuation
-        if not v or len(v) < 8:          # raised from 6 → 8 (no 6-char keys)
-            return
-        if not _validate_payment_key(t, v):
-            return
-        # Dedup by value only (same key found by multiple sources → keep first)
-        v_dedup = v.lower() if len(v) < 40 else v
-        d = v_dedup[:80]
-        if d in seen:
-            return
-        seen.add(d)
-        entry = {"type": t, "value": v, "source": src,
-                 "env": _detect_env(t, v)}
-        if confidence:
-            entry["confidence"] = confidence
-        if verified is not None:
-            entry["verified"] = verified
-        findings.append(entry)
+        v = v.strip()
+        d = t + ":" + v[:80]
+        if d not in seen and len(v) >= 6:
+            if not _validate_payment_key(t, v):
+                return
+            seen.add(d)
+            entry = {"type": t, "value": v, "source": src,
+                     "env": _detect_env(t, v)}
+            if confidence:
+                entry["confidence"] = confidence
+            if verified is not None:
+                entry["verified"] = verified
+            findings.append(entry)
 
     if progress_cb: progress_cb("🔍 Scanning HTML + JS + live + source maps + workers...")
 
@@ -14373,18 +14229,8 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _paykeys_sync, url, lambda t: progress_q.append(t))
-    except asyncio.TimeoutError as e:
-        prog.cancel()
-        logger.error("paykeys timeout uid=%s url=%s", uid, url)
-        await safe_markdown_reply(msg,
-            f"⏱️ *Scan Timeout*\n`{escape_md(domain)}`\n\n"
-            "Scan 180s ကျော်သောကြောင့် ရပ်လိုက်သည်\n"
-            "_Site နှေး သို့မဟုတ် JS bundles ကြီးလွန်းနေသည်_"
-        )
-        return
     except Exception as e:
         prog.cancel()
-        logger.error("paykeys error uid=%s url=%s: %s", uid, url, e, exc_info=True)
         await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
         return
     finally:
@@ -14421,15 +14267,12 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── Build enhanced report ──────────────────────────────────────────────
     lines = [
-        f"💳 *PAYMENT KEY EXTRACTOR  v19*",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 *Domain:*  `{escape_md(domain)}`",
-        f"🔗 *Page URL:* `{escape_md(page_url[:65])}`",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📡 Static: `{reqs}`  |  Live: `{live_reqs}` reqs",
-        f"🗺️ Src Maps: `{extra.get('sourcemaps',0)}`  |  ⚙️ SW: `{extra.get('service_workers',0)}`  |  🔗 Sub-pages: `{extra.get('subpages',0)}`",
-        f"📊 Results:  ✅ `{len(confirmed)}` Confirmed  🔴 `{len(live_keys)}` Live  📋 `{len(findings)}` Total",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"💳 *Payment Keys — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(page_url[:60])}`",
+        f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
+        f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | ⚙️ SW: `{extra.get('service_workers',0)}` | 🔗 Pages: `{extra.get('subpages',0)}`",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`",
         "",
     ]
 
@@ -14450,31 +14293,25 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val     = f.get("value", "")
         env     = f.get("env", _detect_env(f["type"], val))
         vfy     = f.get("verified", "")
-        vfy_tag = " ✔️ VALID" if vfy == "VALID" else (" ✖️ INVALID" if vfy == "INVALID" else "")
+        vfy_tag = " ✔️" if vfy == "VALID" else (" ✖️" if vfy == "INVALID" else "")
         conf    = f.get("confidence", "")
         src_tag = ""
-        if   "SOURCEMAP" in conf: src_tag = " 🗺️"
-        elif "SW"        in conf: src_tag = " ⚙️"
-        elif "SUBPAGE"   in conf: src_tag = " 🔗"
-        elif "GRAPHQL"   in conf: src_tag = " 📐"
+        if "SOURCEMAP" in conf: src_tag = " 🗺️"
+        elif "SW"      in conf: src_tag = " ⚙️"
+        elif "SUBPAGE" in conf: src_tag = " 🔗"
+        elif "GRAPHQL" in conf: src_tag = " 📐"
 
-        env_warn = " ⚠️ SECRET EXPOSED" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
-        _val_safe = val[:72].replace("`", "'")
-        _src_safe = f.get('source', '')[:55]
+        env_warn = " ⚠️" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
 
-        lines.append(f"╔══ 💳 *#{i}  {escape_md(f['type'])}*")
-        lines.append(f"║  {badge}  {env}{src_tag}{env_warn}")
-        if vfy_tag:
-            lines.append(f"║  🔍 Status: *{vfy_tag}*")
-        lines.append(f"║")
-        lines.append(f"║  🔑 `{_val_safe}`")
-        if _src_safe:
-            lines.append(f"║  📂 _{escape_md(_src_safe)}_")
-        lines.append(f"╚{'═'*38}")
+        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
+        lines.append(f"  📌 `{escape_md(f['type'])}`")
+        _val_safe = val[:80].replace("`", "'")
+        lines.append(f"  🔑 `{_val_safe}`")
+        _src_safe = f.get('source', '')[:60]
+        lines.append(f"  📂 _{escape_md(_src_safe)}_")
         lines.append("")
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized security testing only_")
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
 
     # ── Gateway Profile block (v18 unique) ─────────────────────────────────
     gw_profile = result.get("gateway_profile")
@@ -18340,25 +18177,12 @@ async def run_scan(uid: int, fn, *args, **kwargs):
     Also acquires _scan_semaphore (max 5 concurrent scans).
     Usage:
         result = await run_scan(uid, _my_sync_func, url, progress_cb)
-    v17-patch: Added 180s global timeout so hung scans release the semaphore slot.
     """
-    SCAN_TIMEOUT = int(os.getenv("SCAN_TIMEOUT", "180"))   # configurable via .env
     async with _scan_semaphore:
         task = asyncio.current_task()
         _register_task(uid, task)
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(fn, *args, **kwargs),
-                timeout=SCAN_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                "run_scan TIMEOUT uid=%s fn=%s after %ss — semaphore slot released",
-                uid, getattr(fn, "__name__", fn), SCAN_TIMEOUT
-            )
-            raise asyncio.TimeoutError(
-                f"⏱️ Scan {getattr(fn,'__name__','')} timed out after {SCAN_TIMEOUT}s"
-            )
+            return await asyncio.to_thread(fn, *args, **kwargs)
         except asyncio.CancelledError:
             raise
         finally:
@@ -23747,47 +23571,21 @@ _FP_PLACEHOLDER_EXACT = {
     "xoxb-xxxx", "sg.xxxx", "hf_xxxx",
     "none", "null", "undefined", "n/a", "na", "test123", "password",
     "secret", "mysecret", "topsecret", "supersecret",
-    # v17-patch: common framework placeholder names
-    "your-publishable-key", "your_publishable_key",
-    "pk_test_yourkey", "sk_test_yourkey", "rk_live_xxxx",
-    "sandbox", "development", "staging", "production",
 }
 
 _FP_PLACEHOLDER_RE = [
-    re.compile(r'^(.)\1{7,}$'),                                # same char x8+
-    re.compile(r'^[xX0\-_]{8,}$'),                             # x/0/dash only
+    re.compile(r'^(.)\1{7,}$'),                               # same char ×8+
+    re.compile(r'^[xX0\-_]{8,}$'),                            # x/0/dash only
     re.compile(r'(?i)(example|placeholder|your[_\-]?key|your[_\-]?secret'
                r'|insert|replace|changeme|xxxx|dummy|fake|sample'
                r'|test[_\-]?key|demo[_\-]?key|fake[_\-]?key)'),
-    re.compile(r'^[a-z]{1,6}[0-9]{1,6}$'),                    # simple word+num
+    re.compile(r'^[a-z]{1,6}[0-9]{1,6}$'),                   # simple word+num
     re.compile(r'^(abc|123|test|demo|fake|null|none|pass)\w{0,10}$', re.I),
-    # v17-patch: webpack / CSS / build artifact FP patterns ---
-    # Webpack content hash: pure hex 6-20 chars (chunk IDs, asset hashes)
-    re.compile(r'^[0-9a-f]{6,20}$', re.I),
-    # CSS Modules: Block__Element or name_abcd1234 (hash suffix)
-    re.compile(r'^[A-Za-z][A-Za-z0-9_-]{1,40}__[A-Za-z0-9_-]+$'),
-    re.compile(r'^[A-Za-z][A-Za-z0-9_-]*_[0-9a-f]{5,8}$', re.I),
-    # Semantic / package version strings  1.2.3 / v1.23.456-beta
-    re.compile(r'^v?\d{1,4}\.\d{1,4}(\.\d{1,4}){0,2}(-[\w.]+)?$', re.I),
-    # File/URL-like: contains slash or known extension suffix
-    re.compile(r'(?:/[A-Za-z]|\.(?:js|css|png|jpg|svg|woff|ttf|json|html|map|gz|br)\b)', re.I),
-    # SRI / subresource integrity  sha256-xxxx  sha384-xxxx
-    re.compile(r'^sha(?:256|384|512)-[A-Za-z0-9+/=]{4,}$', re.I),  # SRI hash (any length)
-    # Tag manager / analytics IDs  GTM-XXXXX  G-XXXXXXXXXX  UA-12345-1
-    re.compile(r'^(?:GTM|UA|G|AW|DC)-[A-Z0-9]{4,12}(?:-\d+)?$', re.I),
-    # Pure lowercase alpha word (labels/identifiers, not secret keys)
-    re.compile(r'^[a-z]{4,24}$'),
-    # React/Next.js/webpack internal strings
-    re.compile(r'^(?:__NEXT_|__webpack_|_N_E|\$[A-Za-z_])', re.I),
-    # ALL_CAPS_ENV_VAR names with underscore separator (REACT_APP_KEY, DATABASE_URL)
-    re.compile(r'^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+){1,}$'),  # requires at least one underscore
-    # Pure numeric IDs (not keys)
-    re.compile(r'^\d{6,20}$'),
 ]
 
 # Per-type minimum entropy — tuned per key format
 _FP_ENTROPY_MIN = {
-    "AWS Access Key":    3.2,   # AKIA+16 alphanum — naturally structured
+    "AWS Access Key":    3.2,  # AKIA+16 alphanum — naturally structured
     "AWS Secret":        4.5,
     "Stripe Secret":     4.8,
     "Stripe Public":     4.5,
@@ -23802,13 +23600,13 @@ _FP_ENTROPY_MIN = {
     "HuggingFace Token": 3.8,
     "Telegram Token":    3.2,
     "Generic Password":  3.0,
-    "Bearer Token":      3.5,   # v17-patch: raised 3.2→3.5
+    "Bearer Token":      3.2,
     "Basic Auth Header": 3.5,
-    "MongoDB URI":       2.5,   # URIs have structure, lower bar
+    "MongoDB URI":       2.5,  # URIs have structure, lower bar
     "MySQL DSN":         2.5,
-    "Private Key Block": 0.0,   # always real
+    "Private Key Block": 0.0,  # always real
     "JWT Token":         4.0,
-    "_default":          3.5,   # v17-patch: raised 3.2→3.5 (less noise)
+    "_default":          3.2,
 }
 
 # Minimum realistic lengths per type
@@ -23821,10 +23619,10 @@ _FP_MIN_LEN = {
     "GitHub Token":     36,
     "GitLab Token":     20,
     "Google API Key":   35,
-    "Bearer Token":     20,    # v17-patch: added
-    "Slack Token":      35,    # v17-patch: added
-    "_default":         10,    # v17-patch: raised 8→10
+    "_default":         8,
 }
+
+
 def _fp_is_placeholder(value: str, key_type: str = "") -> tuple:
     """
     Phase 1 FP filter — returns (is_fp: bool, reason: str).
@@ -25060,17 +24858,14 @@ def _format_keydump_report(result: dict) -> tuple:
     )
 
     lines = [
-        f"🗝 *KEYDUMP  v22 — FULL SCAN*",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 *Domain:* `{escape_md(domain)}`",
-        f"📁 *Path:*   `{escape_md(path)}`",
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        f"📦 JS bundles: `{escape_md(js_cnt)}`  |  Inline: `{escape_md(inline_cnt)}`",
-        f"🔎 Patterns:  `{len(_KD_PATTERNS)}`  |  Total hits: `{escape_md(total_hits)}`",
-        f"🟢 HIGH: `{conf_counts['HIGH']}`   🟡 MED: `{conf_counts['MED']}`   ⚪ LOW: `{conf_counts['LOW']}`",
-        f"🔴 Live stream: `{escape_md(live_reqs)}` reqs  |  `{escape_md(live_hits)}` live hits",
-        f"{'⚡ Mode: JS+Static+Dynamic+LiveStream' if PLAYWRIGHT_OK else '📄 Mode: Static+JS only'}",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"🔑 *KeyDump v22 — Full Scan*",
+        f"🌐 `{escape_md(domain)}`",
+        f"📁 Path: `{escape_md(path)}`",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📦 JS: `{escape_md(js_cnt)}` | Inline: `{escape_md(inline_cnt)}` | {js_mode}",
+        f"📊 Patterns: `{len(_KD_PATTERNS)}` | Hits: `{escape_md(total_hits)}`",
+        conf_line,
+        live_line,
         "",
     ]
 
@@ -25098,49 +24893,41 @@ def _format_keydump_report(result: dict) -> tuple:
             if not bucket:
                 continue
             tier_label = _KD_TIER_EMOJI.get(tier, tier)
-            tier_total = sum(
-                sum(len(v) for v in cat_data.values())
-                for _, _, cat_data in bucket
-            )
-            lines.append(f"▌{tier_label}  ({tier_total} hits)")
-            lines.append(f"│")
+            lines.append(f"┌─ {tier_label} ─────────────────")
             for cat_icon, cat_name, cat_data in bucket:
                 count = sum(len(v) for v in cat_data.values())
-                lines.append(f"│  {cat_icon} *{escape_md(cat_name)}* — `{count}` hit{'s' if count!=1 else ''}")
+                lines.append(f"{cat_icon} *{cat_name}* `({count})`")
                 for label, vals in cat_data.items():
                     badge, _ = _kd_confidence(label, vals[0]) if vals else ("⚪ LOW", "LOW")
-                    hint = _kd_exploit_hint(label)
-                    lines.append(f"│    {badge}  *{escape_md(label)}*")
+                    lines.append(f"  ┌ {badge} *{label}*")
                     for v in vals[:3]:
                         safe = v.replace("`", "'")
-                        lines.append(f"│      `{safe[:68]}`")
+                        lines.append(f"  └ `{safe[:70]}`")
+                    # ── Exploit hint (unique to v18) ──────────────────────
+                    hint = _kd_exploit_hint(label)
                     if hint:
-                        lines.append(f"│      ⚡ _{escape_md(hint[:85])}_")
-            lines.append(f"└{'─'*32}")
+                        lines.append(f"  ⚡ _{escape_md(hint[:90])}_")
             lines.append("")
 
-        # ── .env file hits ───────────────────────────────────────────────────
+        # ── .env file hits (Phase 2) ─────────────────────────────────────────
         if env_files:
-            lines.append(f"▌📄 *EXPOSED CONFIG FILES*  ({len(env_files)})")
-            lines.append("│")
+            lines.append(f"📄 *Exposed Config Files* `({len(env_files)})`")
             for env_path, env_body in env_files[:5]:
-                lines.append(f"│  🟢 HIGH  `{escape_md(env_path)}`")
+                lines.append(f"  🟢 HIGH `{escape_md(env_path)}`")
+                # Show first 2 non-empty lines of env file
                 preview = [l for l in env_body.splitlines() if "=" in l and len(l) > 5]
                 for pl in preview[:2]:
                     safe = pl.replace("`", "'")
-                    lines.append(f"│    └ `{escape_md(safe[:65])}`")
-            lines.append(f"└{'─'*32}")
+                    lines.append(f"  └ `{escape_md(safe[:65])}`")
             lines.append("")
 
         # ── Dynamic / network interception ───────────────────────────────────
         if dyn.get("requests"):
-            lines.append(f"▌🌐 *INTERCEPTED TOKENS*  ({len(dyn['requests'])})")
-            lines.append("│")
+            lines.append(f"🌐 *Network Intercepted Tokens* `({len(dyn['requests'])})`")
             for req in dyn["requests"][:4]:
-                lines.append(f"│  🔗 `{req['url'][:55]}`")
+                lines.append(f"  🔗 `{req['url'][:50]}`")
                 for hk, hv in req.get("headers", {}).items():
-                    lines.append(f"│    `{hk}: {str(hv)[:48]}`")
-            lines.append(f"└{'─'*32}")
+                    lines.append(f"     `{hk}: {str(hv)[:50]}`")
             lines.append("")
 
         # ── Auth cookies ─────────────────────────────────────────────────────
@@ -25150,40 +24937,37 @@ def _format_keydump_report(result: dict) -> tuple:
                    ["token", "auth", "session", "key", "jwt", "access", "secret", "api"])
         ]
         if interesting_cookies:
-            lines.append(f"▌🍪 *AUTH COOKIES*  ({len(interesting_cookies)})")
-            lines.append("│")
+            lines.append(f"🍪 *Auth Cookies* `({len(interesting_cookies)})`")
             for c in interesting_cookies[:5]:
                 badge, _ = _kd_confidence("Token", c["value"])
                 _cn = c['name'].replace('`', "'")
-                _cv = c['value'][:45].replace('`', "'")
-                lines.append(f"│  {badge}  `{_cn}` = `{_cv}`")
-            lines.append(f"└{'─'*32}")
+                _cv = c['value'][:50].replace('`', "'")
+                lines.append(f"  {badge} `{_cn}` = `{_cv}`")
             lines.append("")
 
         # ── High-entropy strings ──────────────────────────────────────────────
         if entropy:
-            lines.append(f"▌🔬 *HIGH-ENTROPY STRINGS*  H≥4.2  ({len(entropy)} found)")
-            lines.append("│")
+            lines.append(f"🔬 *High-Entropy Strings* `(H≥4.2)` — `{len(entropy)}` found")
             for item in entropy[:6]:
                 badge, _ = _kd_confidence("entropy", item["value"])
                 _ev = item['value'][:55].replace('`', "'")
-                lines.append(f"│  {badge}  H=`{item['entropy']}`  `{_ev}`")
-            lines.append(f"└{'─'*32}")
+                lines.append(
+                    f"  {badge} H=`{item['entropy']}` `{_ev}`"
+                )
             lines.append("")
 
         # ── Source maps ───────────────────────────────────────────────────────
         if smaps:
-            lines.append(f"▌🗺 *SOURCE MAPS*  ({len(smaps)})")
-            lines.append("│")
+            lines.append(f"🗺 *Source Maps Found* `({len(smaps)})`")
             for sm in smaps[:3]:
-                lines.append(f"│  `{escape_md(sm[-65:])}`")
-            lines.append(f"└{'─'*32}")
+                lines.append(f"  `{escape_md(sm[-60:])}`")
             lines.append("")
 
     lines += [
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "⚠️ _Authorized / security research use only_",
-        "💾 _Use /kdexport for full JSON report_",
+        "━━━━━━━━━━━━━━━━━━━━",
+        "⚠️ _For authorized/security research use only_",
+        "",
+        f"💾 Reply with /kdexport to get full JSON report",
     ]
 
     return "\n".join(lines), result
@@ -26948,7 +26732,7 @@ def main():
     app.add_error_handler(error_handler)
 
     print("╔══════════════════════════════════════╗")
-    print("║  Website Downloader Bot v17.1        ║")
+    print("║  Website Downloader Bot v17.0        ║")
     print(f"║  SSRF Protection:     ✅             ║")
     print(f"║  Path Traversal:      ✅             ║")
     print(f"║  Rate Limiting:       ✅ ({RATE_LIMIT_SEC}s)     ║")
