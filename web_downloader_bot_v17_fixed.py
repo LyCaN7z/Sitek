@@ -109,7 +109,9 @@ FILE_EXPIRY_HOURS = int(os.getenv("FILE_EXPIRY_HOURS", "24"))   # 24h ကြာ�
 # ── Global locks / state ──────────────────────────
 db_lock: asyncio.Lock                      # initialized in main()
 user_last_req    = {}                      # rate limit tracker {uid: timestamp}
-_cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal
+_cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal (downloads)
+_user_tasks: dict   = {}                   # {uid: asyncio.Task}  — any running scan task
+_scan_semaphore: asyncio.Semaphore         # initialized in main() — max 5 concurrent scans
 
 HEADERS = {
     'User-Agent': (
@@ -664,13 +666,27 @@ def user_guard(func):
         if uid not in ADMIN_IDS:
             if not db.get("settings", {}).get("bot_enabled", True):
                 await update.effective_message.reply_text(
-                    "🚫 Bot ကို ယာယီပိတ်ထားသည်။ နောက်မှ ထပ်ကြိုးစားပါ။"
+                    "🔴 *Bot ယာယီပိတ်ထားသည်*\n\n"
+                    "Admin မှ maintenance လုပ်နေပါသည်။\n"
+                    "နောက်မှ ထပ်ကြိုးစားပါ 🙏",
+                    parse_mode='Markdown'
                 )
                 return
             user = get_user(db, uid)
             if user.get("banned", False):
                 await update.effective_message.reply_text(
-                    "🚫 သင့် account ကို ပိတ်ထားသည်။"
+                    "🚫 *သင့် account ကို ပိတ်ထားသည်*\n"
+                    "Admin ထံ ဆက်သွယ်ပါ",
+                    parse_mode='Markdown'
+                )
+                return
+            # ── Concurrency guard: user already has active scan ───────────
+            existing = _user_tasks.get(uid)
+            if existing and not existing.done():
+                await update.effective_message.reply_text(
+                    "⚠️ *Operation တစ်ခု run နေသည်*\n"
+                    "ရပ်ရန် `/stop` သုံးပါ၊ ပြီးမှ ဆက်လုပ်ပါ",
+                    parse_mode='Markdown'
                 )
                 return
         return await func(update, context)
@@ -2854,7 +2870,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return detected, notable, resp.status_code, resp.url, js_fetched
 
     try:
-        detected, notable, status, final_url, js_cnt = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status, final_url, js_cnt = await run_scan(uid, _do_tech_scan)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
                             parse_mode='Markdown')
@@ -3274,7 +3290,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return sources, source_origins, findings
 
     try:
-        sources, source_origins, findings = await asyncio.to_thread(_do_extract)
+        sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
@@ -3669,7 +3685,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        results = await asyncio.to_thread(_bypass_sync, url)
+        results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -3940,7 +3956,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
+        data = await run_scan(uid, _subdomains_sync, raw, progress_q)
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -4357,10 +4377,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _extract_apk_assets_sync, filepath, wanted_cats,
+        result = await run_scan(
+            uid, _extract_apk_assets_sync, filepath, wanted_cats,
             lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -4539,7 +4563,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return {"success": False, "error": str(e)}
 
     try:
-        res = await asyncio.to_thread(_run_antibot)
+        res = await run_scan(uid, _run_antibot)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -6962,6 +6986,22 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                 f["source"] = f.get("source", "") + " [deep fetch]"
                 result.setdefault("findings", []).append(f)
                 existing_keys.add(sk)
+        # Deobfuscation pass over each asset — may reveal sitekeys inside atob/hex/join
+        for asset in new_assets:
+            body = asset.get("response_body", "")
+            if not body or len(body) < 30:
+                continue
+            _deob_body = _deobfuscate_text(body)
+            if not _deob_body:
+                continue
+            _deob_all_js = {asset["url"]: _deob_body}
+            for f in _extract_captcha_info("", url, _deob_all_js):
+                sk = f.get("site_key", "")
+                if sk and sk not in existing_keys:
+                    f["source"] = f.get("source", "") + " [deobfuscated]"
+                    f["confidence"] = "HIGH ✅"
+                    result.setdefault("findings", []).append(f)
+                    existing_keys.add(sk)
 
     # ── Phase 2: Real-time network stream intercept ───────────────────
     if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
@@ -7670,9 +7710,13 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _sitekey_with_subpages, url, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _sitekey_with_subpages, url, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -7937,6 +7981,10 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
     except Exception as deob_err:
         logger.debug("sitekey deobfuscate layer error: %s", deob_err)
+
+
+# ══════════════════════════════════════════════════
+# 🗝️  KEY EXTRACTOR ENGINE — Shared Playwright runner
 # ══════════════════════════════════════════════════
 
 def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
@@ -10895,7 +10943,7 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_apikeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _apikeys_sync, url, lambda t: progress_q.append(t))
         progress_q.append("\U0001f534 Phase 2: real-time network stream intercept...")
         live_result = await asyncio.to_thread(
             _stream_intercept_sync, url, lambda t: progress_q.append(t), _LIVE_API_PATTERNS
@@ -11047,14 +11095,20 @@ def _firebase_sync(url: str, progress_cb=None) -> dict:
                 seen.add(key)
                 configs.append({"source": source, "config": fields})
 
-    if progress_cb: progress_cb("🔍 Scanning for Firebase config...")
+    if progress_cb: progress_cb("🔍 Scanning for Firebase config (+ deobfuscation)...")
 
     for text, label in _gather_all_text(data):
         for m in _FIREBASE_PATTERNS.finditer(text):
             _parse_config_block(m.group(0), label)
-        # Also scan line by line for firebaseConfig object
         if "projectId" in text and "apiKey" in text:
             _parse_config_block(text, label)
+        # Deobfuscation pass — decode atob/hex/join-hidden Firebase configs
+        _deob = _deobfuscate_text(text)
+        if _deob:
+            for m in _FIREBASE_PATTERNS.finditer(_deob):
+                _parse_config_block(m.group(0), label + " [deobfuscated]")
+            if "projectId" in _deob and "apiKey" in _deob:
+                _parse_config_block(_deob, label + " [deobfuscated]")
 
     # DOM result
     dr = data.get("dom_result") or {}
@@ -11111,7 +11165,7 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_firebase_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _firebase_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -11491,6 +11545,518 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
     }
 
 
+# ══════════════════════════════════════════════════
+# 💳  /payconfig — Payment Configuration Auditor
+# ══════════════════════════════════════════════════
+# Scope: Extract & audit the EXPOSED payment integration config from
+# a site's HTML/JS — gateway profiles, CSP headers, webhook URLs,
+# form field structure, currency config, and PCI risk signals.
+# Does NOT use found keys to call gateway APIs.
+# ══════════════════════════════════════════════════
+
+# ── CSP header parser for payment domains ─────────────────────────────────
+_PAY_CSP_DOMAINS = {
+    "js.stripe.com":         "Stripe JS SDK",
+    "checkout.stripe.com":   "Stripe Checkout",
+    "q.stripe.com":          "Stripe telemetry",
+    "js.braintreegateway.com": "Braintree JS",
+    "assets.braintreegateway.com": "Braintree assets",
+    "www.paypal.com":        "PayPal",
+    "www.sandbox.paypal.com":"PayPal Sandbox",
+    "js.razorpay.com":       "Razorpay JS",
+    "api.razorpay.com":      "Razorpay API",
+    "js.squareup.com":       "Square JS",
+    "js.squareupsandbox.com":"Square Sandbox",
+    "hcaptcha.com":          "hCaptcha",
+    "js.hcaptcha.com":       "hCaptcha JS",
+    "challenges.cloudflare.com": "Cloudflare Turnstile",
+    "www.google.com/recaptcha": "reCAPTCHA",
+    "adyen.com":             "Adyen",
+    "checkout.adyen.com":    "Adyen Checkout",
+    "live.adyen.com":        "Adyen Live",
+    "pay.google.com":        "Google Pay",
+    "apple.com/apple-pay":   "Apple Pay",
+    "api.klarna.com":        "Klarna",
+    "x.klarnacdn.net":       "Klarna CDN",
+    "paddle.com":            "Paddle",
+    "buy.paddle.com":        "Paddle Checkout",
+    "mollie.com":            "Mollie",
+    "paystack.com":          "Paystack",
+    "flutterwave.com":       "Flutterwave",
+    "checkout.com":          "Checkout.com",
+    "coinbase.com/commerce": "Coinbase Commerce",
+    "affirm.com":            "Affirm",
+    "afterpay.com":          "Afterpay",
+    "clearpay.co.uk":        "Clearpay",
+}
+
+# ── Webhook URL patterns ───────────────────────────────────────────────────
+_WEBHOOK_PATTERNS = [
+    ("Stripe Webhook",    re.compile(r'(?i)(?:stripe[_\-]?)?webhook[_\-]?(?:url|endpoint|secret)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("PayPal IPN",        re.compile(r'(?i)paypal[_\-]?(?:ipn|webhook)[_\-]?url\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Generic Webhook",   re.compile(r'(?i)webhook[_\-]?(?:url|endpoint)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Callback URL",      re.compile(r'(?i)(?:return|callback|redirect)[_\-]?url\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Success URL",       re.compile(r'(?i)success[_\-]?(?:url|redirect)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Cancel URL",        re.compile(r'(?i)cancel[_\-]?(?:url|redirect)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+]
+
+# ── Currency / locale signals ──────────────────────────────────────────────
+_CURRENCY_RE = re.compile(
+    r'(?i)(?:currency|locale|country)[_\-]?(?:code)?\s*[=:,]\s*["\']([A-Z]{2,6})["\']'
+    r'|["\']currency["\']\s*:\s*["\']([A-Z]{2,6})["\']'
+    r'|amount\s*:\s*(\d{1,10})\s*(?:,|})'
+)
+
+# ── Payment form field fingerprint ────────────────────────────────────────
+_FORM_FIELD_SIGNALS = {
+    "Card Number field":      re.compile(r'(?i)card[_\-]?number|cardnumber|cc[_\-]?num'),
+    "CVV/CVC field":          re.compile(r'(?i)\bcvv\b|\bcvc\b|\bsecurity[_\-]?code'),
+    "Expiry field":           re.compile(r'(?i)exp(?:ir(?:y|ation))?[_\-]?(?:date|month|year)|card[_\-]?exp'),
+    "Cardholder name field":  re.compile(r'(?i)cardholder[_\-]?name|card[_\-]?holder|billing[_\-]?name'),
+    "Billing address field":  re.compile(r'(?i)billing[_\-]?address|billing[_\-]?zip|billing[_\-]?postal'),
+    "UPI field (India)":      re.compile(r'(?i)upi[_\-]?id|vpa[_\-]?address|bhim'),
+    "IBAN/SEPA field":        re.compile(r'(?i)\biban\b|\bsepa\b|bank[_\-]?account'),
+    "Crypto address field":   re.compile(r'(?i)wallet[_\-]?address|crypto[_\-]?address|eth[_\-]?address'),
+}
+
+# ── PCI SAQ level heuristics ──────────────────────────────────────────────
+def _pci_saq_estimate(form_fields: list, gateways: list, csp_gateways: list) -> str:
+    """Estimate PCI DSS SAQ type from integration signals."""
+    has_iframe = any("Stripe" in g or "Braintree" in g or "Square" in g or "Adyen" in g
+                     for g in gateways + csp_gateways)
+    has_raw_fields = any("Card Number" in f or "CVV" in f or "Expiry" in f for f in form_fields)
+
+    if has_raw_fields and not has_iframe:
+        return "⚠️ SAQ D (raw card fields in DOM — PCI scope FULL)"
+    elif has_iframe or has_raw_fields is False:
+        return "✅ SAQ A or A-EP (iframe/redirect — reduced PCI scope)"
+    else:
+        return "⚪ SAQ unclear — manual review needed"
+
+
+def _payconfig_sync(url: str, progress_cb=None) -> dict:
+    """
+    Payment configuration surface auditor.
+    Scans HTML, JS, HTTP headers, CSP for exposed payment integration
+    configuration — gateways, modes, currencies, webhook URLs, form structure,
+    PCI risk tier — without using any found keys to call external APIs.
+    """
+    result = {
+        "url":           url,
+        "page_url":      url,
+        "gateways":      [],
+        "sdk_scripts":   [],
+        "csp_gateways":  [],
+        "currencies":    [],
+        "webhooks":      [],
+        "form_fields":   [],
+        "pci_saq":       "",
+        "pci_risks":     [],
+        "threeds":       [],
+        "key_modes":     {"live": [], "test": [], "unknown": []},
+        "security_headers": {},
+        "findings":      [],   # full paykeys findings reused
+        "gateway_profile": None,
+        "error":         None,
+    }
+
+    if progress_cb: progress_cb("🌐 Fetching page + HTTP headers...")
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy,
+                             timeout=TIMEOUT, verify=False, allow_redirects=True)
+        html      = resp.text
+        final_url = resp.url
+        http_hdrs = dict(resp.headers)
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    result["page_url"] = final_url
+
+    # ── 1. Security headers relevant to payments ──────────────────────────────
+    _SEC_HDRS = {
+        "Content-Security-Policy": "CSP",
+        "Strict-Transport-Security": "HSTS",
+        "X-Frame-Options": "X-Frame-Options",
+        "Referrer-Policy": "Referrer-Policy",
+        "Permissions-Policy": "Permissions-Policy",
+        "Cross-Origin-Opener-Policy": "COOP",
+    }
+    for hdr, label in _SEC_HDRS.items():
+        v = http_hdrs.get(hdr, "") or http_hdrs.get(hdr.lower(), "")
+        if v:
+            result["security_headers"][label] = v[:200]
+
+    # ── 2. CSP payment domain fingerprint ────────────────────────────────────
+    if progress_cb: progress_cb("🔍 Parsing CSP for payment domains...")
+    csp_val = (result["security_headers"].get("CSP", "")
+               or http_hdrs.get("Content-Security-Policy", ""))
+    for domain_kw, gw_name in _PAY_CSP_DOMAINS.items():
+        if domain_kw in csp_val:
+            if gw_name not in result["csp_gateways"]:
+                result["csp_gateways"].append(gw_name)
+
+    # ── 3. Gather JS text corpus ──────────────────────────────────────────────
+    if progress_cb: progress_cb("📦 Fetching JS bundles...")
+    texts: list = [(html, "HTML")]
+    for src in re.findall(r'<script[^>]+src=["\']([^"\'>]+)["\']>', html, re.I)[:25]:
+        js_url = urljoin(final_url, src)
+        if not js_url.startswith("http"):
+            continue
+        try:
+            jr = requests.get(js_url, headers=HEADERS, proxies=proxy_manager.get_proxy(),
+                              timeout=TIMEOUT, verify=False)
+            if jr.status_code == 200:
+                body = jr.text
+                texts.append((body, js_url.split("/")[-1][:40]))
+                # deobfuscation pass
+                _deob = _deobfuscate_text(body)
+                if _deob:
+                    texts.append((_deob, js_url.split("/")[-1][:40] + " [deobfuscated]"))
+        except Exception:
+            pass
+
+    combined = "\n".join(t for t, _ in texts)
+
+    # ── 4. SDK <script> tag fingerprint ──────────────────────────────────────
+    if progress_cb: progress_cb("🏦 Fingerprinting payment SDK scripts...")
+    _SDK_PATTERNS = [
+        (re.compile(r'js\.stripe\.com'),        "Stripe JS SDK"),
+        (re.compile(r'checkout\.stripe\.com'),   "Stripe Checkout"),
+        (re.compile(r'braintreegateway\.com'),    "Braintree JS"),
+        (re.compile(r'paypal\.com/sdk/js'),       "PayPal SDK"),
+        (re.compile(r'www\.paypalobjects\.com'), "PayPal Legacy"),
+        (re.compile(r'js\.razorpay\.com'),       "Razorpay JS"),
+        (re.compile(r'js\.squareup\.com'),       "Square Web SDK"),
+        (re.compile(r'checkout\.adyen\.com'),    "Adyen Web"),
+        (re.compile(r'x\.klarnacdn\.net'),       "Klarna JS"),
+        (re.compile(r'buy\.paddle\.com'),        "Paddle.js"),
+        (re.compile(r'mollie\.com'),              "Mollie JS"),
+        (re.compile(r'paystack\.com/popup'),      "Paystack Popup"),
+        (re.compile(r'flutterwave\.com'),         "Flutterwave JS"),
+        (re.compile(r'checkout\.com'),            "Checkout.com"),
+        (re.compile(r'pay\.google\.com'),        "Google Pay API"),
+        (re.compile(r'apple(?:pay)?\.com'),       "Apple Pay"),
+        (re.compile(r'shop\.app/pay'),            "Shop Pay"),
+        (re.compile(r'cashfree\.com'),            "Cashfree"),
+        (re.compile(r'payu\.in|payu\.com'),      "PayU"),
+        (re.compile(r'coinbase\.com/commerce'),   "Coinbase Commerce"),
+    ]
+    sdk_seen = set()
+    for pat, sdk_name in _SDK_PATTERNS:
+        if pat.search(html) and sdk_name not in sdk_seen:
+            sdk_seen.add(sdk_name)
+            result["sdk_scripts"].append(sdk_name)
+    result["gateways"] = list(set(result["sdk_scripts"] + result["csp_gateways"]))
+
+    # ── 5. Key mode detection (live vs test) ──────────────────────────────────
+    if progress_cb: progress_cb("🔑 Detecting payment key modes (live/test)...")
+    _KEY_MODE_PATS = [
+        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live PK", True),
+        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test PK", False),
+        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live SK ⚠️", True),
+        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test SK", False),
+        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'), "Razorpay Live", True),
+        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'), "Razorpay Test", False),
+        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),      "Flutterwave Live PK", True),
+        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'), "Flutterwave Test PK", False),
+        (re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b'), "Checkout.com Key", None),
+        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live", True),
+        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox", False),
+    ]
+    mode_seen = set()
+    for pat, label, is_live in _KEY_MODE_PATS:
+        for m in pat.finditer(combined):
+            val = m.group(1)
+            key = label + ":" + val[:20]
+            if key in mode_seen:
+                continue
+            mode_seen.add(key)
+            masked = val[:12] + "..." + val[-4:] if len(val) > 16 else val
+            entry = {"label": label, "masked": masked}
+            if is_live is True:
+                result["key_modes"]["live"].append(entry)
+            elif is_live is False:
+                result["key_modes"]["test"].append(entry)
+            else:
+                result["key_modes"]["unknown"].append(entry)
+
+    # ── 6. Currency / locale detection ────────────────────────────────────────
+    if progress_cb: progress_cb("💱 Detecting currencies + locales...")
+    currency_seen = set()
+    for m in _CURRENCY_RE.finditer(combined):
+        val = (m.group(1) or m.group(2) or "").upper()
+        if val and len(val) <= 4 and val.isalpha() and val not in currency_seen:
+            currency_seen.add(val)
+    result["currencies"] = sorted(currency_seen)[:20]
+
+    # ── 7. Webhook / callback URL extraction ─────────────────────────────────
+    if progress_cb: progress_cb("🔗 Extracting webhook + callback URLs...")
+    wh_seen = set()
+    for wh_type, pat in _WEBHOOK_PATTERNS:
+        for m in pat.finditer(combined):
+            wh_url = m.group(1).strip().strip('"\' ')
+            key    = wh_url[:80]
+            if key not in wh_seen and "example" not in key.lower():
+                wh_seen.add(key)
+                result["webhooks"].append({"type": wh_type, "url": wh_url[:100]})
+
+    # ── 8. Form field fingerprint ─────────────────────────────────────────────
+    if progress_cb: progress_cb("📋 Fingerprinting payment form fields...")
+    for field_name, pat in _FORM_FIELD_SIGNALS.items():
+        if pat.search(html):   # only HTML for real form fields
+            result["form_fields"].append(field_name)
+
+    # ── 9. 3DS / SCA signal detection ────────────────────────────────────────
+    _3DS_QUICK = [
+        (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction|authenticateSource'), "Stripe 3DS confirmPayment"),
+        (re.compile(r'(?i)stripe\.confirmCardPayment'),        "Stripe confirmCardPayment"),
+        (re.compile(r'(?i)paymentIntent\.status.*requires_action'), "PaymentIntent requires_action"),
+        (re.compile(r'(?i)threeDS(?:Method|Result|Fingerprint)'), "Adyen/Generic 3DS fingerprint"),
+        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),         "3D Secure reference"),
+        (re.compile(r'(?i)\.redirect(?:To)?3ds'),               "redirect3DS call"),
+        (re.compile(r'(?i)authentication_required'),             "authentication_required status"),
+        (re.compile(r'(?i)sca[_\-]?(?:required|enforcement|challenge)'), "SCA enforcement"),
+    ]
+    for pat, label in _3DS_QUICK:
+        if pat.search(combined) and label not in result["threeds"]:
+            result["threeds"].append(label)
+
+    # ── 10. PCI risk scan ─────────────────────────────────────────────────────
+    _PCI_QUICK = [
+        (re.compile(r'(?i)document\.getElementById.*card.?number'),
+         "⚠️ Raw card number input in DOM — SAQ D scope"),
+        (re.compile(r'(?i)localStorage\.setItem.*(?:card|payment|stripe|token)'),
+         "⚠️ Payment data stored in localStorage"),
+        (re.compile(r'(?i)console\.log.*(?:sk_|pk_|secret)'),
+         "⚠️ Payment key logged to console"),
+        (re.compile(r'(?i)http://(?!localhost).*(?:checkout|payment|pay)'),
+         "⚠️ Non-HTTPS payment page link detected"),
+        (re.compile(r'(?i)cvv|cvc|security.?code'),
+         "⚠️ CVV/CVC field present — PCI scope applies"),
+        (re.compile(r'(?i)eval\s*\(|Function\s*\(["\']return'),
+         "⚠️ eval() in JS — obfuscation risk"),
+    ]
+    for pat, note in _PCI_QUICK:
+        if pat.search(combined) and note not in result["pci_risks"]:
+            result["pci_risks"].append(note)
+
+    # ── 11. PCI SAQ estimate ──────────────────────────────────────────────────
+    result["pci_saq"] = _pci_saq_estimate(
+        result["form_fields"], result["gateways"], result["csp_gateways"]
+    )
+
+    return result
+
+
+@user_guard
+async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payconfig <url> — Payment integration configuration auditor"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/payconfig https://example.com`\n\n"
+            "🔍 *Payment Config Auditor — scans:*\n"
+            "  • Payment SDK scripts (20+ gateways fingerprint)\n"
+            "  • CSP header → payment domain whitelist\n"
+            "  • Key mode detection: 🔴 LIVE vs 🟢 TEST\n"
+            "  • Currencies / locales detected\n"
+            "  • Webhook + callback URLs exposed\n"
+            "  • Payment form field structure\n"
+            "  • 3DS / SCA enforcement signals\n"
+            "  • PCI SAQ scope estimate (A / A-EP / D)\n"
+            "  • Security headers audit (CSP, HSTS, X-Frame)\n"
+            "  • Deobfuscation pass over all JS bundles\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"💳 *Payment Config Auditor*\n"
+        f"🌐 `{escape_md(domain)}`\n\n"
+        "⏳ Scanning payment integration surface...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"💳 *Pay Config — `{escape_md(domain)}`*\n\n{escape_md(t)}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await run_scan(
+            uid, _payconfig_sync, url, lambda t: progress_q.append(t)
+        )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    live_count  = len(result["key_modes"]["live"])
+    test_count  = len(result["key_modes"]["test"])
+    vuln_pci    = len(result["pci_risks"])
+    overall_env = ("🔴 LIVE" if live_count else "🟢 TEST" if test_count else "⚪ UNKNOWN")
+
+    lines = [
+        f"💳 *Payment Config Audit — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(result['page_url'][:80])}`",
+        f"🏦 Gateways: `{len(result['gateways'])}` detected | Mode: *{overall_env}*",
+        f"⚠️ PCI Risks: `{vuln_pci}` | 3DS signals: `{len(result['threeds'])}`",
+        "",
+    ]
+
+    # SDKs
+    if result["sdk_scripts"]:
+        lines.append("*🏦 Payment SDK Scripts:*")
+        for gw in result["sdk_scripts"]:
+            lines.append(f"  ✅ {gw}")
+        lines.append("")
+
+    # CSP gateways
+    if result["csp_gateways"]:
+        lines.append("*🔐 CSP-Whitelisted Gateways:*")
+        for gw in result["csp_gateways"]:
+            lines.append(f"  📋 {gw}")
+        lines.append("")
+
+    # Key modes
+    if result["key_modes"]["live"] or result["key_modes"]["test"]:
+        lines.append("*🔑 Key Mode Fingerprint:*")
+        for e in result["key_modes"]["live"][:5]:
+            _m = e["masked"].replace("`", "'")
+            lines.append(f"  🔴 LIVE — {escape_md(e['label'])} `{_m}`")
+        for e in result["key_modes"]["test"][:5]:
+            lines.append(f"  🟢 TEST — {escape_md(e['label'])}")
+        for e in result["key_modes"]["unknown"][:3]:
+            lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
+        lines.append("")
+
+    # Currencies
+    if result["currencies"]:
+        _cur = escape_md(", ".join(result["currencies"][:15]))
+        lines.append(f"*💱 Currencies detected:* `{_cur}`")
+        lines.append("")
+
+    # Webhook URLs
+    if result["webhooks"]:
+        lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
+        for wh in result["webhooks"][:6]:
+            _wu = wh["url"][:70].replace("`", "'")
+            lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
+        lines.append("")
+
+    # Form fields
+    if result["form_fields"]:
+        lines.append("*📋 Payment Form Fields:*")
+        for ff in result["form_fields"]:
+            lines.append(f"  📄 {ff}")
+        lines.append("")
+
+    # 3DS signals
+    if result["threeds"]:
+        lines.append("*🔒 3DS / SCA Signals:*")
+        for s in result["threeds"][:5]:
+            lines.append(f"  ✅ {escape_md(s)}")
+        lines.append("")
+
+    # PCI risks
+    if result["pci_risks"]:
+        lines.append("*🚨 PCI Risk Findings:*")
+        for r in result["pci_risks"][:6]:
+            lines.append(f"  {escape_md(r)}")
+        lines.append("")
+
+    # PCI SAQ
+    if result["pci_saq"]:
+        lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
+        lines.append("")
+
+    # Security headers
+    if result["security_headers"]:
+        lines.append("*🛡️ Security Headers:*")
+        for k, v in result["security_headers"].items():
+            _v = v[:60].replace("`", "'")
+            lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "domain":             domain,
+                "page_url":           result["page_url"],
+                "scanned_at":         datetime.now().isoformat(),
+                "gateways":           result["gateways"],
+                "sdk_scripts":        result["sdk_scripts"],
+                "csp_gateways":       result["csp_gateways"],
+                "key_modes":          result["key_modes"],
+                "currencies":         result["currencies"],
+                "webhooks":           result["webhooks"],
+                "form_fields":        result["form_fields"],
+                "threeds_signals":    result["threeds"],
+                "pci_risks":          result["pci_risks"],
+                "pci_saq_estimate":   result["pci_saq"],
+                "security_headers":   result["security_headers"],
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"payconfig_{safe_d}_{ts}.json",
+            caption=(
+                f"💳 Payment Config — `{escape_md(domain)}`\n"
+                f"🏦 Gateways: `{len(result['gateways'])}` | Mode: {overall_env} | PCI risks: `{vuln_pci}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("payconfig export error: %s", e)
+
 @user_guard
 async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/entropy <url> [threshold] — High entropy secret hunter"""
@@ -11558,9 +12124,13 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _entropy_hunt_sync, url, threshold, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _entropy_hunt_sync, url, threshold, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
@@ -11844,9 +12414,13 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _deobfuscate_sync, url, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _deobfuscate_sync, url, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
@@ -11926,447 +12500,6 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.warning("deobfuscate export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🧩  SHARED — Deobfuscation layer (called by sitekey/keydump/paykeys)
-# ══════════════════════════════════════════════════
-
-def _deobfuscate_layer(texts_map: dict, progress_cb=None) -> list:
-    """
-    Pre-fetched JS text တွေပေါ် deobfuscation scan ပြုလုပ်တယ်။
-    sitekey / keydump / paykeys ရဲ့ already-fetched JS ကို reuse လုပ်တာမို့
-    ထပ်ခါ network request မလုပ်တော့ပါ။
-
-    Returns: list of finding dicts — method, raw, decoded, entropy, source, context
-    """
-    import base64 as _b64
-
-    _SECRET_KW = re.compile(
-        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|'
-        r'sk_|pk_|AKIA|bearer|webhook|signing|encrypt|password|client_secret)',
-    )
-    seen_decoded: set = set()
-    findings: list   = []
-
-    def _ent(s: str) -> float:
-        if not s: return 0.0
-        import math
-        freq = {}
-        for c in s: freq[c] = freq.get(c, 0) + 1
-        l = len(s)
-        return -sum(v/l * math.log2(v/l) for v in freq.values())
-
-    def _record(method: str, raw: str, decoded: str, source: str, ctx: str = ""):
-        val = decoded.strip()
-        if val in seen_decoded or len(val) < 8: return
-        score = _ent(val)
-        if score < 3.5: return
-        seen_decoded.add(val)
-        findings.append({
-            "method":            method,
-            "raw":               raw[:80],
-            "decoded":           val[:120],
-            "entropy":           round(score, 3),
-            "source":            source,
-            "context":           ctx[:80],
-            "in_secret_context": bool(_SECRET_KW.search(ctx + raw)),
-        })
-
-    for source, text in texts_map.items():
-        if not isinstance(text, str) or len(text) < 20:
-            continue
-
-        # ── 1. Base64 atob() / Buffer.from(...,'base64') ─────────────────
-        for m in re.finditer(
-            r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']', text
-        ):
-            raw = m.group(1)
-            try:
-                decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
-                _record("Base64 atob()", raw, decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 2. Hex escape \x73\x6b... ────────────────────────────────────
-        for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){6,})"', text):
-            raw = m.group(1)
-            try:
-                decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
-                                 lambda hm: chr(int(hm.group(1), 16)), raw)
-                _record("Hex \\x", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 3. Raw hex string ─────────────────────────────────────────────
-        for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
-            raw = m.group(1)
-            if len(raw) % 2 != 0: continue
-            try:
-                decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
-                if decoded.isprintable() and _SECRET_KW.search(decoded):
-                    _record("Raw Hex", raw, decoded, source,
-                            text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 4. Unicode escape \u0073\u006b... ────────────────────────────
-        for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){5,})"', text):
-            raw = m.group(1)
-            try:
-                decoded = raw.encode('utf-8').decode('unicode_escape')
-                _record("Unicode \\u", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 5. Array join() trick ["sk","_live","_xx"].join("") ──────────
-        for m in re.finditer(
-            r'\[([^\]]{10,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
-        ):
-            raw = m.group(1)
-            try:
-                parts   = re.findall(r'["\']([^"\']*)["\']', raw)
-                decoded = "".join(parts)
-                _record("Array join()", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 6. String.fromCharCode(115,107,95,...) ───────────────────────
-        for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{10,300})\)', text):
-            raw = m.group(1)
-            try:
-                codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
-                decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
-                _record("fromCharCode", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 7. Reverse string "...".split("").reverse().join("") ─────────
-        for m in re.finditer(
-            r'["\']([A-Za-z0-9+/=_\-]{16,120})["\']'
-            r'\s*\.split\s*\(\s*["\']["\']?\s*\)\s*\.reverse\(\)\s*\.join\s*\(\s*["\']["\']?\s*\)',
-            text
-        ):
-            raw = m.group(1)
-            try:
-                decoded = raw[::-1]
-                _record("Reversed string", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 8. btoa-encoded segments: split("").map(c=>c.charCodeAt(0)) ──
-        for m in re.finditer(
-            r'\.map\s*\(\s*(?:function\s*\(\s*\w+\s*\)|[\w]+\s*=>)\s*'
-            r'\w+\.charCodeAt\s*\(\s*0\s*\)\s*[+\-]\s*(\d+)\s*\)',
-            text
-        ):
-            # Caesar / ROT-N shift detection
-            try:
-                shift = int(m.group(1))
-                ctx   = text[max(0, m.start()-120): m.start()+120]
-                str_m = re.search(r'["\']([A-Za-z0-9+/=_\-]{16,})["\']', ctx)
-                if str_m:
-                    raw     = str_m.group(1)
-                    decoded = "".join(chr(max(0, ord(c) - shift)) for c in raw)
-                    _record(f"Caesar-{shift}", raw[:80], decoded, source, ctx[:80])
-            except Exception:
-                pass
-
-    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
-    if progress_cb:
-        progress_cb(f"🧩 Deobfuscate: {len(findings)} decoded string(s) found")
-    return findings
-
-
-# ══════════════════════════════════════════════════
-# 💳  /payconfig — Payment Gateway Public Config Extractor
-# ══════════════════════════════════════════════════
-
-# JS-source patterns for gateway SDK init config objects (public/frontend only)
-_PAYCONFIG_PATTERNS = [
-    # Stripe
-    ("Stripe",     "publishableKey",  re.compile(r'Stripe\s*\(\s*["\']([^"\']{10,80})["\']', re.I)),
-    ("Stripe",     "stripeAccount",   re.compile(r'stripeAccount\s*:\s*["\']([^"\']{5,40})["\']', re.I)),
-    ("Stripe",     "locale",          re.compile(r'(?:Stripe\b.{0,200})locale\s*:\s*["\']([a-z\-]{2,10})["\']', re.I|re.S)),
-    ("Stripe",     "currency",        re.compile(r'(?:Stripe\b.{0,200})currency\s*:\s*["\']([a-z]{3})["\']', re.I|re.S)),
-    ("Stripe",     "apiVersion",      re.compile(r'apiVersion\s*:\s*["\'](\d{4}-\d{2}-\d{2})["\']', re.I)),
-
-    # PayPal
-    ("PayPal",     "clientId",        re.compile(r'client[-_]?id\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,80})["\']', re.I)),
-    ("PayPal",     "currency",        re.compile(r'(?:paypal|PAYPAL).{0,300}currency\s*:\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-    ("PayPal",     "intent",          re.compile(r'intent\s*:\s*["\']([a-z]+)["\']', re.I)),
-    ("PayPal",     "merchantId",      re.compile(r'merchant[-_]?id\s*[=:]\s*["\']([A-Za-z0-9\-_]{5,60})["\']', re.I)),
-
-    # Braintree
-    ("Braintree",  "authorization",   re.compile(r'(?:braintree|dropin).{0,100}authorization\s*:\s*["\']([^"\']{10,120})["\']', re.I|re.S)),
-    ("Braintree",  "container",       re.compile(r'container\s*:\s*["\']([^"\']{1,60})["\']', re.I)),
-
-    # Square
-    ("Square",     "applicationId",   re.compile(r'applicationId\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,60})["\']', re.I)),
-    ("Square",     "locationId",      re.compile(r'locationId\s*[=:]\s*["\']([A-Za-z0-9]{8,30})["\']', re.I)),
-    ("Square",     "environment",     re.compile(r'(?:square|Square).{0,100}environment\s*[=:]\s*["\']([a-z]+)["\']', re.I|re.S)),
-
-    # Razorpay (public config fields only — key_id prefix rzp_ is public)
-    ("Razorpay",   "key_id",          re.compile(r'["\']?key[_\s]?id["\']?\s*[=:]\s*["\']?(rzp_(?:live|test)_[A-Za-z0-9]{14,})["\']?', re.I)),
-    ("Razorpay",   "currency",        re.compile(r'(?:Razorpay|razorpay).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-    ("Razorpay",   "name",            re.compile(r'(?:Razorpay|razorpay).{0,200}name\s*[=:]\s*["\']([^"\']{2,60})["\']', re.I|re.S)),
-    ("Razorpay",   "theme_color",     re.compile(r'theme\s*[=:]\s*\{[^}]*color\s*[=:]\s*["\']([^"\']{3,20})["\']', re.I|re.S)),
-
-    # Adyen
-    ("Adyen",      "environment",     re.compile(r'(?:AdyenCheckout|adyen).{0,100}environment\s*[=:]\s*["\']([a-zA-Z]+)["\']', re.I|re.S)),
-    ("Adyen",      "clientKey",       re.compile(r'clientKey\s*[=:]\s*["\']([^"\']{10,80})["\']', re.I)),
-    ("Adyen",      "countryCode",     re.compile(r'countryCode\s*[=:]\s*["\']([A-Z]{2})["\']', re.I)),
-    ("Adyen",      "currency",        re.compile(r'(?:AdyenCheckout|adyen).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-
-    # Klarna
-    ("Klarna",     "client_id",       re.compile(r'(?:Klarna|klarna).{0,100}client[-_]?id\s*[=:]\s*["\']([^"\']{8,60})["\']', re.I|re.S)),
-    ("Klarna",     "purchase_country",re.compile(r'purchase_country\s*[=:]\s*["\']([A-Z]{2})["\']', re.I)),
-    ("Klarna",     "purchase_currency",re.compile(r'purchase_currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I)),
-
-    # Mollie
-    ("Mollie",     "profileId",       re.compile(r'profileId\s*[=:]\s*["\']([^"\']{5,40})["\']', re.I)),
-
-    # Paddle
-    ("Paddle",     "vendorId",        re.compile(r'(?:Paddle|paddle).{0,100}vendor(?:Id|ID)\s*[=:]\s*["\']?(\d{4,10})["\']?', re.I|re.S)),
-    ("Paddle",     "environment",     re.compile(r'(?:Paddle|paddle).{0,100}environment\s*[=:]\s*["\']([a-z]+)["\']', re.I|re.S)),
-
-    # Paystack
-    ("Paystack",   "key",             re.compile(r'(?:PaystackPop|paystack).{0,100}key\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I|re.S)),
-    ("Paystack",   "currency",        re.compile(r'(?:PaystackPop|paystack).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-]
-
-
-def _payconfig_sync(url: str, progress_cb=None) -> dict:
-    """
-    Payment gateway SDK init config ကို JS source ထဲမှ ထုတ်ယူတယ်။
-    Frontend/public config fields သာ — API key/secret မဟုတ်ပါ။
-    """
-    if progress_cb: progress_cb("🌐 Fetching page HTML...")
-
-    try:
-        proxy    = proxy_manager.get_proxy()
-        resp     = requests.get(url, headers=HEADERS, proxies=proxy,
-                                timeout=TIMEOUT, verify=False)
-        html     = resp.text
-        final_url = resp.url
-    except Exception as e:
-        return {"error": str(e), "findings": {}, "js_count": 0}
-
-    texts_map: dict = {"[HTML]": html}
-
-    # Collect JS bundle URLs
-    js_urls: list = []
-    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
-        abs_src = urljoin(final_url, src)
-        if abs_src.startswith("http"):
-            js_urls.append(abs_src)
-
-    if progress_cb: progress_cb(f"📦 Fetching {len(js_urls)} JS bundles...")
-    for js_url in js_urls[:30]:
-        try:
-            r = requests.get(js_url, headers=HEADERS,
-                             proxies=proxy_manager.get_proxy(),
-                             timeout=TIMEOUT, verify=False)
-            if r.status_code == 200 and len(r.text) < 5_000_000:
-                key = js_url.split("/")[-1][:40] or js_url[-40:]
-                texts_map[key] = r.text
-        except Exception:
-            pass
-
-    # Also try known public config endpoints
-    config_paths = [
-        "/payment-config.json", "/checkout-config.json",
-        "/static/payment.js",   "/assets/checkout.js",
-        "/js/payment.js",       "/__payment_config",
-    ]
-    for path in config_paths:
-        try:
-            r = requests.get(urljoin(final_url, path), headers=HEADERS,
-                             proxies=proxy_manager.get_proxy(),
-                             timeout=8, verify=False)
-            if r.status_code == 200 and len(r.text) < 2_000_000:
-                texts_map[path] = r.text
-        except Exception:
-            pass
-
-    if progress_cb: progress_cb("🔍 Extracting gateway SDK config objects...")
-
-    # gateway → {field: [values]}
-    gw_configs: dict = {}
-    all_text = "\n".join(texts_map.values())
-
-    for gateway, field, pattern in _PAYCONFIG_PATTERNS:
-        for m in pattern.finditer(all_text):
-            val = m.group(1).strip()
-            if not val or len(val) < 2:
-                continue
-            if gateway not in gw_configs:
-                gw_configs[gateway] = {}
-            if field not in gw_configs[gateway]:
-                gw_configs[gateway][field] = []
-            if val not in gw_configs[gateway][field]:
-                gw_configs[gateway][field].append(val)
-
-    # Also run deobfuscate layer to catch hidden config values
-    if progress_cb: progress_cb("🧩 Running deobfuscation layer...")
-    deob = _deobfuscate_layer(texts_map, progress_cb)
-    # Classify deobfuscated results back into gateway buckets if recognizable
-    for f in deob:
-        dec = f.get("decoded", "")
-        if re.match(r'^pk_(live|test)_', dec):
-            gw_configs.setdefault("Stripe", {}).setdefault("decoded_publishable", []).append(dec[:40])
-        elif re.match(r'^rzp_(live|test)_', dec):
-            gw_configs.setdefault("Razorpay", {}).setdefault("decoded_key_id", []).append(dec[:40])
-        elif re.match(r'^[A-Z]{2}\d{6}[A-Z0-9]{10,}$', dec):
-            gw_configs.setdefault("Adyen", {}).setdefault("decoded_clientKey", []).append(dec[:40])
-
-    return {
-        "error":     None,
-        "page_url":  final_url,
-        "js_count":  len(texts_map) - 1,
-        "findings":  gw_configs,
-        "deob_count": len(deob),
-    }
-
-
-async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/payconfig <url> — Extract payment gateway SDK public config from JS source"""
-    if not await check_force_join(update, context): return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/payconfig https://example.com`\n\n"
-            "⚙️ *Payment SDK Config Extractor:*\n"
-            "  JS source ထဲမှ payment gateway public init config ထုတ်ယူသည်\n\n"
-            "💳 *Supported gateways:*\n"
-            "  🔵 Stripe  🟡 PayPal  🟠 Braintree  🟣 Square\n"
-            "  🔴 Razorpay  🟢 Adyen  🟤 Klarna  ⚫ Mollie\n"
-            "  🔵 Paddle  🟠 Paystack\n\n"
-            "🔍 *Extracts (frontend/public fields only):*\n"
-            "  publishableKey · clientId · merchantId · locationId\n"
-            "  applicationId · currency · locale · environment\n"
-            "  countryCode · SDK version · theme config\n\n"
-            "🧩 Deobfuscation layer ပါဝင်သည်\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith("http"): url = "https://" + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"⚙️ *Payment Config Extractor*\n🌐 `{escape_md(domain)}`\n\n"
-        "⏳ Scanning JS bundles...",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                t = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"⚙️ *PayConfig — `{escape_md(domain)}`*\n\n{escape_md(t)}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        result = await asyncio.to_thread(_payconfig_sync, url, lambda t: progress_q.append(t))
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
-        return
-
-    findings  = result["findings"]
-    page_url  = result["page_url"]
-    js_count  = result["js_count"]
-    deob_count= result["deob_count"]
-
-    if not findings:
-        await safe_markdown_reply(msg,
-            f"⚙️ *PayConfig — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 Payment SDK config မတွေ့ပါ\n"
-            f"📦 JS bundles: `{js_count}` | 🧩 Deob: `{deob_count}`\n"
-            f"🌐 `{escape_md(page_url[:80])}`"
-        )
-        return
-
-    lines = [
-        f"⚙️ *Payment SDK Config — `{escape_md(domain)}`*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 `{escape_md(page_url[:70])}`",
-        f"📦 JS: `{js_count}` | 🧩 Deob: `{deob_count}` | 💳 Gateways: `{len(findings)}`\n",
-    ]
-
-    _GW_EMOJI = {
-        "Stripe": "🔵", "PayPal": "🟡", "Braintree": "🟠", "Square": "🟣",
-        "Razorpay": "🔴", "Adyen": "🟢", "Klarna": "🟤", "Mollie": "⚫",
-        "Paddle": "🔵", "Paystack": "🟠",
-    }
-
-    for gw, fields in findings.items():
-        emoji = _GW_EMOJI.get(gw, "💳")
-        lines.append(f"*{emoji} {gw}*")
-        for field, vals in fields.items():
-            for v in vals[:3]:
-                lines.append(f"  `{escape_md(field)}`: `{escape_md(str(v)[:70])}`")
-        lines.append("")
-
-    lines += [
-        "━━━━━━━━━━━━━━━━━━",
-        "⚠️ _Frontend/public config only — API secrets မပါပါ_",
-        "⚠️ _Authorized testing only_",
-    ]
-
-    report = "\n".join(lines)
-    await safe_markdown_reply(msg, _truncate_safe_md(report))
-
-    import io as _io
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=_io.BytesIO(json.dumps({
-                "domain": domain, "page_url": page_url,
-                "scanned_at": datetime.now().isoformat(),
-                "js_count": js_count, "deob_count": deob_count,
-                "findings": findings,
-            }, indent=2, ensure_ascii=False).encode()),
-            filename=f"payconfig_{safe_d}_{ts}.json",
-            caption=f"⚙️ Payment Config — `{escape_md(domain)}`",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("payconfig export error: %s", e)
 
 
 # ══════════════════════════════════════════════════
@@ -13877,6 +14010,13 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+        # Deobfuscation pass: decode atob/hex/join/fromCharCode hidden keys
+        _deob = _deobfuscate_text(text)
+        if _deob:
+            for key_type, pat in _PAY_PATTERNS:
+                for m in pat.finditer(_deob):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add(key_type, val.strip(), label + " [deobfuscated]")
 
     # ── 2. Source map texts ──
     for text, label in sourcemap_texts:
@@ -14088,7 +14228,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_paykeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _paykeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
@@ -14250,34 +14390,6 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=kb,
             parse_mode='Markdown'
         )
-
-    # ── Deobfuscation layer — fetched JS ထဲ obfuscated keys ရှာ ─────────────
-    try:
-        texts_for_deob = {}
-        for item in result.get("requests_log", result.get("network_log", [])):
-            ct   = item.get("content_type", "") or ""
-            body = item.get("response_body", "") or item.get("body", "") or ""
-            if ("javascript" in ct or item.get("url","").endswith(".js")) and body:
-                lbl = item.get("url","?").split("/")[-1][:40]
-                texts_for_deob[lbl] = body
-        texts_for_deob["[HTML]"] = result.get("html", "")
-        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
-        high_deob = [f for f in deob_findings
-                     if f["in_secret_context"] and f["entropy"] >= 4.5]
-        if high_deob:
-            deob_lines = [f"🧩 *Deobfuscated Keys — `{escape_md(domain)}`*",
-                          "━━━━━━━━━━━━━━━━━━━━",
-                          f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
-            for i, f in enumerate(high_deob[:8], 1):
-                deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
-                deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
-                deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
-            deob_lines.append("⚠️ _Authorized testing only_")
-            await update.effective_message.reply_text(
-                _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
-    except Exception as deob_err:
-        logger.debug("paykeys deobfuscate layer error: %s", deob_err)
-
 
 # ══════════════════════════════════════════════════
 # 💳  /verifykeys — Payment Key Validator (Read-Only)
@@ -14819,7 +14931,7 @@ async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_socialkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _socialkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -14988,7 +15100,7 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_analytics_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _analytics_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -16894,7 +17006,7 @@ async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_jwtlive_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _jwtlive_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17069,7 +17181,7 @@ async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_pushkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _pushkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17214,7 +17326,7 @@ async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_chatkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _chatkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17399,8 +17511,8 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog_task = asyncio.create_task(_prog_loop())
 
     try:
-        result = await asyncio.to_thread(
-            analyze_app_file, save_path, lambda t: prog_q.append(t)
+        result = await run_scan(
+            uid, analyze_app_file, save_path, lambda t: prog_q.append(t)
         )
     except Exception as e:
         prog_task.cancel()
@@ -17899,7 +18011,11 @@ async def _run_download(
             await update.effective_message.reply_text("🚫 Ban ထားပါတယ်"); return
         if not db["settings"]["bot_enabled"] and uid not in ADMIN_IDS:
             _save_db_sync(db)
-            await update.effective_message.reply_text("🔴 Bot ယာယီပိတ်ထားပါတယ်"); return
+            await update.effective_message.reply_text(
+                "🔴 *Bot ယာယီပိတ်ထားသည်*\nAdmin မှ maintenance လုပ်နေပါသည်",
+                parse_mode='Markdown'
+            )
+            return
         if not resume_mode and not can_download(db, u):
             lim = get_limit(db, u)
             _save_db_sync(db)
@@ -18044,25 +18160,67 @@ async def _run_download(
         await msg.edit_text(f"❌ Upload error: {type(e).__name__}")
 
 
-# ── Command wrappers ──────────────────────────────
+# ══════════════════════════════════════════════════
+# 🛑  GLOBAL STOP / TASK REGISTRY
+# ══════════════════════════════════════════════════
+
+def _register_task(uid: int, task: asyncio.Task) -> None:
+    """Register a running scan task for a user (enables /stop for all commands)."""
+    _user_tasks[uid] = task
+
+def _clear_task(uid: int) -> None:
+    _user_tasks.pop(uid, None)
+
+async def run_scan(uid: int, fn, *args, **kwargs):
+    """
+    Wrapper: run blocking fn(*args) in thread, registered so /stop can cancel it.
+    Also acquires _scan_semaphore (max 5 concurrent scans).
+    Usage:
+        result = await run_scan(uid, _my_sync_func, url, progress_cb)
+    """
+    async with _scan_semaphore:
+        task = asyncio.current_task()
+        _register_task(uid, task)
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            _clear_task(uid)
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stop — Cancel current running download"""
-    uid = update.effective_user.id
+    """/stop — လက်ရှိ run နေသော command မည်သည့်အမျိုးအစားမဆို ရပ်ရန်"""
+    uid   = update.effective_user.id
+    msg   = update.effective_message
+    stopped = []
+
+    # 1. Download cancel flag
     event = _cancel_flags.get(uid)
     if event and not event.is_set():
         event.set()
-        await update.effective_message.reply_text(
-            "🛑 *Download cancel လုပ်နေပါတယ်...*\n"
-            "⚙️ လက်ရှိ page/asset ပြီးရင် ရပ်မယ်",
+        stopped.append("📥 Download")
+
+    # 2. Any active scan task
+    task = _user_tasks.get(uid)
+    if task and not task.done():
+        task.cancel()
+        _clear_task(uid)
+        stopped.append("🔍 Scan")
+
+    if stopped:
+        await msg.reply_text(
+            f"🛑 *Stopped:* {', '.join(stopped)}\n"
+            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ",
             parse_mode='Markdown'
         )
     else:
-        await update.effective_message.reply_text(
-            "ℹ️ Cancel လုပ်စရာ Download မရှိပါ\n"
-            "`/download`, `/fullsite` စသည်ဖြင့် download ကနဦးစပါ",
+        await msg.reply_text(
+            "ℹ️ ရပ်ရမည့် operation မရှိပါ\n"
+            "Command တစ်ခုခု run နေမှ `/stop` သုံးပါ",
             parse_mode='Markdown'
         )
+
+# ── Command wrappers ──────────────────────────────
 
 
 async def cmd_download(u, c):
@@ -18109,42 +18267,67 @@ async def cmd_resume(u, c):
 # ══════════════════════════════════════════════════
 
 async def _send_admin_panel(target, db: dict):
-    bot_on    = db["settings"]["bot_enabled"]
-    today     = str(date.today())
-    tu        = len(db["users"])
-    tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
-    banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
-    today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
+    bot_on      = db["settings"]["bot_enabled"]
+    today       = str(date.today())
+    tu          = len(db["users"])
+    tdl         = sum(u.get("total_downloads", 0) for u in db["users"].values())
+    banned_n    = sum(1 for u in db["users"].values() if u.get("banned"))
+    today_dl    = sum(u["count_today"] for u in db["users"].values() if u.get("last_date") == today)
+    active_scans = sum(1 for t in _user_tasks.values() if t and not t.done())
+    proxy_st    = proxy_manager.stats()
+    proxy_live  = proxy_st.get("live", 0)
+    proxy_total = proxy_st.get("total", 0)
+    limit       = db["settings"]["global_daily_limit"]
+
+    bot_icon  = "🟢" if bot_on  else "🔴"
+    bot_label = "ON"  if bot_on else "OFF"
+    pw_icon   = "✅"  if PLAYWRIGHT_OK else "❌"
+
+    text = (
+        f"👑 *PhantomScope Admin Panel*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{bot_icon} Bot: *{bot_label}* | 🕸️ JS Engine: {pw_icon}\n"
+        f"⚡ Active Scans: `{active_scans}/{MAX_WORKERS}` | Queue cap: `{QUEUE_MAX}`\n\n"
+        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total DL: `{tdl}` | 📅 Today: `{today_dl}`\n"
+        f"🌐 Proxy: `{proxy_live}/{proxy_total}` live | "
+        f"📏 Limit: `{limit}/day`"
+    )
+
     kb = [
         [
-            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
+            InlineKeyboardButton("📊 Stats",      callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
+            InlineKeyboardButton("🌐 Proxy",      callback_data="adm_proxy"),
+        ],
+        [
+            InlineKeyboardButton("📡 Active Scans", callback_data="adm_active"),
+            InlineKeyboardButton("📜 Log",        callback_data="adm_log"),
+        ],
+        [
+            InlineKeyboardButton("📢 Broadcast",  callback_data="adm_broadcast_prompt"),
+            InlineKeyboardButton("🚫 Ban User",   callback_data="adm_ban_prompt"),
+        ],
+        [
             InlineKeyboardButton(
-                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
+                f"{'🔴 Bot OFF' if bot_on else '🟢 Bot ON'}",
                 callback_data="adm_toggle_bot"
             ),
+            InlineKeyboardButton("🛑 Kill All Tasks", callback_data="adm_killall"),
         ],
-        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
-    text = (
-        f"👑 *Admin Panel v17.0*\n\n"
-        f"👥 Users: `{escape_md(tu)}` | 🚫 Banned: `{escape_md(banned_n)}`\n"
-        f"📦 Total: `{escape_md(tdl)}` | Today: `{escape_md(today_dl)}`\n"
-        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
-        f"⚡ Concurrent: `{escape_md(MAX_WORKERS)}` | Limit: `{db['settings']['global_daily_limit']}`\n"
-        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PLAYWRIGHT_OK else '❌'}"
-    )
+
     markup = InlineKeyboardMarkup(kb)
     try:
         if hasattr(target, 'edit_message_text'):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest: pass
+    except BadRequest:
+        pass
 
 @admin_only
 
@@ -20303,7 +20486,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return detected, notable, resp.status_code
 
     try:
-        detected, notable, status = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status = await run_scan(uid, _do_tech_scan)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -20681,7 +20864,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return sources, source_origins, findings
 
     try:
-        sources, source_origins, findings = await asyncio.to_thread(_do_extract)
+        sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
@@ -21076,7 +21259,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        results = await asyncio.to_thread(_bypass_sync, url)
+        results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -21347,7 +21530,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
+        data = await run_scan(uid, _subdomains_sync, raw, progress_q)
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -21764,10 +21951,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _extract_apk_assets_sync, filepath, wanted_cats,
+        result = await run_scan(
+            uid, _extract_apk_assets_sync, filepath, wanted_cats,
             lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -21946,7 +22137,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return {"success": False, "error": str(e)}
 
     try:
-        res = await asyncio.to_thread(_run_antibot)
+        res = await run_scan(uid, _run_antibot)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -22760,6 +22951,38 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_db_sync(db2)
             new_state = db2["settings"]["bot_enabled"]
         await query.answer(f"Bot is now {'🟢 ON' if new_state else '🔴 OFF'}", show_alert=True)
+
+        # ── Bot OFF → cancel ALL active tasks + notify users ─────────────
+        if not new_state:
+            killed = 0
+            for task_uid, task in list(_user_tasks.items()):
+                if task and not task.done():
+                    task.cancel()
+                    killed += 1
+                    try:
+                        await context.bot.send_message(
+                            chat_id=task_uid,
+                            text=(
+                                "🔴 *Bot ကို Admin မှ ပိတ်လိုက်ပါသည်*\n"
+                                "⚙️ လက်ရှိ operation ရပ်သွားပါပြီ\n"
+                                "_Bot ပြန်ဖွင့်မှ သုံးနိုင်မည်_"
+                            ),
+                            parse_mode='Markdown'
+                        )
+                    except Exception:
+                        pass
+            # cancel download flags too
+            for ev_uid, ev in list(_cancel_flags.items()):
+                if ev and not ev.is_set():
+                    ev.set()
+                    killed += 1
+            _user_tasks.clear()
+            if killed:
+                await query.message.reply_text(
+                    f"🛑 Active operations `{killed}` ကို ရပ်လိုက်ပါပြီ",
+                    parse_mode='Markdown'
+                )
+
         async with db_lock:
             db3 = _load_db_sync()
         await _send_admin_panel(query, db3)
@@ -22776,6 +22999,78 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
             "\n".join(lines) if len(lines)>1 else "Empty",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_proxy":
+        st   = proxy_manager.stats()
+        icon = "🟢" if st["enabled"] else "🔴"
+        kb   = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            f"🌐 *Proxy Status*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon} Status  : `{'ENABLED' if st['enabled'] else 'DISABLED'}`\n"
+            f"📋 Total  : `{st['total']}`\n"
+            f"✅ Live   : `{st['live']}`\n"
+            f"⏳ Cooldown: `{st['in_cooldown']}`\n"
+            f"🚀 Free   : `{st['available']}`\n\n"
+            f"Use `/proxy reload` to refresh",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_active":
+        active = [(uid, t) for uid, t in _user_tasks.items() if t and not t.done()]
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        if not active:
+            txt = "📡 *Active Scans*\n━━━━━━━━━━━━━━━━━━━━\n\n✅ ဘာမှ run မနေပါ"
+        else:
+            lines = ["📡 *Active Scans*", "━━━━━━━━━━━━━━━━━━━━", ""]
+            for task_uid, task in active:
+                u_data = db["users"].get(str(task_uid), {})
+                name   = u_data.get("name", f"uid:{task_uid}")
+                lines.append(f"🔄 `{escape_md(name)}` (`{task_uid}`)")
+            lines.append(f"\n🔢 Total: `{len(active)}/{MAX_WORKERS}`")
+            txt = "\n".join(lines)
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == "adm_killall":
+        killed = 0
+        for task_uid, task in list(_user_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+                killed += 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=task_uid,
+                        text="🛑 *Admin မှ operation ရပ်လိုက်ပါသည်*",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+        for ev_uid, ev in list(_cancel_flags.items()):
+            if ev and not ev.is_set():
+                ev.set()
+                killed += 1
+        _user_tasks.clear()
+        await query.answer(f"🛑 {killed} tasks killed", show_alert=True)
+        async with db_lock:
+            db_r = _load_db_sync()
+        await _send_admin_panel(query, db_r)
+
+    elif data == "adm_broadcast_prompt":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            "📢 *Broadcast*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Command ကိုသုံးပါ:\n`/broadcast <message>`",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_ban_prompt":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            "🚫 *Ban User*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Command ကိုသုံးပါ:\n`/ban <user_id>`\n`/unban <user_id>`\n\n"
+            "User ID ကြည့်ရန်:\n`/allusers` သို့မဟုတ် `/userinfo <id>`",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
@@ -23453,6 +23748,120 @@ def _is_obfuscated(js_text: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 🧩  SHARED DE-OBFUSCATION LAYER
+# Used by keydump, paykeys, sitekey, firebase as a corpus pre-processor.
+# Call: extra = _deobfuscate_text(js_text) → append to scan corpus.
+# ═══════════════════════════════════════════════════════════════
+
+def _deobfuscate_text(text: str) -> str:
+    """
+    Decode common JS obfuscation patterns and return decoded strings
+    as a single block to append to any scan corpus.
+
+    Patterns handled:
+      1. atob("...") / Buffer.from("...","base64")
+      2. Hex escape sequences  "\\x73\\x6b..."
+      3. Unicode escapes       "\\u0073\\u006b..."
+      4. Array join tricks     ["sk","_live","_xx"].join("")
+      5. String.fromCharCode(115,107,95,...)
+      6. Simple string concat  "sk" + "_live" + "_secret_xxx"
+      7. Hex string → printable ASCII  (32-char raw hex values)
+    """
+    import base64 as _b64
+    decoded_parts: list = []
+
+    # ── 1. Base64 atob() / Buffer.from(...,"base64") ──────────────
+    for m in re.finditer(
+        r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']'
+        r'(?:\s*,\s*["\']base64["\'])?\s*\)',
+        text
+    ):
+        raw = m.group(1)
+        try:
+            decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
+            if len(decoded) >= 8 and decoded.isprintable():
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 2. Hex escape  \x73\x6b\x5f... ───────────────────────────
+    for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){5,})"', text):
+        raw = m.group(1)
+        try:
+            decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                              lambda hm: chr(int(hm.group(1), 16)), raw)
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 3. Unicode escape  \u0073\u006b... ───────────────────────
+    for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){4,})"', text):
+        raw = m.group(1)
+        try:
+            decoded = raw.encode("utf-8").decode("unicode_escape")
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 4. Array join trick  ["sk","_live","_xx"].join("") ────────
+    for m in re.finditer(
+        r'\[([^\]]{8,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
+    ):
+        raw = m.group(1)
+        try:
+            parts  = re.findall(r'["\']([^"\']*)["\']', raw)
+            joined = "".join(parts)
+            if len(joined) >= 8:
+                decoded_parts.append(joined)
+        except Exception:
+            pass
+
+    # ── 5. String.fromCharCode(115,107,95,...) ────────────────────
+    for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{8,300})\)', text):
+        raw = m.group(1)
+        try:
+            codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
+            decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 6. String concatenation  "sk" + "_live" + "_secret_xxx" ──
+    for m in re.finditer(
+        r'(?:=|:|\()\s*["\']([A-Za-z0-9_\-]{2,30})["\']'
+        r'(?:\s*\+\s*["\']([^"\']{1,50})["\'])+',
+        text
+    ):
+        try:
+            all_parts = re.findall(r'["\']([^"\']*)["\']', m.group(0))
+            joined    = "".join(all_parts)
+            if len(joined) >= 10:
+                decoded_parts.append(joined)
+        except Exception:
+            pass
+
+    # ── 7. Raw hex string → printable ASCII ───────────────────────
+    for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
+        raw = m.group(1)
+        if len(raw) % 2 != 0:
+            continue
+        try:
+            decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
+            if (decoded.isprintable() and len(decoded) >= 12
+                    and re.search(r'(?i)(key|secret|token|api|auth|pass|sk_|pk_)', decoded)):
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    if not decoded_parts:
+        return ""
+    return "\n// [DEOBFUSCATED]\n" + "\n".join(decoded_parts)
+
+
+# ═══════════════════════════════════════════════════════════════
 
 def _entropy(s: str) -> float:
     """Calculate Shannon entropy of a string."""
@@ -24124,6 +24533,18 @@ def _run_keydump_sync(url: str) -> dict:
 
     _kd_pattern_scan(corpus)  # main corpus
 
+    # ── 2b. Deobfuscation pass — decode atob/hex/unicode/join/fromCharCode ────
+    _deob_hits = 0
+    for _js_text in ([data["html"]] + [_js for _, _js in data["js_sources"]] + inline_scripts):
+        if len(_js_text) < 50:
+            continue
+        _extra = _deobfuscate_text(_js_text)
+        if _extra:
+            _deob_hits += 1
+            _kd_pattern_scan(_extra, "[deobfuscated]")
+    if _deob_hits:
+        out["deobfuscated_files"] = _deob_hits
+
     # ── 3. High-entropy — threshold 4.2 (was 4.5) ────────────────────────────
     # Lowering from 4.5 → 4.2 catches more real secrets (AWS, GCP tokens,
     # random API keys) while hex-32/hex-64 patterns add structural coverage.
@@ -24622,7 +25043,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await asyncio.to_thread(_run_keydump_sync, url)
+        result = await run_scan(uid, _run_keydump_sync, url)
     except Exception as e:
         await msg.edit_text(
             f"❌ *KeyDump Error*\n`{type(e).__name__}: {str(e)[:100]}`",
@@ -24653,36 +25074,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             _truncate_safe_md(report), parse_mode="Markdown")
 
-    # ── Deobfuscation layer — keydump JS ထဲ obfuscated secrets ရှာ ──────────
-    try:
-        texts_for_deob = {}
-        for item in result.get("network_log", []):
-            ct   = item.get("content_type", "") or ""
-            body = item.get("response_body", "") or item.get("body", "") or ""
-            if ("javascript" in ct or item.get("url","").endswith(".js")) and body:
-                lbl = item.get("url","?").split("/")[-1][:40]
-                texts_for_deob[lbl] = body
-        texts_for_deob["[HTML]"] = result.get("html", "")
-        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
-        # Only report HIGH risk — in_secret_context + entropy >= 4.5
-        high_deob = [f for f in deob_findings
-                     if f["in_secret_context"] and f["entropy"] >= 4.5]
-        if high_deob:
-            deob_lines = [f"🧩 *Deobfuscated Secrets — `{escape_md(domain)}`*",
-                          "━━━━━━━━━━━━━━━━━━━━",
-                          f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
-            for i, f in enumerate(high_deob[:10], 1):
-                deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
-                deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
-                deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
-            deob_lines.append("⚠️ _Authorized testing only_")
-            await update.effective_message.reply_text(
-                _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
-    except Exception as deob_err:
-        logger.debug("keydump deobfuscate layer error: %s", deob_err)
 
-
-# ဒီနေရာမှာ Function Name ကို အသစ်ပြန်ထည့်ပေးလိုက်ပါ
 async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /keydump inline buttons: raw, entropy, json export"""
     query = update.callback_query
@@ -24690,12 +25082,12 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     except Exception:
         pass
-    data = query.data
-    # kd_raw_UID | kd_entropy_UID | kd_json_UID
+    data = query.data   # kd_raw_UID | kd_entropy_UID | kd_json_UID
+
     try:
-        parts = data.split("_")
-        action = parts[1]  # raw / entropy / json
-        uid = int(parts[2])
+        parts  = data.split("_")
+        action = parts[1]                    # raw / entropy / json
+        uid    = int(parts[2])
     except Exception:
         return
 
@@ -25223,7 +25615,7 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = asyncio.create_task(_prog())
 
     try:
-        result = await asyncio.to_thread(_webhooks_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _webhooks_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -25447,7 +25839,7 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_vuln_scan_sync, url, progress_q)
+        result = await run_scan(uid, _vuln_scan_sync, url, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Scan error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -25499,7 +25891,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -25582,7 +25974,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        found, baseline = await asyncio.to_thread(_fuzz_sync, url, mode, progress_q)
+        found, baseline = await run_scan(uid, _fuzz_sync, url, mode, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -25656,7 +26048,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 words = ["api", "admin", "login", "user", "config", "static", "assets"]
             progress_q.append(f"🧠 Wordlist built: `{len(words)}` words — probing...")
             return _smartfuzz_probe_sync(url, words, lambda t: progress_q.append(t))
-        found = await asyncio.to_thread(_run)
+        found = await run_scan(uid, _run)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -25716,7 +26108,7 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp_atk   = _jwt_exp_forgery(token)
         return decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk
     try:
-        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await asyncio.to_thread(_run)
+        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await run_scan(uid, _run)
     except Exception as e:
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -25782,7 +26174,7 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_hiddenkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _hiddenkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -25897,7 +26289,7 @@ async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -25967,7 +26359,7 @@ async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_oauthscan_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _oauthscan_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -26258,8 +26650,9 @@ def main():
     )
 
     # ── Init asyncio primitives (event loop must be running) ─
-    global download_semaphore, db_lock, _dl_queue
+    global download_semaphore, db_lock, _dl_queue, _scan_semaphore
     download_semaphore = asyncio.Semaphore(MAX_WORKERS)
+    _scan_semaphore    = asyncio.Semaphore(MAX_WORKERS)   # 5 concurrent scans
     db_lock            = asyncio.Lock()
     _dl_queue          = asyncio.Queue(maxsize=QUEUE_MAX)
 
@@ -26297,8 +26690,8 @@ def main():
     app.add_handler(CommandHandler("firecheck",       cmd_firecheck))
     app.add_handler(CommandHandler("entropy",         cmd_entropy))
     app.add_handler(CommandHandler("deobfuscate",     cmd_deobfuscate))
-    app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
     app.add_handler(CommandHandler("payconfig",       cmd_payconfig))
+    app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
     app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
@@ -26382,7 +26775,7 @@ def main():
                     BotCommand("jsdownload",  "JS/React/Vue site download"),
                     BotCommand("jsfullsite",  "JS + Full crawl"),
                     BotCommand("resume",      "Download ဆက်လုပ်ရန်"),
-                    BotCommand("stop",        "Download ရပ်ရန်"),
+                    BotCommand("stop",        "လက်ရှိ operation အကုန် ရပ်ရန်"),
                     BotCommand("vuln",        "Security vulnerability scan"),
                     BotCommand("api",         "API endpoint discovery"),
                     BotCommand("tech",        "Tech stack fingerprint"),
@@ -26396,8 +26789,8 @@ def main():
                     BotCommand("firecheck",   "Firebase misconfig scanner"),
                     BotCommand("entropy",     "High entropy secret hunter"),
                     BotCommand("deobfuscate", "JS secret de-obfuscator"),
+                    BotCommand("payconfig",   "Payment config auditor"),
                     BotCommand("paykeys",     "Payment key extractor"),
-                    BotCommand("payconfig",   "Payment SDK public config extractor"),
                     BotCommand("verifykeys",  "Payment key validator (read-only)"),
                     BotCommand("socialkeys",  "OAuth / social key extractor"),
                     BotCommand("analytics",   "Analytics ID extractor"),
@@ -26412,6 +26805,10 @@ def main():
                     BotCommand("smartfuzz",   "Context-aware smart fuzzer"),
                     BotCommand("monitor",     "Page change alert monitor"),
                     BotCommand("appassets",   "Web app asset analyzer"),
+                    BotCommand("kdexport",    "Keydump JSON export"),
+                    BotCommand("jwtlive",     "JWT live network interceptor"),
+                    BotCommand("chatkeys",    "Chat/messaging key extractor"),
+                    BotCommand("stop",        "လက်ရှိ operation ရပ်ရန်"),
                     BotCommand("status",      "Daily usage & limit"),
                     BotCommand("history",     "Download history"),
                     BotCommand("mystats",     "Detailed statistics"),
@@ -26427,6 +26824,7 @@ def main():
                     BotCommand("setpages",    "Set max pages"),
                     BotCommand("setassets",   "Set max assets"),
                     BotCommand("proxy",       "Proxy pool status"),
+                    BotCommand("setproxy",    "Set proxy (url/file/off)"),
                     BotCommand("setforcejoin","Set force join channel"),
                 ]
                 try:
