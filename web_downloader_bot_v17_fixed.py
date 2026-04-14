@@ -8920,23 +8920,36 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                         const h = (req instanceof Request) ? req.headers : new Headers(opts.headers || {});
                         h.forEach((v, k) => { headers[k.toLowerCase()] = v; });
                     } catch(e) {}
-                    const bodySnip = typeof opts.body === 'string' ? opts.body.slice(0,1000) :
-                                     (opts.body instanceof URLSearchParams ? opts.body.toString().slice(0,1000) : '');
+                    const bodySnip = typeof opts.body === 'string' ? opts.body.slice(0,2000) :
+                                     (opts.body instanceof URLSearchParams ? opts.body.toString().slice(0,2000) : '');
                     _log({type:'fetch', url, method, headers, body: bodySnip, ts: Date.now()});
 
                     const resp = await _origFetch.apply(this, args);
-                    // BUG FIX 2: store body synchronously in __responseLog to avoid
-                    // async .then() race condition — read after networkidle wait
+                    // FIX: Use clone() + tee pattern to avoid async race.
+                    // Store result ID so Playwright-level merge can match it.
                     try {
                         const ct = resp.headers.get('content-type') || '';
-                        if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                        const _CAPTURABLE = ['json','text','javascript','xml','html',
+                                             'form','graphql','plain','csv','yaml'];
+                        if (_CAPTURABLE.some(t => ct.includes(t)) || resp.status < 400) {
                             const clone = resp.clone();
-                            clone.text().then(t => {
-                                window.__streamLog.push({
-                                    type:'fetch_response', url,
-                                    status: resp.status, content_type: ct,
-                                    body: t.slice(0, 4000), ts: Date.now()
-                                });
+                            // Use Promise.race with 5s timeout to avoid hanging
+                            const bodyP = clone.text();
+                            const timeoutP = new Promise(r => setTimeout(() => r('__timeout__'), 5000));
+                            Promise.race([bodyP, timeoutP]).then(t => {
+                                if (t !== '__timeout__') {
+                                    window.__streamLog.push({
+                                        type: 'fetch_response', url,
+                                        status: resp.status,
+                                        content_type: ct,
+                                        resp_headers: (() => {
+                                            const h = {};
+                                            try { resp.headers.forEach((v,k) => h[k.toLowerCase()]=v); } catch(e){}
+                                            return h;
+                                        })(),
+                                        body: t.slice(0, 8000), ts: Date.now()
+                                    });
+                                }
                             }).catch(()=>{});
                         }
                     } catch(e) {}
@@ -8959,14 +8972,35 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     xhr.send = function(body) {
                         _log({type:'xhr', url: meta.url, method: meta.method,
                               headers: meta.headers,
-                              body: (typeof body === 'string' ? body.slice(0,1000) : ''),
+                              body: (typeof body === 'string' ? body.slice(0,2000) : ''),
                               ts: Date.now()});
+                        const _XHR_CAPTURABLE = ['json','text','javascript','xml','html',
+                                                 'form','graphql','plain','csv','yaml'];
+                        // Primary: load event
                         xhr.addEventListener('load', function() {
                             const ct = xhr.getResponseHeader('content-type') || '';
-                            if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                            // Capture all response headers
+                            const respHdrs = {};
+                            try {
+                                const raw = xhr.getAllResponseHeaders() || '';
+                                raw.trim().split(/[\r\n]+/).forEach(line => {
+                                    const parts = line.split(/:\s*/);
+                                    if (parts[0]) respHdrs[parts[0].toLowerCase()] = parts.slice(1).join(': ');
+                                });
+                            } catch(e) {}
+                            if (_XHR_CAPTURABLE.some(t => ct.includes(t)) || xhr.status < 400) {
                                 _log({type:'xhr_response', url: meta.url, status: xhr.status,
-                                      content_type: ct, body: xhr.responseText.slice(0,4000),
+                                      content_type: ct, resp_headers: respHdrs,
+                                      body: (xhr.responseText || '').slice(0,8000),
                                       ts: Date.now()});
+                            }
+                        });
+                        // Backup: readystatechange (catches early abort/error)
+                        xhr.addEventListener('readystatechange', function() {
+                            if (xhr.readyState === 4 && xhr.status === 0 && xhr.responseText) {
+                                _log({type:'xhr_response', url: meta.url, status: 0,
+                                      content_type: '', resp_headers: {},
+                                      body: xhr.responseText.slice(0,8000), ts: Date.now()});
                             }
                         });
                         return _origXHR.prototype.send.apply(xhr, [body]);
@@ -8982,9 +9016,21 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     window.EventSource = function(url, opts) {
                         const es = new _origES(url, opts);
                         _log({type:'sse_open', url, ts: Date.now()});
+                        // Capture default message events
                         es.addEventListener('message', function(e) {
-                            _log({type:'sse_message', url,
-                                  data: String(e.data).slice(0,2000), ts: Date.now()});
+                            _log({type:'sse_message', url, event: 'message',
+                                  data: String(e.data).slice(0,4000),
+                                  lastEventId: e.lastEventId || '',
+                                  ts: Date.now()});
+                        });
+                        // Capture named event types (error, open, custom)
+                        ['error', 'open', 'data', 'update', 'result',
+                         'delta', 'completion', 'chunk', 'token'].forEach(evtType => {
+                            es.addEventListener(evtType, function(e) {
+                                _log({type:'sse_message', url, event: evtType,
+                                      data: String(e.data || '').slice(0,4000),
+                                      ts: Date.now()});
+                            });
                         });
                         return es;
                     };
@@ -9005,8 +9051,16 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             # ── BUG FIX 3: Playwright-level response body capture ─────────────
             # JS hook can miss responses due to async race; Playwright-level
             # capture is synchronous and reliable — used as primary source.
-            _plw_request_headers = {}
-            _plw_response_bodies = {}   # url → body text
+            _plw_request_headers  = {}
+            _plw_response_bodies  = {}   # url → body text
+            _plw_response_meta    = {}   # url → {status, headers, content_type}
+
+            # Expanded: JSON, XML, HTML, GraphQL, form, plain, CSV, YAML, JS bundles
+            _CAPTURE_CT = (
+                "json", "javascript", "text", "html", "xml",
+                "form", "graphql", "plain", "x-www-form-urlencoded",
+                "csv", "yaml", "toml",
+            )
 
             def _on_request_headers(req):
                 try:
@@ -9018,10 +9072,17 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             def _on_response(resp):
                 try:
                     ct = (resp.headers.get("content-type") or "").lower()
-                    if any(x in ct for x in ("json", "text", "javascript")):
-                        body = resp.body()          # synchronous bytes
-                        text = body.decode("utf-8", errors="replace")[:4000]
+                    st = resp.status
+                    # Capture matching content-type OR any 2xx/3xx API response
+                    if any(x in ct for x in _CAPTURE_CT) or (200 <= st < 400 and ct):
+                        body = resp.body()
+                        text = body.decode("utf-8", errors="replace")[:8000]
                         _plw_response_bodies[resp.url] = text
+                        _plw_response_meta[resp.url] = {
+                            "status":       st,
+                            "content_type": ct,
+                            "headers":      {k.lower(): v for k, v in resp.headers.items()},
+                        }
                 except Exception:
                     pass
 
@@ -9030,11 +9091,24 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             def _on_websocket(ws):
                 ws_url = ws.url
                 def _on_frame_sent(payload):
-                    _ws_frames.append({"dir": "sent", "url": ws_url,
-                                       "payload": str(payload)[:2000]})
+                    # Handle binary (bytes) and text payloads
+                    if isinstance(payload, (bytes, bytearray)):
+                        try:
+                            text = payload.decode("utf-8", errors="replace")[:4000]
+                        except Exception:
+                            text = repr(payload[:200])
+                    else:
+                        text = str(payload)[:4000]
+                    _ws_frames.append({"dir": "sent", "url": ws_url, "payload": text})
                 def _on_frame_recv(payload):
-                    _ws_frames.append({"dir": "recv", "url": ws_url,
-                                       "payload": str(payload)[:2000]})
+                    if isinstance(payload, (bytes, bytearray)):
+                        try:
+                            text = payload.decode("utf-8", errors="replace")[:4000]
+                        except Exception:
+                            text = repr(payload[:200])
+                    else:
+                        text = str(payload)[:4000]
+                    _ws_frames.append({"dir": "recv", "url": ws_url, "payload": text})
                 ws.on("framesent",    _on_frame_sent)
                 ws.on("framereceived", _on_frame_recv)
 
@@ -9124,9 +9198,17 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
         js_seen_urls = {e.get("url","") for e in raw_log}
         for u, body in _plw_response_bodies.items():
             if u not in js_seen_urls and body:
-                raw_log.append({"type": "fetch_response", "url": u,
-                                 "body": body, "headers": _plw_request_headers.get(u, {}),
-                                 "status": 200, "source": "playwright_level"})
+                meta = _plw_response_meta.get(u, {})
+                raw_log.append({
+                    "type":         "fetch_response",
+                    "url":          u,
+                    "body":         body,
+                    "headers":      _plw_request_headers.get(u, {}),
+                    "resp_headers": meta.get("headers", {}),
+                    "status":       meta.get("status", 200),
+                    "content_type": meta.get("content_type", ""),
+                    "source":       "playwright_level",
+                })
 
         # ── Separate SSE frames ────────────────────────────────────────────
         for entry in raw_log:
