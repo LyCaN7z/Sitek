@@ -8012,7 +8012,6 @@ def _get_solver_params(f: dict) -> dict:
     return {"2captcha": p2c, "anticaptcha": pac, "capsolver": pcs, "ezcaptcha": pez}
 
 
-@user_guard
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
     if not await check_force_join(update, context):
@@ -14703,7 +14702,6 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     }
 
 
-@user_guard
 async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/paykeys <url> — Extract payment keys from all major gateways"""
     if not await check_force_join(update, context): return
@@ -27677,7 +27675,7 @@ async def cmd_allusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 *All Users ({len(users)}):*\n"]
     for uid_str, u in users[:50]:
         icon = "🚫" if u.get("banned") else "✅"
-        lines.append(f"{icon} `{escape_md(uid_str)}` — {escape_md(str(u.get('name','?')))} | {u.get('total_downloads',0)} DL")
+        lines.append(f"{icon} `{escape_md(uid_str)}` — {u.get('name','?')} | {u.get('total_downloads',0)} DL")
     if len(users) > 50:
         lines.append(f"\n_…and {len(users)-50} more_")
     await safe_markdown_reply(update.effective_message, _truncate_safe_md("\n".join(lines)))
