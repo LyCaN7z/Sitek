@@ -62,13 +62,13 @@ APP_ANALYZE_DIR = os.path.expanduser("~/downloads/app_analysis")
 APP_MAX_MB      = int(os.getenv("APP_MAX_MB", "150"))   # max upload size
 
 DAILY_LIMIT      = int(os.getenv("DAILY_LIMIT", "5"))
-MAX_WORKERS      = 5
+MAX_WORKERS      = 50
 MAX_PAGES        = 50
 MAX_ASSETS       = 500
 TIMEOUT          = 20
 SPLIT_MB         = 45
 MAX_ASSET_MB     = 100          # single asset max size
-RATE_LIMIT_SEC   = 15           # per-user cooldown between requests
+RATE_LIMIT_SEC   = 5           # per-user cooldown between requests
 
 # ── Proxy config ────────────────────────────────────
 PROXY_FILE        = os.getenv("PROXY_FILE",
@@ -99,7 +99,7 @@ logger.addHandler(_file_handler)
 download_semaphore: asyncio.Semaphore  # initialized in main()
 
 # ── Queue system ──────────────────────────────────
-QUEUE_MAX     = 20                    # max queue depth
+QUEUE_MAX     = 100                    # max queue depth
 _dl_queue: asyncio.Queue | None = None  # initialized in main()
 _queue_pos: dict = {}                 # {uid: position}
 
@@ -112,100 +112,6 @@ user_last_req    = {}                      # rate limit tracker {uid: timestamp}
 _cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal (downloads)
 _user_tasks: dict   = {}                   # {uid: asyncio.Task}  — any running scan task
 _scan_semaphore: asyncio.Semaphore         # initialized in main() — max 5 concurrent scans
-
-# ══════════════════════════════════════════════════
-# 🛠️  ADMIN ENHANCEMENT — Feature Toggle + Maintenance + Active Users
-# ══════════════════════════════════════════════════
-
-# ── Maintenance Mode ──────────────────────────────
-_maintenance_mode: bool = False            # True ဆိုရင် admin မှလွဲပြီး ဘယ် user မှ command သုံးမရ
-
-# ── Active Users Tracking ─────────────────────────
-_active_users: dict = {}                   # {uid: {"username": str, "command": str, "started": float}}
-
-def track_active_user(uid: int, username: str, command: str):
-    """User command စတင်တဲ့အခါ track လုပ်"""
-    _active_users[uid] = {
-        "username": username or str(uid),
-        "command": command,
-        "started": time.time()
-    }
-
-def untrack_active_user(uid: int):
-    """User command ပြီးဆုံးတဲ့အခါ remove"""
-    _active_users.pop(uid, None)
-
-def get_active_users_count() -> int:
-    return len(_active_users)
-
-def get_active_users_list() -> list:
-    now = time.time()
-    result = []
-    for uid, info in _active_users.items():
-        elapsed = int(now - info["started"])
-        result.append({
-            "uid": uid,
-            "username": info["username"],
-            "command": info["command"],
-            "elapsed_sec": elapsed
-        })
-    return sorted(result, key=lambda x: x["elapsed_sec"])
-
-# ── Feature Toggle ────────────────────────────────
-# False ထားလိုက်ရင် ထို command ကို ဘယ် user မှ သုံးမရ
-_feature_flags: dict = {
-    "download":     True,
-    "fullsite":     True,
-    "jsdownload":   True,
-    "jsfullsite":   True,
-    "vuln":         True,
-    "api":          True,
-    "tech":         True,
-    "extract":      True,
-    "sitekey":      True,
-    "antibot":      True,
-    "jwtattack":    True,
-    "keydump":      True,
-    "apikeys":      True,
-    "firebase":     True,
-    "firecheck":    True,
-    "entropy":      True,
-    "deobfuscate":  True,
-    "payconfig":    True,
-    "paykeys":      True,
-    "verifykeys":   True,
-    "socialkeys":   True,
-    "analytics":    True,
-    "hiddenkeys":   True,
-    "pushkeys":     True,
-    "endpoints":    True,
-    "webhooks":     True,
-    "oauthscan":    True,
-    "subdomains":   True,
-    "bypass403":    True,
-    "fuzz":         True,
-    "smartfuzz":    True,
-    "monitor":      True,
-    "appassets":    True,
-    "resume":       True,
-    "jwtlive":      True,
-    "chatkeys":     True,
-}
-
-def is_feature_enabled(feature: str) -> bool:
-    return _feature_flags.get(feature, True)
-
-def check_maintenance(uid: int) -> bool:
-    """Maintenance mode ဆိုရင် admin မဟုတ်သောသူတွေကို block"""
-    if _maintenance_mode and uid not in ADMIN_IDS:
-        return False
-    return True
-
-def check_feature(feature: str, uid: int) -> bool:
-    """Feature disabled ဆိုရင် False return"""
-    if uid in ADMIN_IDS:
-        return True   # admin တွေကို feature toggle မသက်ရောက်
-    return _feature_flags.get(feature, True)
 
 HEADERS = {
     'User-Agent': (
@@ -630,11 +536,7 @@ async def safe_markdown_send(bot_or_ctx, chat_id: int, text: str, **kwargs):
 def check_rate_limit(user_id: int) -> tuple:
     """
     Returns: (allowed: bool, wait_seconds: int)
-    -1 = maintenance mode block
     """
-    # ── Maintenance mode check ────────────────────────
-    if _maintenance_mode and user_id not in ADMIN_IDS:
-        return False, -1
     now  = time.time()
     last = user_last_req.get(user_id, 0)
     diff = now - last
@@ -3105,19 +3007,9 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "tech")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -3495,19 +3387,9 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "extract")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -3986,22 +3868,9 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "bypass403")
-
-    if not check_feature("bypass403", uid):
-        await update.effective_message.reply_text("🔌 `/bypass403` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -4252,22 +4121,9 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "subdomains")
-
-    if not check_feature("subdomains", uid):
-        await update.effective_message.reply_text("🔌 `/subdomains` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     raw = context.args[0].strip().replace("https://","").replace("http://","").split("/")[0].lower()
@@ -4627,13 +4483,6 @@ def _extract_apk_assets_sync(filepath: str, wanted_cats: set, progress_cb=None) 
 async def cmd_appassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/appassets — Extract specific asset types from uploaded APK/IPA/ZIP"""
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "appassets")
-
-    if not check_feature("appassets", uid):
-        await update.effective_message.reply_text("🔌 `/appassets` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
 
     # Force join check
     if not await check_force_join(update, context):
@@ -4641,13 +4490,7 @@ async def cmd_appassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     # Check if user has a recently uploaded file
@@ -4837,19 +4680,9 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "antibot")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -8039,17 +7872,9 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # Register task so /stop can cancel this function
-    _register_task(uid, asyncio.current_task())
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -11288,22 +11113,9 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "apikeys")
-
-    if not check_feature("apikeys", uid):
-        await update.effective_message.reply_text("🔌 `/apikeys` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -11523,22 +11335,9 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "firebase")
-
-    if not check_feature("firebase", uid):
-        await update.effective_message.reply_text("🔌 `/firebase` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -11738,21 +11537,9 @@ async def cmd_firecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # Register task so /stop can cancel this function
-    _register_task(uid, asyncio.current_task())
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "firecheck")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     project_id = context.args[0].strip().lower()
@@ -12281,19 +12068,9 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "payconfig")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -12590,19 +12367,9 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "entropy")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -12898,22 +12665,9 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "deobfuscate")
-
-    if not check_feature("deobfuscate", uid):
-        await update.effective_message.reply_text("🔌 `/deobfuscate` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -14727,19 +14481,9 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "paykeys")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -15311,21 +15055,9 @@ async def cmd_verifykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # Register task so /stop can cancel this function
-    _register_task(uid, asyncio.current_task())
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "verifykeys")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     args = list(context.args)
@@ -15496,22 +15228,9 @@ async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "socialkeys")
-
-    if not check_feature("socialkeys", uid):
-        await update.effective_message.reply_text("🔌 `/socialkeys` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -15678,22 +15397,9 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "analytics")
-
-    if not check_feature("analytics", uid):
-        await update.effective_message.reply_text("🔌 `/analytics` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -17597,22 +17303,9 @@ async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "jwtlive")
-
-    if not check_feature("jwtlive", uid):
-        await update.effective_message.reply_text("🔌 `/jwtlive` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -17785,22 +17478,9 @@ async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "pushkeys")
-
-    if not check_feature("pushkeys", uid):
-        await update.effective_message.reply_text("🔌 `/pushkeys` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -17943,22 +17623,9 @@ async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "chatkeys")
-
-    if not check_feature("chatkeys", uid):
-        await update.effective_message.reply_text("🔌 `/chatkeys` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith("http"): url = "https://" + url
@@ -18828,25 +18495,18 @@ async def run_scan(uid: int, fn, *args, **kwargs):
     """
     Wrapper: run blocking fn(*args) in thread, registered so /stop can cancel it.
     Also acquires _scan_semaphore (max 5 concurrent scans).
-    /stop နှိပ်ရင် cancel_event set ဖြစ်ပြီး task cancel ဖြစ်မယ်
     Usage:
         result = await run_scan(uid, _my_sync_func, url, progress_cb)
     """
-    # ── Create cancel event for this scan ────────────
-    cancel_event = asyncio.Event()
-    _cancel_flags[uid] = cancel_event
-
     async with _scan_semaphore:
         task = asyncio.current_task()
         _register_task(uid, task)
         try:
             return await asyncio.to_thread(fn, *args, **kwargs)
         except asyncio.CancelledError:
-            untrack_active_user(uid)
             raise
         finally:
             _clear_task(uid)
-            _cancel_flags.pop(uid, None)
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/stop — လက်ရှိ run နေသော command မည်သည့်အမျိုးအစားမဆို ရပ်ရန်"""
@@ -18866,9 +18526,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task.cancel()
         _clear_task(uid)
         stopped.append("🔍 Scan")
-
-    # 3. Untrack active user
-    untrack_active_user(uid)
 
     if stopped:
         await msg.reply_text(
@@ -18942,12 +18599,6 @@ async def _send_admin_panel(target, db: dict):
     proxy_total = proxy_st.get("total", 0)
     limit       = db["settings"]["global_daily_limit"]
 
-    # ── New: Active users + Maintenance + Feature counts ──
-    active_users_now  = get_active_users_count()
-    maint_icon        = "🔧" if _maintenance_mode else "✅"
-    maint_label       = "ON (Maintenance)" if _maintenance_mode else "OFF"
-    disabled_features = sum(1 for v in _feature_flags.values() if not v)
-
     bot_icon  = "🟢" if bot_on  else "🔴"
     bot_label = "ON"  if bot_on else "OFF"
     pw_icon   = "✅"  if PLAYWRIGHT_OK else "❌"
@@ -18956,32 +18607,29 @@ async def _send_admin_panel(target, db: dict):
         f"👑 *PhantomScope Admin Panel*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"{bot_icon} Bot: *{bot_label}* | 🕸️ JS Engine: {pw_icon}\n"
-        f"{maint_icon} Maintenance: *{maint_label}*\n"
-        f"⚡ Active Scans: `{active_scans}/{MAX_WORKERS}` | Queue cap: `{QUEUE_MAX}`\n"
-        f"👤 Active Users Now: `{active_users_now}`\n\n"
-        f"👥 Total Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"⚡ Active Scans: `{active_scans}/{MAX_WORKERS}` | Queue cap: `{QUEUE_MAX}`\n\n"
+        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
         f"📦 Total DL: `{tdl}` | 📅 Today: `{today_dl}`\n"
         f"🌐 Proxy: `{proxy_live}/{proxy_total}` live | "
-        f"📏 Limit: `{limit}/day`\n"
-        f"🔧 Disabled Features: `{disabled_features}/{len(_feature_flags)}`"
+        f"📏 Limit: `{limit}/day`"
     )
 
     kb = [
         [
-            InlineKeyboardButton("👥 Users",        callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",         callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
+            InlineKeyboardButton("📊 Stats",      callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings",     callback_data="adm_settings"),
-            InlineKeyboardButton("🌐 Proxy",         callback_data="adm_proxy"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
+            InlineKeyboardButton("🌐 Proxy",      callback_data="adm_proxy"),
         ],
         [
-            InlineKeyboardButton("📡 Active Scans",  callback_data="adm_active"),
-            InlineKeyboardButton("📜 Log",           callback_data="adm_log"),
+            InlineKeyboardButton("📡 Active Scans", callback_data="adm_active"),
+            InlineKeyboardButton("📜 Log",        callback_data="adm_log"),
         ],
         [
-            InlineKeyboardButton("📢 Broadcast",     callback_data="adm_broadcast_prompt"),
-            InlineKeyboardButton("🚫 Ban User",      callback_data="adm_ban_prompt"),
+            InlineKeyboardButton("📢 Broadcast",  callback_data="adm_broadcast_prompt"),
+            InlineKeyboardButton("🚫 Ban User",   callback_data="adm_ban_prompt"),
         ],
         [
             InlineKeyboardButton(
@@ -18989,17 +18637,6 @@ async def _send_admin_panel(target, db: dict):
                 callback_data="adm_toggle_bot"
             ),
             InlineKeyboardButton("🛑 Kill All Tasks", callback_data="adm_killall"),
-        ],
-        # ── New Buttons ──────────────────────────────────
-        [
-            InlineKeyboardButton(
-                f"{'🔧 Maintenance ON' if not _maintenance_mode else '✅ Maintenance OFF'}",
-                callback_data="adm_toggle_maintenance"
-            ),
-        ],
-        [
-            InlineKeyboardButton("🔌 Feature Toggle",  callback_data="adm_features"),
-            InlineKeyboardButton("👤 Active Users",    callback_data="adm_activeusers"),
         ],
     ]
 
@@ -21130,18 +20767,9 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    if not check_feature("tech", uid):
-        await update.effective_message.reply_text("🔌 `/tech` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -21447,13 +21075,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -21932,18 +21554,9 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    if not check_feature("bypass403", uid):
-        await update.effective_message.reply_text("🔌 `/bypass403` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -22194,18 +21807,9 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    if not check_feature("subdomains", uid):
-        await update.effective_message.reply_text("🔌 `/subdomains` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     raw = context.args[0].strip().replace("https://","").replace("http://","").split("/")[0].lower()
@@ -22565,9 +22169,6 @@ def _extract_apk_assets_sync(filepath: str, wanted_cats: set, progress_cb=None) 
 async def cmd_appassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/appassets — Extract specific asset types from uploaded APK/IPA/ZIP"""
     uid = update.effective_user.id
-    if not check_feature("appassets", uid):
-        await update.effective_message.reply_text("🔌 `/appassets` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
 
     # Force join check
     if not await check_force_join(update, context):
@@ -22575,13 +22176,7 @@ async def cmd_appassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     # Check if user has a recently uploaded file
@@ -22773,13 +22368,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -23807,138 +23396,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "adm_back":
         await _send_admin_panel(query, db)
-
-    # ══════════════════════════════════════════════════
-    # 🔧 MAINTENANCE MODE TOGGLE
-    # ══════════════════════════════════════════════════
-    elif data == "adm_toggle_maintenance":
-        global _maintenance_mode
-        _maintenance_mode = not _maintenance_mode
-        status = "🔧 ON" if _maintenance_mode else "✅ OFF"
-        await query.answer(f"Maintenance {status}", show_alert=True)
-        if _maintenance_mode:
-            for au_uid in list(_active_users.keys()):
-                try:
-                    await context.bot.send_message(
-                        chat_id=au_uid,
-                        text=(
-                            "🔧 *Maintenance Mode စတင်ပါပြီ*\n"
-                            "⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n"
-                            "_ပြန်ဖွင့်သည့်အခါ အသိပေးပါမည်_"
-                        ),
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-        async with db_lock:
-            db_m = _load_db_sync()
-        await _send_admin_panel(query, db_m)
-
-    # ══════════════════════════════════════════════════
-    # 👤 ACTIVE USERS REAL-TIME
-    # ══════════════════════════════════════════════════
-    elif data == "adm_activeusers":
-        active_list = get_active_users_list()
-        kb = [
-            [InlineKeyboardButton("🔄 Refresh", callback_data="adm_activeusers")],
-            [InlineKeyboardButton("🔙 Back",    callback_data="adm_back")]
-        ]
-        if not active_list:
-            txt = (
-                "👤 *Active Users — Real-time*\n"
-                "━━━━━━━━━━━━━━━━━━━━\n\n"
-                "✅ လက်ရှိ active user မရှိပါ"
-            )
-        else:
-            lines = [
-                "👤 *Active Users — Real-time*",
-                "━━━━━━━━━━━━━━━━━━━━",
-                f"📊 Total: `{len(active_list)}` users\n"
-            ]
-            for u_info in active_list[:20]:
-                elapsed  = u_info["elapsed_sec"]
-                mins     = elapsed // 60
-                secs     = elapsed % 60
-                time_str = f"{mins}m {secs}s" if mins > 0 else f"{secs}s"
-                lines.append(
-                    f"🔄 *{escape_md(u_info['username'])}*\n"
-                    f"   └ CMD: `/{escape_md(u_info['command'])}` | ⏱ `{time_str}`"
-                )
-            txt = "\n".join(lines)
-        await query.edit_message_text(
-            txt,
-            reply_markup=InlineKeyboardMarkup(kb),
-            parse_mode='Markdown'
-        )
-
-    # ══════════════════════════════════════════════════
-    # 🔌 FEATURE TOGGLE LIST
-    # ══════════════════════════════════════════════════
-    elif data == "adm_features":
-        kb_rows = []
-        items   = list(_feature_flags.items())
-        for i in range(0, len(items), 2):
-            row = []
-            for feat, enabled in items[i:i+2]:
-                icon = "🟢" if enabled else "🔴"
-                row.append(InlineKeyboardButton(
-                    f"{icon} /{feat}",
-                    callback_data=f"adm_ftoggle_{feat}"
-                ))
-            kb_rows.append(row)
-        kb_rows.append([InlineKeyboardButton("🔙 Back", callback_data="adm_back")])
-        enabled_count  = sum(1 for v in _feature_flags.values() if v)
-        disabled_count = len(_feature_flags) - enabled_count
-        txt = (
-            "🔌 *Feature Toggle*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "_Button နှိပ်ပြီး ON/OFF ပြောင်းနိုင်သည်_\n\n"
-            f"🟢 Enabled: `{enabled_count}` | 🔴 Disabled: `{disabled_count}`"
-        )
-        await query.edit_message_text(
-            txt,
-            reply_markup=InlineKeyboardMarkup(kb_rows),
-            parse_mode='Markdown'
-        )
-
-    # ── Individual feature toggle ─────────────────────
-    elif data.startswith("adm_ftoggle_"):
-        feat = data.replace("adm_ftoggle_", "")
-        if feat in _feature_flags:
-            _feature_flags[feat] = not _feature_flags[feat]
-            new_state = _feature_flags[feat]
-            await query.answer(
-                f"/{feat} → {'🟢 Enabled' if new_state else '🔴 Disabled'}",
-                show_alert=True
-            )
-        kb_rows = []
-        items   = list(_feature_flags.items())
-        for i in range(0, len(items), 2):
-            row = []
-            for f2, enabled in items[i:i+2]:
-                icon = "🟢" if enabled else "🔴"
-                row.append(InlineKeyboardButton(
-                    f"{icon} /{f2}",
-                    callback_data=f"adm_ftoggle_{f2}"
-                ))
-            kb_rows.append(row)
-        kb_rows.append([InlineKeyboardButton("🔙 Back", callback_data="adm_back")])
-        enabled_count  = sum(1 for v in _feature_flags.values() if v)
-        disabled_count = len(_feature_flags) - enabled_count
-        txt = (
-            "🔌 *Feature Toggle*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "_Button နှိပ်ပြီး ON/OFF ပြောင်းနိုင်သည်_\n\n"
-            f"🟢 Enabled: `{enabled_count}` | 🔴 Disabled: `{disabled_count}`"
-        )
-        try:
-            await query.edit_message_text(
-                txt,
-                reply_markup=InlineKeyboardMarkup(kb_rows),
-                parse_mode='Markdown'
-            )
-        except BadRequest:
-            pass
 
 
 
@@ -25875,10 +25332,6 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid  = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "keydump")
-
     raw  = context.args[0]
     url  = raw if raw.startswith("http") else "https://" + raw
 
@@ -26606,22 +26059,9 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "webhooks")
-
-    if not check_feature("webhooks", uid):
-        await update.effective_message.reply_text("🔌 `/webhooks` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -26848,22 +26288,9 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "vuln")
-
-    if not check_feature("vuln", uid):
-        await update.effective_message.reply_text("🔌 `/vuln` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith('http'): url = 'https://' + url
@@ -26913,22 +26340,9 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "api")
-
-    if not check_feature("api", uid):
-        await update.effective_message.reply_text("🔌 `/api` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith('http'): url = 'https://' + url
@@ -27008,22 +26422,9 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "fuzz")
-
-    if not check_feature("fuzz", uid):
-        await update.effective_message.reply_text("🔌 `/fuzz` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url  = context.args[0].strip()
     mode = context.args[1].strip().lower() if len(context.args) > 1 else "common"
@@ -27087,22 +26488,9 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "smartfuzz")
-
-    if not check_feature("smartfuzz", uid):
-        await update.effective_message.reply_text("🔌 `/smartfuzz` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith('http'): url = 'https://' + url
@@ -27178,19 +26566,9 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Not a valid JWT — must start with `eyJ`", parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "jwtattack")
-
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     msg = await update.effective_message.reply_text("🔐 *JWT Attack Suite*\n\n⏳ Running attacks...", parse_mode='Markdown')
     def _run():
@@ -27245,22 +26623,9 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "hiddenkeys")
-
-    if not check_feature("hiddenkeys", uid):
-        await update.effective_message.reply_text("🔌 `/hiddenkeys` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith('http'): url = 'https://' + url
@@ -27373,22 +26738,9 @@ async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "endpoints")
-
-    if not check_feature("endpoints", uid):
-        await update.effective_message.reply_text("🔌 `/endpoints` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith('http'): url = 'https://' + url
@@ -27456,22 +26808,9 @@ async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
         return
     uid = update.effective_user.id
-    # ── Track active user for /stop + admin panel ──
-    _uname = (update.effective_user.username or update.effective_user.first_name or str(uid))
-    track_active_user(uid, _uname, "oauthscan")
-
-    if not check_feature("oauthscan", uid):
-        await update.effective_message.reply_text("🔌 `/oauthscan` command ကို Admin မှ ပိတ်ထားပါသည်", parse_mode='Markdown')
-        return
     allowed, wait = check_rate_limit(uid)
     if not allowed:
-        if wait == -1:
-            await update.effective_message.reply_text(
-                "🔧 *Maintenance Mode*\n⚙️ Bot ကို ခဏပိတ်ထားပါသည်\n_မကြာမီ ပြန်ဖွင့်ပါမည်_",
-                parse_mode='Markdown'
-            )
-        else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
     url = context.args[0].strip()
     if not url.startswith('http'): url = 'https://' + url
