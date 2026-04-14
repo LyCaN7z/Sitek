@@ -109,7 +109,9 @@ FILE_EXPIRY_HOURS = int(os.getenv("FILE_EXPIRY_HOURS", "24"))   # 24h ကြာ�
 # ── Global locks / state ──────────────────────────
 db_lock: asyncio.Lock                      # initialized in main()
 user_last_req    = {}                      # rate limit tracker {uid: timestamp}
-_cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal
+_cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal (downloads)
+_user_tasks: dict   = {}                   # {uid: asyncio.Task}  — any running scan task
+_scan_semaphore: asyncio.Semaphore         # initialized in main() — max 5 concurrent scans
 
 HEADERS = {
     'User-Agent': (
@@ -253,6 +255,214 @@ def escape_md(text: str) -> str:
     for ch in ('\\', '_', '*', '`', '[', ']'):
         text = text.replace(ch, '\\' + ch)
     return text
+
+
+# ══ PRO OUTPUT FORMATTERS v2.0 ══
+_HEADER_BAR = "━" * 28
+
+_CAPTCHA_TYPE_ICON = {
+    "reCAPTCHA v2":          "🔵",
+    "reCAPTCHA v3":          "🟣",
+    "reCAPTCHA Enterprise":  "🟤",
+    "hCaptcha":              "🟡",
+    "Cloudflare Turnstile":  "🟠",
+    "FunCaptcha":            "🔴",
+    "GeeTest":               "🟢",
+    "AWS WAF Captcha":       "⚪",
+    "DataDome":              "🟤",
+    "PerimeterX/HUMAN":      "🔶",
+    "FriendlyCaptcha":       "🔷",
+    "MTCaptcha":             "🔹",
+    "Akamai Bot Manager":    "🟥",
+    "Kasada Bot Defense":    "🟫",
+    "Altcha":                "🔘",
+    "mCaptcha":              "🔸",
+}
+
+_KEY_CAT_ICON = {
+    "Payment":       "💳",
+    "AI / ML":       "🤖",
+    "Cloud":         "☁️",
+    "Auth / Token":  "🔐",
+    "Communication": "📡",
+    "DevOps":        "⚙️",
+    "Database":      "🗄️",
+    "Analytics":     "📊",
+    "Crypto":        "🪙",
+    "Captcha":       "🛡️",
+    "Other":         "🔑",
+}
+
+_ENV_LABELS = {
+    "PROD":    "🔴 PROD",
+    "TEST":    "🟡 TEST",
+    "DEV":     "🟢 DEV",
+    "SANDBOX": "🟢 SANDBOX",
+    "UNKNOWN": "⚪ UNKNOWN",
+}
+
+_PAY_PROVIDER_ICON = {
+    "Stripe":      "💜",
+    "PayPal":      "💙",
+    "Square":      "🖤",
+    "Razorpay":    "💚",
+    "Braintree":   "🧡",
+    "Adyen":       "💛",
+    "Klarna":      "🩷",
+    "Paddle":      "🩵",
+    "Paystack":    "🩶",
+    "Flutterwave": "🤎",
+}
+
+# ── Key type → Category mapping ──────────────────────────────────
+_KEY_TYPE_CATEGORIES = {
+    "Payment": [
+        "stripe", "paypal", "braintree", "square", "razorpay",
+        "adyen", "klarna", "paddle", "paystack", "flutterwave",
+        "checkout", "billing", "payment",
+    ],
+    "AI / ML": [
+        "openai", "anthropic", "huggingface", "groq", "replicate",
+        "cohere", "google ai", "deepseek", "mistral", "claude",
+    ],
+    "Cloud": [
+        "aws", "google cloud", "azure", "firebase", "supabase",
+        "cloudflare", "vercel", "netlify", "heroku", "railway",
+    ],
+    "Auth / Token": [
+        "jwt", "bearer", "oauth", "auth0", "clerk", "session",
+        "csrf", "token", "authorization", "basic auth",
+    ],
+    "Communication": [
+        "twilio", "sendgrid", "mailgun", "telegram", "slack",
+        "discord", "pusher", "mailchimp",
+    ],
+    "DevOps": [
+        "github", "gitlab", "docker", "sentry", "datadog",
+        "new relic", "jenkins",
+    ],
+    "Database": [
+        "mongodb", "mysql", "postgresql", "redis", "supabase db",
+        "database", "dsn",
+    ],
+    "Analytics": [
+        "google analytics", "mixpanel", "amplitude", "segment",
+        "facebook pixel", "hotjar",
+    ],
+    "Captcha": [
+        "recaptcha", "hcaptcha", "turnstile", "funcaptcha",
+        "geetest", "captcha", "arkose",
+    ],
+}
+
+
+def _conf_emoji(confidence: str) -> str:
+    """Confidence string → single emoji."""
+    c = (confidence or "").upper()
+    if "CONFIRMED" in c: return "✅"
+    if "HIGH" in c:      return "🔴"
+    if "MEDIUM" in c:    return "🟡"
+    if "STATIC" in c:    return "⚪"
+    return "⚫"
+
+
+def _conf_label(confidence: str) -> str:
+    """Confidence string → clean short label."""
+    c = (confidence or "").upper()
+    if "CONFIRMED" in c: return "CONFIRMED"
+    if "HIGH" in c:      return "HIGH"
+    if "MEDIUM" in c:    return "MEDIUM"
+    if "STATIC" in c:    return "STATIC"
+    return "UNKNOWN"
+
+
+def _categorize_key_type(type_str: str) -> str:
+    """Map a finding type to a display category."""
+    tl = (type_str or "").lower()
+    for cat, keywords in _KEY_TYPE_CATEGORIES.items():
+        if any(kw in tl for kw in keywords):
+            return cat
+    return "Other"
+
+
+def _detect_pay_provider(type_str: str) -> str:
+    """Extract payment provider name from finding type."""
+    tl = (type_str or "").lower()
+    providers = [
+        "Stripe", "PayPal", "Square", "Razorpay", "Braintree",
+        "Adyen", "Klarna", "Paddle", "Paystack", "Flutterwave",
+    ]
+    for p in providers:
+        if p.lower() in tl:
+            return p
+    return "Other"
+
+
+def _key_safe(value: str) -> str:
+    """Make key value safe for Telegram code blocks."""
+    if not value:
+        return "N/A"
+    return str(value).replace("`", "'").replace("\\", "/")
+
+
+def _key_masked(value: str) -> str:
+    """Masked key for inline display: first12...last4"""
+    if not value:
+        return "`N/A`"
+    v = str(value).strip()
+    if len(v) <= 20:
+        return f"`{escape_md(v)}`"
+    return f"`{escape_md(v[:12])}···{escape_md(v[-4:])}`"
+
+
+def _url_short(url: str, max_len: int = 58) -> str:
+    """Truncated URL in code format."""
+    if not url:
+        return ""
+    u = str(url).strip()
+    if len(u) <= max_len:
+        return f"`{escape_md(u)}`"
+    return f"`{escape_md(u[:max_len])}…`"
+
+
+def _dedup_by_key(findings: list, key_field: str = "value") -> list:
+    """Deduplicate findings list by key value."""
+    seen = set()
+    out = []
+    for f in findings:
+        k = f.get(key_field) or f.get("site_key") or ""
+        if not k:
+            out.append(f)
+            continue
+        if k not in seen:
+            seen.add(k)
+            out.append(f)
+    return out
+
+
+def _compact_json(obj: dict, max_oneline: int = 95) -> str:
+    """JSON → single line if short, else pretty. Backtick-safe."""
+    s = json.dumps(obj, ensure_ascii=False)
+    if len(s) <= max_oneline:
+        return s.replace("`", "'")
+    pretty = json.dumps(obj, indent=2, ensure_ascii=False)
+    return pretty.replace("`", "'")
+
+
+def _build_solver_json(f: dict) -> dict:
+    """Build compact solver-ready JSON from a finding dict."""
+    sk   = f.get("site_key") or f.get("value") or ""
+    page = f.get("page_url") or ""
+    out = {}
+    if f.get("type"):      out["type"]       = f["type"].split(" (")[0].strip()
+    if sk:                  out["sitekey"]    = sk
+    if page:               out["pageurl"]    = page[:100]
+    if f.get("action"):    out["action"]     = f["action"]
+    if f.get("enterprise"):out["enterprise"] = 1
+    if f.get("min_score"): out["min_score"]  = f["min_score"]
+    if f.get("invisible"): out["invisible"]  = 1
+    if f.get("s_param"):   out["data-s"]     = f["s_param"][:50]
+    return out
 
 
 def _truncate_safe_md(text: str, limit: int = 4000) -> str:
@@ -664,13 +874,27 @@ def user_guard(func):
         if uid not in ADMIN_IDS:
             if not db.get("settings", {}).get("bot_enabled", True):
                 await update.effective_message.reply_text(
-                    "🚫 Bot ကို ယာယီပိတ်ထားသည်။ နောက်မှ ထပ်ကြိုးစားပါ။"
+                    "🔴 *Bot ယာယီပိတ်ထားသည်*\n\n"
+                    "Admin မှ maintenance လုပ်နေပါသည်။\n"
+                    "နောက်မှ ထပ်ကြိုးစားပါ 🙏",
+                    parse_mode='Markdown'
                 )
                 return
             user = get_user(db, uid)
             if user.get("banned", False):
                 await update.effective_message.reply_text(
-                    "🚫 သင့် account ကို ပိတ်ထားသည်။"
+                    "🚫 *သင့် account ကို ပိတ်ထားသည်*\n"
+                    "Admin ထံ ဆက်သွယ်ပါ",
+                    parse_mode='Markdown'
+                )
+                return
+            # ── Concurrency guard: user already has active scan ───────────
+            existing = _user_tasks.get(uid)
+            if existing and not existing.done():
+                await update.effective_message.reply_text(
+                    "⚠️ *Operation တစ်ခု run နေသည်*\n"
+                    "ရပ်ရန် `/stop` သုံးပါ၊ ပြီးမှ ဆက်လုပ်ပါ",
+                    parse_mode='Markdown'
                 )
                 return
         return await func(update, context)
@@ -1399,12 +1623,13 @@ ALL_API_PATHS = list(dict.fromkeys(
 
 
 # ── API URL patterns in JS bundles ─────────────
+# ── API URL patterns in JS bundles ─────────────
 _JS_API_PATTERNS = [
-    re.compile(r"""(?:fetch|axios\\.(?:get|post|put|delete|patch))\\s*\\(\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
-    re.compile(r"""(?:url|endpoint|baseURL|apiUrl|API_URL)\\s*[:=]\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
-    re.compile(r"""['"`](/api/[^\\s'"`\\?#]{3,100})['"`]"""),
-    re.compile(r"""['"`](/rest/[^\\s'"`\\?#]{3,100})['"`]"""),
-    re.compile(r"""['"`](/v\\d+/[^\\s'"`\\?#]{3,100})['"`]"""),
+    re.compile(r"""(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*['"`]([^'"`\s]{5,200})['"`]"""),
+    re.compile(r"""(?:url|endpoint|baseURL|apiUrl|API_URL)\s*[:=]\s*['"`]([^'"`\s]{5,200})['"`]"""),
+    re.compile(r"""['"`](/api/[^\s'"`\?#]{3,100})['"`]"""),
+    re.compile(r"""['"`](/rest/[^\s'"`\?#]{3,100})['"`]"""),
+    re.compile(r"""['"`](/v\d+/[^\s'"`\?#]{3,100})['"`]"""),
     re.compile(r"['\"`](https?://[^\s'\"` ]{10,200}/api/[^\s'\"` ?#]{2,100})['\"`]"),
 ]
 
@@ -2853,7 +3078,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return detected, notable, resp.status_code, resp.url, js_fetched
 
     try:
-        detected, notable, status, final_url, js_cnt = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status, final_url, js_cnt = await run_scan(uid, _do_tech_scan)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
                             parse_mode='Markdown')
@@ -3273,7 +3498,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return sources, source_origins, findings
 
     try:
-        sources, source_origins, findings = await asyncio.to_thread(_do_extract)
+        sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
@@ -3668,7 +3893,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        results = await asyncio.to_thread(_bypass_sync, url)
+        results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -3939,7 +4164,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
+        data = await run_scan(uid, _subdomains_sync, raw, progress_q)
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -4356,10 +4585,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _extract_apk_assets_sync, filepath, wanted_cats,
+        result = await run_scan(
+            uid, _extract_apk_assets_sync, filepath, wanted_cats,
             lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -4538,7 +4771,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return {"success": False, "error": str(e)}
 
     try:
-        res = await asyncio.to_thread(_run_antibot)
+        res = await run_scan(uid, _run_antibot)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -6261,6 +6494,649 @@ def _sitekey_scan_subpages(base_url: str, progress_cb=None) -> list:
     return findings
 
 
+# ═══════════════════════════════════════════════════════════════════
+# 🔑  SITEKEY LIVE ENHANCEMENTS  —  နည်းလမ်း ၅ ခု
+#  1. _csp_captcha_detect()       — CSP Header → provider fast detect
+#  2. _postmessage_sitekey()      — iframe postMessage intercept
+#  3. _wellknown_captcha_probe()  — /.well-known/ captcha config files
+#  4. _extract_advanced_captcha_params() — action / cData / execution mode
+#  5. _interact_trigger_captcha() — button click → hidden captcha reveal
+# ═══════════════════════════════════════════════════════════════════
+
+_CSP_PROVIDER_MAP = [
+    ("www.google.com/recaptcha",      "reCAPTCHA v2/v3",          "HIGH"),
+    ("recaptcha.google.com",          "reCAPTCHA Enterprise",     "HIGH"),
+    ("hcaptcha.com",                  "hCaptcha",                 "HIGH"),
+    ("challenges.cloudflare.com",     "Cloudflare Turnstile",     "HIGH"),
+    ("newassets.hcaptcha.com",        "hCaptcha",                 "HIGH"),
+    ("arkoselabs.com",                "FunCaptcha/Arkose",        "HIGH"),
+    ("funcaptcha.com",                "FunCaptcha",               "HIGH"),
+    ("geo.captcha.com",               "GeeTest",                  "HIGH"),
+    ("gtcaptcha.com",                 "GeeTest v4",               "HIGH"),
+    ("friendlycaptcha.com",           "FriendlyCaptcha",          "HIGH"),
+    ("friendlycaptcha.eu",            "FriendlyCaptcha (EU)",     "HIGH"),
+    ("captcha.awswaf.com",            "AWS WAF Captcha",          "HIGH"),
+    ("datadome.co",                   "DataDome",                 "MEDIUM"),
+    ("px-cloud.net",                  "PerimeterX",               "MEDIUM"),
+    ("px-cdn.net",                    "PerimeterX",               "MEDIUM"),
+    ("mtcaptcha.com",                 "MTCaptcha",                "HIGH"),
+    ("p.lu8Y24.com",                  "Kasada",                   "HIGH"),
+]
+
+def _csp_captcha_detect(url: str) -> dict:
+    """
+    HEAD request တစ်ကြောင်းဖြင့် CSP header ကိုကြည့်ပြီး
+    captcha provider ကို detect လုပ်သည်။
+    """
+    result = {
+        "providers":      [],
+        "csp_raw":        "",
+        "feature_policy": "",
+        "frame_ancestors": [],
+    }
+    try:
+        r = requests.head(
+            url, timeout=8, verify=False, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; SecurityScanner/1.0)"}
+        )
+        headers = {k.lower(): v for k, v in r.headers.items()}
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    csp = headers.get("content-security-policy", "") or \
+          headers.get("content-security-policy-report-only", "")
+    result["csp_raw"]        = csp[:2000]
+    result["feature_policy"] = headers.get("permissions-policy", "")
+
+    if not csp:
+        return result
+
+    fa_match = re.search(r"frame-ancestors\s+([^;]+)", csp, re.I)
+    if fa_match:
+        result["frame_ancestors"] = fa_match.group(1).strip().split()
+
+    csp_lower  = csp.lower()
+    seen_names = set()
+    for domain_frag, provider_name, confidence in _CSP_PROVIDER_MAP:
+        if domain_frag.lower() in csp_lower and provider_name not in seen_names:
+            seen_names.add(provider_name)
+            result["providers"].append({
+                "name":       provider_name,
+                "confidence": confidence,
+                "csp_domain": domain_frag,
+            })
+    return result
+
+
+_PM_SITEKEY_PATTERNS = [
+    re.compile(r'"sitekey"\s*:\s*"([A-Za-z0-9_\-]{20,})"',        re.I),
+    re.compile(r'"site_key"\s*:\s*"([A-Za-z0-9_\-]{20,})"',       re.I),
+    re.compile(r'"k"\s*:\s*"(6[A-Za-z0-9_\-]{38})"',              re.I),
+    re.compile(r'"siteKey"\s*:\s*"(0x4[A-Za-z0-9_]{20,})"',       re.I),
+    re.compile(r'"sitekey"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"', re.I),
+]
+_PM_ACTION_PATTERNS = [
+    re.compile(r'"action"\s*:\s*"([A-Za-z0-9_\-/]{1,50})"',       re.I),
+    re.compile(r'"challenge-type"\s*:\s*"([^"]{1,40})"',           re.I),
+    re.compile(r'"type"\s*:\s*"(captcha|challenge|verify)[^"]*"',  re.I),
+]
+_PM_SCORE_PATTERNS = [
+    re.compile(r'"score"\s*:\s*(0\.\d+)',                          re.I),
+    re.compile(r'"minScore"\s*:\s*(0\.\d+)',                       re.I),
+    re.compile(r'"threshold"\s*:\s*(0\.\d+)',                      re.I),
+]
+
+def _postmessage_sitekey(url: str, progress_cb=None) -> list:
+    """
+    Playwright ဖြင့် page load လုပ်ပြီး postMessage events ကို
+    intercept လုပ်ကာ sitekey ထုတ်သည်။
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return []
+
+    if progress_cb: progress_cb("📨 PostMessage intercept — captcha iframe communication...")
+
+    findings  = []
+    seen_keys = set()
+    pm_log    = []
+
+    INJECT_SCRIPT = """
+    window.__pm_captures = [];
+    const _origAddEvent = window.addEventListener.bind(window);
+    _origAddEvent('message', function(evt) {
+        try {
+            let raw = typeof evt.data === 'string' ? evt.data : JSON.stringify(evt.data);
+            window.__pm_captures.push({ origin: evt.origin, data: raw.slice(0, 4000) });
+        } catch(e) {}
+    }, true);
+    """
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+        ctx     = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
+        page = ctx.new_page()
+        page.add_init_script(INJECT_SCRIPT)
+        try:
+            page.goto(url, timeout=20_000, wait_until="networkidle")
+        except Exception:
+            pass
+
+        try:
+            for sel in ['input[type="email"]', 'input[name="email"]', 'input[name="username"]']:
+                if page.locator(sel).count() > 0:
+                    page.locator(sel).first.fill("test@example.com", timeout=1500)
+                    break
+            for sel in ['input[type="password"]']:
+                if page.locator(sel).count() > 0:
+                    page.locator(sel).first.fill("Test@1234!", timeout=1500)
+                    break
+        except Exception:
+            pass
+
+        try:
+            for sel in [
+                'button[type="submit"]', 'input[type="submit"]',
+                'button:text("Login")', 'button:text("Sign in")',
+                'button:text("Continue")', 'button:text("Next")',
+            ]:
+                if page.locator(sel).count() > 0:
+                    page.locator(sel).first.click(timeout=2000)
+                    page.wait_for_timeout(3000)
+                    break
+        except Exception:
+            pass
+
+        try:
+            pm_log = page.evaluate("window.__pm_captures || []")
+        except Exception:
+            pm_log = []
+        browser.close()
+
+    for entry in pm_log:
+        data_str = entry.get("data", "")
+        origin   = entry.get("origin", "unknown")
+        if not data_str:
+            continue
+        for pat in _PM_SITEKEY_PATTERNS:
+            for m in pat.finditer(data_str):
+                key = m.group(1).strip()
+                if key in seen_keys or len(key) < 10:
+                    continue
+                seen_keys.add(key)
+                action = ""
+                for ap in _PM_ACTION_PATTERNS:
+                    am = ap.search(data_str)
+                    if am:
+                        action = am.group(1)
+                        break
+                score = ""
+                for sp in _PM_SCORE_PATTERNS:
+                    sm = sp.search(data_str)
+                    if sm:
+                        score = sm.group(1)
+                        break
+                cap_type = _classify_enh_sitekey_type(key)
+                findings.append({
+                    "type":       f"{cap_type} (postMessage)",
+                    "site_key":   key,
+                    "action":     action,
+                    "min_score":  score,
+                    "source":     f"postMessage ← iframe origin: {origin[:60]}",
+                    "confidence": "CONFIRMED ✅",
+                    "raw_msg":    data_str[:200],
+                })
+
+    if progress_cb:
+        progress_cb(f"📨 postMessage: {len(pm_log)} messages → {len(findings)} sitekeys")
+    return findings
+
+
+_WELLKNOWN_PATHS = [
+    ("/.well-known/recaptcha-challenge.json",        "reCAPTCHA Enterprise"),
+    ("/.well-known/cloudflare/challenge-platform",   "Cloudflare Turnstile"),
+    ("/.well-known/captcha.json",                    "Captcha Config"),
+    ("/.well-known/security.txt",                    "Security Policy"),
+    ("/.well-known/hcaptcha-challenge",              "hCaptcha"),
+    ("/.well-known/apple-developer-merchantid-domain-association", "Apple Pay Merchant"),
+    ("/.well-known/assetlinks.json",                 "Android/Google Pay"),
+    ("/.well-known/aws-waf-captcha-integration",     "AWS WAF Captcha"),
+    ("/.well-known/datadome",                        "DataDome"),
+]
+
+def _wellknown_captcha_probe(base_url: str, progress_cb=None) -> list:
+    """
+    Known /.well-known/ paths များကို probe လုပ်ပြီး
+    captcha config, merchant ID, security policy ကို extract လုပ်သည်.
+    """
+    parsed  = urlparse(base_url)
+    origin  = f"{parsed.scheme}://{parsed.netloc}"
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"})
+
+    if progress_cb: progress_cb("🔍 /.well-known/ captcha config probe...")
+
+    findings = []
+    for path, provider in _WELLKNOWN_PATHS:
+        probe_url = origin + path
+        try:
+            r = session.get(probe_url, timeout=6, verify=False, allow_redirects=False)
+            if r.status_code != 200:
+                continue
+            content = r.text[:5000]
+            ct      = r.headers.get("content-type", "").lower()
+            finding = {
+                "type":            provider,
+                "path":            path,
+                "content_preview": content[:300],
+                "status":          r.status_code,
+                "content_type":    ct,
+            }
+            if "json" in ct or content.strip().startswith("{"):
+                try:
+                    data = json.loads(content)
+                    finding["parsed"] = data
+                    for field in ("siteKey", "site_key", "key", "publicKey"):
+                        if field in data:
+                            finding["extracted_key"] = data[field]
+                            break
+                    if isinstance(data, list) and data and "target" in data[0]:
+                        pkg = data[0]["target"].get("package_name", "")
+                        finding["android_package"] = pkg
+                except json.JSONDecodeError:
+                    pass
+            if "apple" in provider.lower():
+                m = re.search(r'merchant\.[a-z0-9.\-]+', content, re.I)
+                if m:
+                    finding["merchant_id"] = m.group(0)
+            if "security" in path:
+                captcha_mentions = [kw for kw in ("recaptcha","hcaptcha","turnstile","captcha","bot") if kw in content.lower()]
+                if captcha_mentions:
+                    finding["captcha_mentions"] = captcha_mentions
+            findings.append(finding)
+        except requests.exceptions.ConnectionError:
+            continue
+        except Exception:
+            continue
+
+    if progress_cb:
+        progress_cb(f"🔍 well-known: {len(findings)} config files found")
+    return findings
+
+
+def _extract_advanced_captcha_params(html: str, js_sources: dict, page_url: str) -> list:
+    """
+    HTML + JS source ထဲမှ captcha advanced parameters ကို extract:
+    Turnstile action/cData/execution, reCAPTCHA v3 action/score, hCaptcha theme/endpoint
+    """
+    findings = []
+    all_text = html + "\n" + "\n".join(js_sources.values())
+
+    TURNSTILE_ELEM_RE = re.compile(
+        r'(?:class=["\'][^"\']*cf-turnstile[^"\']*["\']|data-turnstile)[^>]*>',
+        re.I | re.S
+    )
+    for elem_match in TURNSTILE_ELEM_RE.finditer(html):
+        elem   = elem_match.group(0)
+        params = {}
+        for attr in ("data-sitekey","data-action","data-cdata","data-callback",
+                     "data-error-callback","data-expired-callback","data-retry",
+                     "data-retry-interval","data-execution","data-appearance",
+                     "data-theme","data-size"):
+            m = re.search(attr + r'=["\']([^"\']+)["\']', elem, re.I)
+            if m:
+                params[attr.replace("data-", "")] = m.group(1)
+        if not params.get("sitekey"):
+            continue
+        sk = params.pop("sitekey")
+        findings.append({
+            "type":       "Cloudflare Turnstile (full params)",
+            "site_key":   sk,
+            "action":     params.get("action", ""),
+            "params":     params,
+            "source":     "HTML attribute (cf-turnstile element)",
+            "confidence": "CONFIRMED ✅",
+            "notes":      _turnstile_param_notes(params),
+        })
+
+    TS_RENDER_RE = re.compile(r'turnstile\.render\s*\([^)]*\{([^}]{10,600})\}', re.I | re.S)
+    for m in TS_RENDER_RE.finditer(all_text):
+        obj_text = m.group(1)
+        sk_m     = re.search(r'sitekey\s*:\s*["\']([0-9A-Za-z_\-]{20,})["\']', obj_text, re.I)
+        if not sk_m:
+            continue
+        sk     = sk_m.group(1)
+        params = {}
+        for field in ("action","cData","callback","execution","retry","appearance","theme"):
+            fm = re.search(field + r'\s*:\s*["\']([^"\']{0,100})["\']', obj_text, re.I)
+            if fm:
+                params[field] = fm.group(1)
+        findings.append({
+            "type":       "Cloudflare Turnstile (JS render)",
+            "site_key":   sk,
+            "action":     params.get("action", ""),
+            "params":     params,
+            "source":     "JS turnstile.render() call",
+            "confidence": "HIGH ✅",
+            "notes":      _turnstile_param_notes(params),
+        })
+
+    RC3_EXECUTE_RE = re.compile(
+        r'grecaptcha\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{20,})["\']'
+        r'\s*,\s*\{([^}]{0,300})\}',
+        re.I | re.S
+    )
+    for m in RC3_EXECUTE_RE.finditer(all_text):
+        sk       = m.group(1)
+        obj_text = m.group(2)
+        action   = ""
+        am = re.search(r'action\s*:\s*["\']([^"\']{1,50})["\']', obj_text, re.I)
+        if am:
+            action = am.group(1)
+        score_threshold = ""
+        for sp in [
+            re.compile(r'score\s*[<>]=?\s*(0\.\d+)', re.I),
+            re.compile(r'threshold\s*[:=]\s*(0\.\d+)', re.I),
+            re.compile(r'minScore\s*[:=]\s*(0\.\d+)', re.I),
+        ]:
+            start  = max(0, m.start() - 500)
+            end    = min(len(all_text), m.end() + 500)
+            sm     = sp.search(all_text[start:end])
+            if sm:
+                score_threshold = sm.group(1)
+                break
+        findings.append({
+            "type":            "reCAPTCHA v3 (execute call)",
+            "site_key":        sk,
+            "action":          action,
+            "score_threshold": score_threshold,
+            "source":          "JS grecaptcha.execute() call",
+            "confidence":      "CONFIRMED ✅",
+            "notes": (
+                f"Action: '{action}'" +
+                (f" | Score threshold: {score_threshold}" if score_threshold else "") +
+                (" ⚠️ Score threshold ≥ 0.7 means harder bypass" if score_threshold and float(score_threshold) >= 0.7 else "")
+            ),
+        })
+
+    HC_RENDER_RE = re.compile(r'hcaptcha\.render\s*\([^)]*\{([^}]{10,600})\}', re.I | re.S)
+    for m in HC_RENDER_RE.finditer(all_text):
+        obj_text = m.group(1)
+        sk_m     = re.search(r'sitekey\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', obj_text, re.I)
+        if not sk_m:
+            continue
+        sk     = sk_m.group(1)
+        params = {}
+        for field in ("theme","size","tabindex","endpoint","host","reportapi","assethost","imghost"):
+            fm = re.search(field + r'\s*:\s*["\']([^"\']{0,120})["\']', obj_text, re.I)
+            if fm:
+                params[field] = fm.group(1)
+        custom_endpoint = params.get("endpoint","") or params.get("host","")
+        findings.append({
+            "type":       "hCaptcha (render params)",
+            "site_key":   sk,
+            "action":     "",
+            "params":     params,
+            "source":     "JS hcaptcha.render() call",
+            "confidence": "CONFIRMED ✅",
+            "notes": (
+                (f"⚠️ Custom endpoint: {custom_endpoint}" if custom_endpoint else "") +
+                (f" | Theme: {params.get('theme','')}" if params.get("theme") else "")
+            ).strip(" |"),
+        })
+
+    seen  = set()
+    dedup = []
+    for f in findings:
+        k = f.get("type","") + ":" + f.get("site_key","")
+        if k not in seen:
+            seen.add(k)
+            dedup.append(f)
+    return dedup
+
+
+def _turnstile_param_notes(params: dict) -> str:
+    """Turnstile parameter ကို human-readable notes ဖြင့် ရှင်းပြ"""
+    notes = []
+    ex = params.get("execution", "")
+    if ex == "execute":
+        notes.append("⚡ Explicit execution mode (programmatic trigger)")
+    elif ex == "render":
+        notes.append("🖼️ Auto-render mode")
+    ap = params.get("appearance", "")
+    if ap == "interaction-only":
+        notes.append("👁️ Interaction-only (invisible until needed)")
+    elif ap == "always":
+        notes.append("🔲 Always visible widget")
+    if params.get("retry") == "never":
+        notes.append("🔒 Retry disabled (strict mode)")
+    cdata = params.get("cData", "")
+    if cdata:
+        notes.append(f"📦 cData: '{cdata[:40]}' (custom context)")
+    return " | ".join(notes) if notes else ""
+
+
+_TRIGGER_SELECTORS = [
+    'button[type="submit"]', 'input[type="submit"]',
+    'button:has-text("Login")',    'button:has-text("Sign in")',
+    'button:has-text("Log in")',   'button:has-text("Sign up")',
+    'button:has-text("Register")', 'button:has-text("Continue")',
+    'button:has-text("Next")',     'button:has-text("Submit")',
+    'button:has-text("Send")',     'button:has-text("Get started")',
+    'button:has-text("Create")',   'button:has-text("Join")',
+    'form button:first-of-type',
+    '[data-testid="submit-button"]', '[data-testid="login-button"]',
+    '.submit-btn', '.login-btn', '.btn-primary',
+]
+
+_POST_TRIGGER_SITEKEY_PATTERNS = [
+    re.compile(r'data-sitekey=["\']([0-9A-Za-z_\-]{20,})["\']',    re.I),
+    re.compile(r'data-sitekey=["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I),
+    re.compile(r'recaptcha[^"\']*[?&]k=([0-9A-Za-z_\-]{20,})',     re.I),
+    re.compile(r'hcaptcha[^"\']*[?&]sitekey=([0-9a-f\-]{36})',      re.I),
+    re.compile(r'challenges\.cloudflare[^"\']*[?&](?:sitekey|k)=([0-9A-Za-z_\-]{20,})', re.I),
+]
+
+def _interact_trigger_captcha(url: str, progress_cb=None) -> list:
+    """
+    Form field ဖြည့်ပြီး submit button click → invisible captcha reveal.
+    Before/after DOM diff ဖြင့် newly appeared sitekeys ကို detect.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return []
+
+    if progress_cb: progress_cb("🖱️ Form interaction — hidden captcha trigger...")
+
+    new_findings = []
+    seen_keys    = set()
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-gpu","--disable-dev-shm-usage"]
+        )
+        ctx  = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+        )
+        page = ctx.new_page()
+        triggered_keys = set()
+
+        def _on_request(req):
+            for pat in _POST_TRIGGER_SITEKEY_PATTERNS:
+                m = pat.search(req.url)
+                if m:
+                    triggered_keys.add(m.group(1))
+
+        page.on("request", _on_request)
+        try:
+            page.goto(url, timeout=18_000, wait_until="networkidle")
+        except Exception:
+            pass
+
+        before_html = ""
+        try:
+            before_html = page.content()
+            for pat in _POST_TRIGGER_SITEKEY_PATTERNS:
+                for m in pat.finditer(before_html):
+                    seen_keys.add(m.group(1))
+        except Exception:
+            pass
+
+        field_fill_pairs = [
+            (['input[type="email"]','input[name="email"]','input[name="username"]',
+              'input[name="user"]','input[name="login"]','input[id*="email"]'],
+             "test@securityresearch.local"),
+            (['input[type="password"]','input[name="password"]',
+              'input[name="pass"]','input[id*="password"]'],
+             "TestPassword@9999"),
+            (['input[type="text"][name*="name"]','input[name="firstname"]',
+              'input[name="first_name"]'], "Security"),
+            (['input[type="tel"]','input[name="phone"]'], "+1-555-000-0000"),
+        ]
+        for selectors, value in field_fill_pairs:
+            for sel in selectors:
+                try:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.fill(value, timeout=1500)
+                        break
+                except Exception:
+                    continue
+
+        clicked = False
+        for sel in _TRIGGER_SELECTORS:
+            try:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    loc.first.click(timeout=2000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+
+        try:
+            page.wait_for_timeout(4000)
+        except Exception:
+            pass
+
+        after_html = ""
+        try:
+            after_html = page.content()
+        except Exception:
+            pass
+        browser.close()
+
+    for pat in _POST_TRIGGER_SITEKEY_PATTERNS:
+        for m in pat.finditer(after_html):
+            key = m.group(1)
+            if key not in seen_keys and key not in triggered_keys:
+                triggered_keys.add(key)
+
+    for key in triggered_keys:
+        cap_type = _classify_enh_sitekey_type(key)
+        new_findings.append({
+            "type":       f"{cap_type} (interaction-triggered)",
+            "site_key":   key,
+            "action":     "",
+            "source":     "Revealed after form fill + submit click",
+            "confidence": "CONFIRMED ✅",
+            "notes":      "⚡ Invisible/conditional captcha — only appears after user interaction",
+        })
+
+    if progress_cb:
+        progress_cb(f"🖱️ Interaction trigger: {len(new_findings)} hidden sitekeys revealed")
+    return new_findings
+
+
+def _classify_enh_sitekey_type(key: str) -> str:
+    """Key format ကိုကြည့်ပြီး captcha type classify လုပ်"""
+    if re.match(r'^6[A-Za-z0-9_\-]{39}$', key):
+        return "reCAPTCHA v2/v3"
+    if re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', key, re.I):
+        return "hCaptcha"
+    if re.match(r'^0x4[A-Za-z0-9_]{20,}$', key):
+        return "Cloudflare Turnstile"
+    if re.match(r'^[0-9a-f]{32}$', key, re.I):
+        return "GeeTest"
+    if re.match(r'^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-', key):
+        return "FunCaptcha/Arkose"
+    return "Unknown Captcha"
+
+
+def run_live_sitekey_enhancements(url: str, html: str = "", js_sources: dict = None, progress_cb=None) -> dict:
+    """
+    Enhancement ၅ ခုလုံးကို run ပြီး combined results return။
+    _sitekey_sync() ထဲ call လုပ်ပြီး existing findings နှင့် merge လုပ်ရန်။
+    """
+    js_sources   = js_sources or {}
+    all_findings = []
+    meta         = {}
+
+    # ① CSP fast detect
+    if progress_cb: progress_cb("① CSP header — provider pre-detection...")
+    csp_result = _csp_captcha_detect(url)
+    meta["csp"] = csp_result
+    if csp_result.get("providers"):
+        pnames = [p["name"] for p in csp_result["providers"]]
+        if progress_cb: progress_cb(f"  → CSP: {', '.join(pnames)} detected")
+
+    # ② /.well-known/ probe
+    wk_findings          = _wellknown_captcha_probe(url, progress_cb)
+    meta["wellknown_count"] = len(wk_findings)
+    meta["wellknown"]       = wk_findings
+    for f in wk_findings:
+        if f.get("extracted_key"):
+            all_findings.append({
+                "type":       f["type"] + " (well-known)",
+                "site_key":   f["extracted_key"],
+                "source":     f["path"],
+                "confidence": "CONFIRMED ✅",
+            })
+
+    # ③ Advanced param extraction (HTML + JS)
+    if html or js_sources:
+        if progress_cb: progress_cb("③ Advanced params — action/cData/score extraction...")
+        adv = _extract_advanced_captcha_params(html, js_sources, url)
+        meta["advanced_params_count"] = len(adv)
+        all_findings.extend(adv)
+
+    # ④ PostMessage intercept (Playwright)
+    pm_findings              = _postmessage_sitekey(url, progress_cb)
+    meta["postmessage_count"] = len(pm_findings)
+    all_findings.extend(pm_findings)
+
+    # ⑤ Button interaction → hidden captcha
+    inter_findings           = _interact_trigger_captcha(url, progress_cb)
+    meta["interaction_count"] = len(inter_findings)
+    all_findings.extend(inter_findings)
+
+    meta["total_new"] = len(all_findings)
+    return {"all_findings": all_findings, "meta": meta}
+
+
+# ═══════════════════════════════════════════════════════════════════
+
 def _sitekey_sync(url: str, progress_cb=None) -> dict:
     """
     Try Playwright (DevTools-style) first.
@@ -6318,6 +7194,22 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                 f["source"] = f.get("source", "") + " [deep fetch]"
                 result.setdefault("findings", []).append(f)
                 existing_keys.add(sk)
+        # Deobfuscation pass over each asset — may reveal sitekeys inside atob/hex/join
+        for asset in new_assets:
+            body = asset.get("response_body", "")
+            if not body or len(body) < 30:
+                continue
+            _deob_body = _deobfuscate_text(body)
+            if not _deob_body:
+                continue
+            _deob_all_js = {asset["url"]: _deob_body}
+            for f in _extract_captcha_info("", url, _deob_all_js):
+                sk = f.get("site_key", "")
+                if sk and sk not in existing_keys:
+                    f["source"] = f.get("source", "") + " [deobfuscated]"
+                    f["confidence"] = "HIGH ✅"
+                    result.setdefault("findings", []).append(f)
+                    existing_keys.add(sk)
 
     # ── Phase 2: Real-time network stream intercept ───────────────────
     if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
@@ -6378,6 +7270,18 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                         "source":   f"JSON response ← {entry.get('url','')[:70]}",
                         "confidence": "HIGH ✅",
                     })
+
+    # ── LIVE ENHANCEMENTS: CSP + well-known + advanced params + postMessage + interact ──
+    if progress_cb: progress_cb("🔑 Live sitekey enhancements (CSP/postMsg/interact)...")
+    _enh_html     = result.get("html", "")
+    _enh_js       = {a["url"]: a["response_body"] for a in new_assets} if new_assets else {}
+    live_enh      = run_live_sitekey_enhancements(url, _enh_html, _enh_js, progress_cb)
+    for f in live_enh["all_findings"]:
+        sk = f.get("site_key", "")
+        if sk and sk not in existing_keys:
+            result.setdefault("findings", []).append(f)
+            existing_keys.add(sk)
+    result["live_enhancements"] = live_enh["meta"]
 
     result["live_result"] = live_result
     return result
@@ -7014,9 +7918,13 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _sitekey_with_subpages, url, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _sitekey_with_subpages, url, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -7026,7 +7934,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.get("error"):
         await msg.edit_text(
-            f"❌ *Fetch error*\n`{result['error']}`",
+            f"❌ *Fetch error*\n`{escape_md(str(result['error'])[:80])}`",
             parse_mode='Markdown'
         )
         return
@@ -7037,12 +7945,11 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     js_count     = result.get("js_fetched", 0)
     live_reqs    = len(live_result.get("live_requests", []))
 
-    # Cross-reference: use site_key as the "value" field for confidence scoring
+    # Cross-reference for confidence scoring
     for f in raw_findings:
         if "value" not in f:
             f["value"] = f.get("site_key", "")
     findings_xref = _confidence_crossref(raw_findings, live_result)
-    # Restore site_key field
     for orig, f in zip(raw_findings, findings_xref[:len(raw_findings)]):
         f["site_key"] = orig.get("site_key", f.get("value", ""))
         for k in ("page_url","action","invisible","min_score","enterprise",
@@ -7050,166 +7957,153 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if k in orig:
                 f[k] = orig[k]
 
-    confirmed   = [f for f in findings_xref if "CONFIRMED" in f.get("confidence","")]
-    high_live   = [f for f in findings_xref if f.get("confidence","").startswith("HIGH")]
-    static_only = [f for f in findings_xref if "STATIC" in f.get("confidence","")]
-    findings    = findings_xref
-
-    # ─── No captcha found ───────────────────────
-    if not findings:
-        await msg.edit_text(
-            f"🔑 *Site Key Extractor — `{escape_md(domain)}`*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 *Captcha မတွေ့ပါ*\n\n"
-            f"🌐 Page URL: `{escape_md(page_url)}`\n"
-            f"📡 Static: `{escape_md(js_count)}` | Live: `{escape_md(live_reqs)}`\n\n"
-            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
-            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
-            parse_mode='Markdown'
-        )
-        return
-
-    # ─── Build report ────────────────────────────
-    _TYPE_ICON = {
-        "reCAPTCHA v2":          "🔵",
-        "reCAPTCHA v3":          "🟣",
-        "reCAPTCHA Enterprise":  "🟤",
-        "hCaptcha":              "🟡",
-        "Cloudflare Turnstile":  "🟠",
-        "FunCaptcha":            "🔴",
-        "GeeTest":               "🟢",
-        "AWS WAF Captcha":       "⚪",
-        "DataDome":              "🟤",
-        "PerimeterX/HUMAN":      "🔶",
-        "FriendlyCaptcha":       "🔷",
-        "MTCaptcha":             "🔹",
-        "Akamai Bot Manager":    "🟥",
+    # Filter to captcha types only
+    _CAPTCHA_WORDS = {
+        "recaptcha", "hcaptcha", "turnstile", "funcaptcha",
+        "geetest", "captcha", "arkose", "datadome", "perimeterx",
+        "friendlycaptcha", "mtcaptcha", "akamai", "kasada", "altcha",
+        "mcaptcha", "aws waf",
     }
+    findings = [
+        f for f in findings_xref
+        if any(cw in f.get("type", "").lower() for cw in _CAPTCHA_WORDS)
+    ]
 
-    # Deduplicated ordering: CONFIRMED → HIGH → STATIC
-    seen_keys = set()
-    ordered   = []
-    for f, badge in (
-        [(f, "✅ CONFIRMED") for f in confirmed] +
-        [(f, "🔴 HIGH-LIVE") for f in high_live if f not in confirmed] +
-        [(f, "⚠️ STATIC")   for f in static_only]
-    ):
-        sk = f.get("site_key", "") or f.get("value", "")
-        if sk and sk in seen_keys:
-            continue
-        seen_keys.add(sk)
-        ordered.append((f, badge))
-    # Include remaining findings not yet categorized
-    for f in findings:
-        sk = f.get("site_key", "") or f.get("value", "")
-        if sk not in seen_keys:
-            seen_keys.add(sk)
-            ordered.append((f, f.get("confidence", "⚠️ STATIC")))
+    # Deduplicate by site_key
+    findings = _dedup_by_key(findings, "site_key")
+
+    # Sort: CONFIRMED → HIGH → STATIC
+    _conf_order = {"CONFIRMED": 0, "HIGH": 1, "MEDIUM": 2, "STATIC": 3}
+    findings.sort(key=lambda x: _conf_order.get(_conf_label(x.get("confidence", "")), 9))
+
+    confirmed = [f for f in findings if "CONFIRMED" in f.get("confidence", "")]
+    high_live = [f for f in findings if f not in confirmed and "HIGH" in f.get("confidence", "")]
+    static_only = [f for f in findings if "STATIC" in f.get("confidence", "")]
+
+    # ═══════════════════════════════════════════════════════════
+    # BUILD TELEGRAM REPORT
+    # ═══════════════════════════════════════════════════════════
 
     lines = [
-        f"🔑 *Site Key Extractor — `{escape_md(domain)}`*",
-        f"━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 Page URL: `{escape_md(page_url)}`",
-        f"📡 Static: `{escape_md(js_count)}` JS | Live: `{escape_md(live_reqs)}` requests",
-        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live: `{len(high_live)}` | ⚠️ Static: `{len(static_only)}`",
-        f"🔑 Found: `{len(ordered)}` captcha instance(s)",
+        "🔑 *CAPTCHA Site Keys*",
+        _HEADER_BAR,
+        f"🌐  `{escape_md(domain)}`",
+        f"📄  {_url_short(page_url, 60)}",
+        "",
+        f"📡  JS `{escape_md(str(js_count))}` │ Live `{escape_md(str(live_reqs))}` │ Found `{escape_md(str(len(findings)))}`",
+        f"✅ `{escape_md(str(len(confirmed)))}` confirmed   "
+        f"🔴 `{escape_md(str(len(high_live)))}` live   "
+        f"⚪ `{escape_md(str(len(static_only)))}` static",
         "",
     ]
 
-    _CAPTCHA_TYPES = {
-        "reCAPTCHA", "hCaptcha", "Turnstile", "FunCaptcha",
-        "GeeTest", "AWS WAF", "DataDome", "PerimeterX",
-        "FriendlyCaptcha", "MTCaptcha", "Akamai",
-    }
+    # ── No captcha found ──────────────────────────────────────
+    if not findings:
+        lines += [
+            "📭 *Captcha မတွေ့ရှိပါ*",
+            "",
+            "_Possible reasons:_",
+            "  • Site မှာ captcha မပါ",
+            "  • Server-side only (no client key)",
+            "  • User interaction ပြီးမှ load",
+            "  • Obfuscated / encrypted JS bundle",
+        ]
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+        return
 
-    entry_num = 0
-    for f, badge in ordered:
-        cap_type = f.get("type", "")
-        sk       = f.get("site_key", "") or f.get("value", "") or "N/A"
+    # ── Per-finding cards ─────────────────────────────────────
+    for i, f in enumerate(findings, 1):
+        cap_type   = f.get("type", "Unknown").split(" (")[0].strip()
+        full_type  = f.get("type", "Unknown")
+        sk         = f.get("site_key") or f.get("value") or "N/A"
+        f_page     = f.get("page_url", "")
+        action     = f.get("action", "")
+        min_score  = f.get("min_score", "")
+        invisible  = f.get("invisible", False)
+        enterprise = f.get("enterprise", False)
+        confidence = f.get("confidence", "STATIC")
+        source     = (f.get("source") or "")[:55]
+        s_param    = f.get("s_param", "")
 
-        # JWT / non-captcha tokens ဖယ်ရှား
-        if not any(ct in cap_type for ct in _CAPTCHA_TYPES):
-            continue
+        icon  = _CAPTCHA_TYPE_ICON.get(cap_type, "🔑")
+        badge = _conf_emoji(confidence)
+        clbl  = _conf_label(confidence)
 
-        entry_num += 1
-        icon = next((v for k, v in _TYPE_ICON.items() if k in cap_type), "🔑")
+        # Difficulty score
+        diff_score, diff_label, diff_emoji = _sitekey_difficulty(f)
 
-        # Key format validation
-        clean_type = cap_type.replace(" ⚠️ (key not found)", "").strip()
-        validator  = _KEY_VALIDATORS.get(clean_type)
-        fmt_ok     = ""
-        if sk and sk != "N/A" and validator:
-            fmt_ok = " ✔️" if validator(sk) else " ✖️"
+        # Card header
+        lines.append(f"┌{'─' * 32}")
+        lines.append(f"│ {icon}  *#{i}*  {escape_md(full_type)}")
+        lines.append(f"│ {badge} {clbl}   {diff_emoji} Difficulty `{escape_md(str(diff_score))}/10` _{diff_label}_")
+        lines.append(f"│")
 
-        lines.append(f"*{icon} [{entry_num}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
-        lines.append(f"  🔑 `{sk}`")
-        page = f.get("page_url", "")
-        if page:
-            lines.append(f"  🌐 `{page[:80]}`")
-        if f.get("action"):
-            lines.append(f"  ⚡ `{f['action']}`")
-        if f.get("invisible"):
-            lines.append(f"  👁️ invisible")
-        if f.get("min_score"):
-            lines.append(f"  📊 score: `{f['min_score']}`")
-        if f.get("enterprise"):
-            lines.append(f"  🏢 enterprise")
-        src = f.get("source", "")[:60]
-        if src:
-            lines.append(f"  📂 _{escape_md(src)}_")
+        # Key (full, copyable)
+        lines.append(f"│ 🔑 *Key:*")
+        lines.append(f"│ `{_key_safe(sk)}`")
 
-        # ── Clean JSON-style solver params ──────────────────────
-        sp_fields = {}
-        sp_fields["type"]    = cap_type
-        sp_fields["sitekey"] = sk
-        if page:
-            sp_fields["pageurl"] = page
-        if f.get("action"):
-            sp_fields["action"]    = f["action"]
-        if f.get("enterprise"):
-            sp_fields["enterprise"] = 1
-        if f.get("min_score"):
-            sp_fields["min_score"]  = float(f["min_score"])
-        if f.get("invisible"):
-            sp_fields["invisible"]  = 1
-        if f.get("s_param"):
-            sp_fields["data-s"]     = f["s_param"][:40]
+        # Page URL (only if different from main)
+        if f_page and f_page.rstrip("/") != page_url.rstrip("/"):
+            lines.append(f"│ 🌐 {_url_short(f_page, 55)}")
 
-        # Align values like JSON
-        max_klen = max(len(k) for k in sp_fields)
-        json_rows = []
-        keys = list(sp_fields.keys())
-        for idx2, (k, v) in enumerate(sp_fields.items()):
-            pad    = " " * (max_klen - len(k))
-            comma  = "," if idx2 < len(keys) - 1 else ""
-            if isinstance(v, str):
-                json_rows.append(f'  "{k}":{pad} "{v}"{comma}')
-            else:
-                json_rows.append(f'  "{k}":{pad} {v}{comma}')
-        json_block = "\n".join(["{"] + json_rows + ["}"])
-        lines.append(f"```\n{json_block}\n```")
+        # Flags (compact row)
+        flags = []
+        if action:     flags.append(f"action=`{escape_md(action)}`")
+        if min_score:  flags.append(f"score=`{escape_md(str(min_score))}`")
+        if invisible:  flags.append("👁 invisible")
+        if enterprise: flags.append("🏢 enterprise")
+        if s_param:    flags.append(f"data-s=`{escape_md(s_param[:16])}…`")
+        if flags:
+            lines.append(f"│ ⚡ {' │ '.join(flags)}")
+
+        # Source
+        if source:
+            lines.append(f"│ 📂 _{escape_md(source)}_")
+
+        # Solver JSON (compact)
+        solver = _build_solver_json(f)
+        json_out = _compact_json(solver)
+        if "\n" in json_out:
+            lines.append(f"│")
+            lines.append(f"│ 📋 *Solver params:*")
+            lines.append(f"```\n{json_out}\n```")
+        else:
+            lines.append(f"│ 📋 `{json_out}`")
+
+        lines.append(f"└{'─' * 32}")
         lines.append("")
 
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("⚠️ _Authorized testing only_")
-    lines.append("📄 _Full solver params — JSON export ကိုကြည့်ပါ_")
+    # ── Footer ────────────────────────────────────────────────
+    lines += [
+        _HEADER_BAR,
+        "📦 _JSON export ကို solver service တွေမှာ တိုက်ရိုက် သုံးနိုင်ပါသည်_",
+        "⚠️ _Authorized security testing only_",
+    ]
 
     report = "\n".join(lines)
     await safe_markdown_reply(msg, _truncate_safe_md(report))
 
-    # ─── Export JSON ─────────────────────────────
+    # ═══════════════════════════════════════════════════════════
+    # JSON EXPORT
+    # ═══════════════════════════════════════════════════════════
+
     import io as _io
-    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d    = re.sub(r'[^\w\-]', '_', domain)
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+
     export = {
-        "domain":     domain,
-        "page_url":   page_url,
-        "scanned_at": datetime.now().isoformat(),
-        "js_scanned": js_count,
-        "live_requests_captured": live_reqs,
-        "sse_frames_captured": len(live_result.get("sse_frames", [])),
-        "confirmed": len(confirmed),
-        "static_only": len(static_only),
+        "command":     "sitekey",
+        "domain":      domain,
+        "page_url":    page_url,
+        "scanned_at":  datetime.now().isoformat(),
+        "js_scanned":  js_count,
+        "live_reqs":   live_reqs,
+        "summary": {
+            "total":     len(findings),
+            "confirmed": len(confirmed),
+            "high":      len(high_live),
+            "static":    len(static_only),
+        },
         "findings": [
             {
                 "type":       f.get("type", ""),
@@ -7217,41 +8111,69 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "pageurl":    f.get("page_url", page_url),
                 "action":     f.get("action", ""),
                 "enterprise": 1 if f.get("enterprise") else 0,
-                "min_score":  float(f["min_score"]) if f.get("min_score") else None,
+                "min_score":  f.get("min_score", ""),
                 "invisible":  1 if f.get("invisible") else 0,
-                "data-s":     f.get("s_param", ""),
-                "hl":         f.get("hl", ""),
-                "co":         f.get("co", ""),
-                "callback":   f.get("callback", ""),
+                "data_s":     f.get("s_param", ""),
+                "confidence": f.get("confidence", ""),
                 "user_agent": f.get("user_agent", ""),
-                # ── Solver-ready format (per-service) ──
                 "solver_params": _get_solver_params(f),
             }
-            # FIX: exclude non-captcha types that bleed in from keydump/live pipeline
             for f in findings
-            if not any(f.get("type", "").startswith(pfx) for pfx in (
-                "Live JWT", "Live API", "Live Bearer", "Live AWS",
-                "Live Stripe", "Live OpenAI", "Live storage",
-                "Authorization", "X-Api-Key", "X-Auth-Token",
-            ))
         ],
     }
+
     json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
+    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
+
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=json_buf,
             filename=f"sitekey_{safe_d}_{ts}.json",
             caption=(
-                f"🔑 *Site Key Report — `{escape_md(domain)}`*\n"
-                f"Found: `{len(findings)}` | JS: `{escape_md(js_count)}`"
+                f"🔑 *Sitekey Report — `{escape_md(domain)}`*\n"
+                f"Found `{escape_md(str(len(findings)))}` │ "
+                f"Confirmed `{escape_md(str(len(confirmed)))}` │ "
+                f"💾 `{json_mb:.2f}` MB"
             ),
             parse_mode='Markdown'
         )
     except Exception as e:
         logger.warning("Sitekey export error: %s", e)
 
-
+    # ── Deobfuscation layer ───────────────────────────────────
+    try:
+        texts_for_deob = {}
+        for item in result.get("network_log", []):
+            if isinstance(item, dict):
+                ct = item.get("content_type", "") or ""
+                if ct.startswith(("application/javascript", "text/javascript")):
+                    body = item.get("response_body", "") or ""
+                    if body:
+                        lbl = item.get("url", "?").split("/")[-1][:40]
+                        texts_for_deob[lbl] = body
+        texts_for_deob["[HTML]"] = result.get("html", "")
+        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
+        if deob_findings:
+            high_deob = [f for f in deob_findings if f.get("in_secret_context") and f.get("entropy", 0) >= 4.5]
+            if high_deob:
+                deob_lines = [
+                    f"\n🧩 *Deobfuscated Secrets*",
+                    _HEADER_BAR,
+                    f"🌐  `{escape_md(domain)}`",
+                    f"🔴  High-risk decoded: `{escape_md(str(len(high_deob)))}`",
+                    "",
+                ]
+                for j, df in enumerate(high_deob[:8], 1):
+                    deob_lines.append(f"  *{j}.* `{escape_md(str(df.get('method','')))}` H=`{escape_md(str(df.get('entropy','')))}`")
+                    deob_lines.append(f"     `{escape_md(str(df.get('decoded',''))[:80])}`")
+                    deob_lines.append(f"     📂 _{escape_md(str(df.get('source',''))[:50])}_")
+                    deob_lines.append("")
+                deob_lines.append("⚠️ _Authorized testing only_")
+                await update.effective_message.reply_text(
+                    _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
+    except Exception as deob_err:
+        logger.debug("sitekey deobfuscate layer error: %s", deob_err)
 
 
 # ══════════════════════════════════════════════════
@@ -10214,7 +11136,7 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_apikeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _apikeys_sync, url, lambda t: progress_q.append(t))
         progress_q.append("\U0001f534 Phase 2: real-time network stream intercept...")
         live_result = await asyncio.to_thread(
             _stream_intercept_sync, url, lambda t: progress_q.append(t), _LIVE_API_PATTERNS
@@ -10366,14 +11288,20 @@ def _firebase_sync(url: str, progress_cb=None) -> dict:
                 seen.add(key)
                 configs.append({"source": source, "config": fields})
 
-    if progress_cb: progress_cb("🔍 Scanning for Firebase config...")
+    if progress_cb: progress_cb("🔍 Scanning for Firebase config (+ deobfuscation)...")
 
     for text, label in _gather_all_text(data):
         for m in _FIREBASE_PATTERNS.finditer(text):
             _parse_config_block(m.group(0), label)
-        # Also scan line by line for firebaseConfig object
         if "projectId" in text and "apiKey" in text:
             _parse_config_block(text, label)
+        # Deobfuscation pass — decode atob/hex/join-hidden Firebase configs
+        _deob = _deobfuscate_text(text)
+        if _deob:
+            for m in _FIREBASE_PATTERNS.finditer(_deob):
+                _parse_config_block(m.group(0), label + " [deobfuscated]")
+            if "projectId" in _deob and "apiKey" in _deob:
+                _parse_config_block(_deob, label + " [deobfuscated]")
 
     # DOM result
     dr = data.get("dom_result") or {}
@@ -10430,7 +11358,7 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_firebase_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _firebase_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -10477,6 +11405,1389 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown')
     except Exception as e:
         logger.warning("firebase export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🔥  /firecheck — Firebase Misconfiguration Scanner
+# ══════════════════════════════════════════════════
+
+def _firecheck_sync(project_id: str, api_key: str = "") -> dict:
+    """
+    Test Firebase Realtime Database for public read/write misconfiguration.
+    Also checks Firestore REST API and Firebase Storage bucket.
+    """
+    results = {}
+    rtdb_url = f"https://{project_id}-default-rtdb.firebaseio.com/.json"
+
+    # ── Realtime Database: Public Read ─────────────────────────────
+    try:
+        r = requests.get(rtdb_url, timeout=12, verify=False,
+                         headers={**HEADERS, "Accept": "application/json"})
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                if data is None:
+                    results["rtdb_read"] = {"status": "🟡 OPEN (empty)", "detail": "Database exists but is empty"}
+                else:
+                    preview   = json.dumps(data, ensure_ascii=False)[:200]
+                    key_count = len(data) if isinstance(data, dict) else "N/A"
+                    results["rtdb_read"] = {
+                        "status":  "🔴 VULNERABLE — Public Read",
+                        "detail":  f"Root keys: {key_count}",
+                        "preview": preview,
+                    }
+            except Exception:
+                results["rtdb_read"] = {"status": "🟡 OPEN (non-JSON)", "detail": r.text[:100]}
+        elif r.status_code == 401:
+            results["rtdb_read"] = {"status": "✅ PROTECTED — Auth required", "detail": "401 Unauthorized"}
+        elif r.status_code == 403:
+            results["rtdb_read"] = {"status": "✅ PROTECTED — Permission denied", "detail": "403 Forbidden"}
+        elif r.status_code == 404:
+            results["rtdb_read"] = {"status": "⚪ NOT FOUND", "detail": "RTDB not enabled or wrong project-id"}
+        else:
+            results["rtdb_read"] = {"status": f"⚠️ HTTP {r.status_code}", "detail": r.text[:80]}
+    except requests.RequestException as e:
+        results["rtdb_read"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:80]}
+
+    # ── Realtime Database: Public Write test ───────────────────────
+    try:
+        probe_path = f"https://{project_id}-default-rtdb.firebaseio.com/firecheck_probe.json"
+        wr = requests.put(probe_path, json={"_probe": True}, timeout=10,
+                          headers={**HEADERS, "Content-Type": "application/json"}, verify=False)
+        if wr.status_code in (200, 201):
+            results["rtdb_write"] = {
+                "status": "🔴 VULNERABLE — Public Write",
+                "detail": "Unauthenticated write succeeded",
+            }
+            try:
+                requests.delete(probe_path, timeout=8, verify=False)
+            except Exception:
+                pass
+        elif wr.status_code in (401, 403):
+            results["rtdb_write"] = {"status": "✅ PROTECTED — Write denied", "detail": f"HTTP {wr.status_code}"}
+        else:
+            results["rtdb_write"] = {"status": f"⚠️ HTTP {wr.status_code}", "detail": wr.text[:60]}
+    except requests.RequestException as e:
+        results["rtdb_write"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:60]}
+
+    # ── Firestore REST API ─────────────────────────────────────────
+    if api_key:
+        fs_url = (
+            f"https://firestore.googleapis.com/v1/projects/{project_id}"
+            f"/databases/(default)/documents?key={api_key}"
+        )
+        try:
+            fr = requests.get(fs_url, timeout=10, headers=HEADERS, verify=False)
+            if fr.status_code == 200:
+                docs = fr.json().get("documents", [])
+                results["firestore"] = {
+                    "status": "🔴 VULNERABLE — Firestore Public Read",
+                    "detail": f"{len(docs)} document(s) accessible",
+                }
+            elif fr.status_code == 403:
+                results["firestore"] = {"status": "✅ PROTECTED", "detail": "Firestore requires auth"}
+            else:
+                results["firestore"] = {"status": f"⚪ HTTP {fr.status_code}", "detail": ""}
+        except Exception as e:
+            results["firestore"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:60]}
+    else:
+        results["firestore"] = {"status": "⚪ SKIPPED", "detail": "apiKey မပေးဘဲ Firestore check မလုပ်နိုင်"}
+
+    # ── Firebase Storage ───────────────────────────────────────────
+    storage_url = f"https://storage.googleapis.com/{project_id}.appspot.com/"
+    try:
+        sr = requests.get(storage_url, timeout=10, headers=HEADERS, verify=False)
+        if sr.status_code == 200:
+            results["storage"] = {
+                "status":  "🔴 VULNERABLE — Storage Public",
+                "detail":  "Bucket listing accessible",
+                "preview": sr.text[:150],
+            }
+        elif sr.status_code == 403:
+            results["storage"] = {"status": "✅ PROTECTED", "detail": "Storage not public"}
+        elif sr.status_code == 404:
+            results["storage"] = {"status": "⚪ NOT FOUND", "detail": "Bucket does not exist"}
+        else:
+            results["storage"] = {"status": f"⚪ HTTP {sr.status_code}", "detail": ""}
+    except Exception as e:
+        results["storage"] = {"status": "⚪ UNREACHABLE", "detail": str(e)[:60]}
+
+    return results
+
+
+@user_guard
+async def cmd_firecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/firecheck <project_id> [api_key] — Firebase misconfiguration scanner"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            "  `/firecheck <project-id>`\n"
+            "  `/firecheck <project-id> <apiKey>`\n\n"
+            "🔥 *Tests:*\n"
+            "  • Realtime Database — Public Read\n"
+            "  • Realtime Database — Public Write\n"
+            "  • Firestore REST API _(apiKey လိုသည်)_\n"
+            "  • Firebase Storage bucket listing\n\n"
+            "💡 _projectId နဲ့ apiKey ကို `/firebase <url>` မှ ရနိုင်သည်_\n\n"
+            "⚠️ _Authorized security testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    project_id = context.args[0].strip().lower()
+    api_key    = context.args[1].strip() if len(context.args) > 1 else ""
+
+    if not re.match(r'^[a-z0-9\-]{3,80}$', project_id):
+        await update.effective_message.reply_text("🚫 Invalid project-id format", parse_mode='Markdown')
+        return
+
+    msg = await update.effective_message.reply_text(
+        f"🔥 *Firebase Misconfig Scanner*\n"
+        f"🆔 `{escape_md(project_id)}`\n\n"
+        "⏳ Testing RTDB Read, Write, Firestore, Storage...",
+        parse_mode='Markdown'
+    )
+
+    try:
+        res = await asyncio.to_thread(_firecheck_sync, project_id, api_key)
+    except Exception as e:
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+
+    vuln_count = sum(1 for v in res.values() if "VULNERABLE" in v.get("status", ""))
+    overall    = "🔴 MISCONFIGURED" if vuln_count else "✅ SECURE"
+
+    lines = [
+        "🔥 *Firebase Misconfig Report*",
+        f"🆔 `{escape_md(project_id)}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Overall: *{overall}* | Vulns: `{vuln_count}`",
+        "",
+        "*🗄️ Realtime Database — Read*",
+        f"  {res['rtdb_read']['status']}",
+    ]
+    if res['rtdb_read'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['rtdb_read']['detail'])}_")
+    if res['rtdb_read'].get('preview'):
+        _prev = res['rtdb_read']['preview'][:120].replace('`', "'")
+        lines.append(f"```\n{_prev}\n```")
+
+    lines += ["", "*✏️ Realtime Database — Write*", f"  {res['rtdb_write']['status']}"]
+    if res['rtdb_write'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['rtdb_write']['detail'])}_")
+
+    lines += ["", "*📂 Firestore REST API*", f"  {res['firestore']['status']}"]
+    if res['firestore'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['firestore']['detail'])}_")
+
+    lines += ["", "*🗂️ Firebase Storage*", f"  {res['storage']['status']}"]
+    if res['storage'].get('detail'):
+        lines.append(f"  📋 _{escape_md(res['storage']['detail'])}_")
+
+    lines += [
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        ("🔴 *Misconfiguration တွေ့ပါသည်*\n_Firebase Console → Database Rules စစ်ဆေးပါ_"
+         if vuln_count else "✅ _Firebase resources properly secured_"),
+        "⚠️ _Authorized testing only_",
+    ]
+
+    report = "\n".join(lines)
+    await safe_markdown_reply(msg, _truncate_safe_md(report))
+
+    import io as _io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "project_id": project_id,
+                "scanned_at": datetime.now().isoformat(),
+                "vulnerable": vuln_count > 0,
+                "vuln_count": vuln_count,
+                "results":    res,
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"firecheck_{project_id}_{ts}.json",
+            caption=(
+                f"🔥 Firebase Misconfig — `{escape_md(project_id)}`\n"
+                f"Vulns: `{vuln_count}` | {overall}"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("firecheck export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🔬  /entropy — High Entropy Secret Hunter
+# ══════════════════════════════════════════════════
+
+def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> dict:
+    """
+    Shannon Entropy-based secret hunter.
+    Scans HTML + JS bundles for high-entropy strings likely to be secrets.
+    Classifies results by risk tier and string type.
+    """
+    if progress_cb: progress_cb("🌐 Fetching HTML...")
+
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
+        html  = resp.text
+        final_url = resp.url
+    except Exception as e:
+        return {"error": str(e), "findings": [], "js_count": 0}
+
+    texts = [html]
+    js_urls: set = set()
+    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        abs_src = urljoin(final_url, src)
+        if abs_src.startswith("http"):
+            js_urls.add(abs_src)
+
+    if progress_cb: progress_cb(f"📦 Fetching {len(js_urls)} JS bundles...")
+    for js_url in list(js_urls)[:20]:
+        try:
+            r = requests.get(js_url, headers=HEADERS,
+                             proxies=proxy_manager.get_proxy(), timeout=TIMEOUT, verify=False)
+            if r.status_code == 200:
+                texts.append(r.text)
+        except Exception:
+            pass
+
+    if progress_cb: progress_cb("🔬 Running Shannon entropy analysis...")
+
+    _CANDIDATE_RE = re.compile(
+        r'["\']([A-Za-z0-9+/=_\-\.]{16,120})["\']'
+        r'|(?:key|secret|token|pass|api|auth|credential|private|access)'
+        r'[_\-]?\s*["\s:=]+\s*["\']([A-Za-z0-9+/=_\-\.]{8,120})["\']',
+        re.I
+    )
+    _CONTEXT_RE = re.compile(
+        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|bearer|'
+        r'client_secret|webhook|signing|encryption|sk_|pk_|AKIA|ya29|eyJ)',
+        re.I
+    )
+    _FP_RE = re.compile(
+        r'^(?:[0-9a-f]{3,8})$'
+        r'|^(?:true|false|null|undefined)$'
+        r'|\.(js|css|png|jpg|svg|woff|html|json)$'
+        r'|^https?://',
+        re.I
+    )
+
+    seen = set()
+    findings = []
+
+    for text in texts:
+        for m in _CANDIDATE_RE.finditer(text):
+            val = (m.group(1) or m.group(2) or "").strip()
+            if not val or val in seen or len(val) < 12:
+                continue
+            if _FP_RE.search(val):
+                continue
+            seen.add(val)
+
+            score = _entropy(val)
+            if score < threshold:
+                continue
+
+            ctx_start = max(0, m.start() - 80)
+            ctx       = text[ctx_start: m.start() + len(val) + 80]
+            ctx       = re.sub(r'\s+', ' ', ctx).strip()
+            in_ctx    = bool(_CONTEXT_RE.search(ctx))
+
+            risk = ("🔴 HIGH" if (score >= 4.8 and in_ctx) else
+                    "🟡 MED"  if (score >= 4.4 or in_ctx) else
+                    "⚪ LOW")
+
+            kind = "Unknown"
+            if re.match(r'^eyJ', val):               kind = "JWT"
+            elif re.match(r'^sk_|^pk_|^rk_', val):  kind = "Stripe-like"
+            elif re.match(r'^AKIA', val):             kind = "AWS Key"
+            elif re.match(r'^ya29\.', val):           kind = "Google Token"
+            elif re.match(r'^[0-9a-fA-F]+$', val):   kind = "Hex"
+            elif re.match(r'^[A-Za-z0-9+/]+=*$', val) and len(val) % 4 == 0:
+                kind = "Base64"
+
+            findings.append({
+                "value":              val,
+                "entropy":            round(score, 3),
+                "risk":               risk,
+                "kind":               kind,
+                "context":            ctx[:100],
+                "in_secret_context":  in_ctx,
+            })
+
+    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
+
+    return {
+        "url":       url,
+        "final_url": final_url,
+        "js_count":  len(js_urls),
+        "threshold": threshold,
+        "findings":  findings,
+    }
+
+
+# ══════════════════════════════════════════════════
+# 💳  /payconfig — Payment Configuration Auditor
+# ══════════════════════════════════════════════════
+# Scope: Extract & audit the EXPOSED payment integration config from
+# a site's HTML/JS — gateway profiles, CSP headers, webhook URLs,
+# form field structure, currency config, and PCI risk signals.
+# Does NOT use found keys to call gateway APIs.
+# ══════════════════════════════════════════════════
+
+# ── CSP header parser for payment domains ─────────────────────────────────
+_PAY_CSP_DOMAINS = {
+    "js.stripe.com":         "Stripe JS SDK",
+    "checkout.stripe.com":   "Stripe Checkout",
+    "q.stripe.com":          "Stripe telemetry",
+    "js.braintreegateway.com": "Braintree JS",
+    "assets.braintreegateway.com": "Braintree assets",
+    "www.paypal.com":        "PayPal",
+    "www.sandbox.paypal.com":"PayPal Sandbox",
+    "js.razorpay.com":       "Razorpay JS",
+    "api.razorpay.com":      "Razorpay API",
+    "js.squareup.com":       "Square JS",
+    "js.squareupsandbox.com":"Square Sandbox",
+    "hcaptcha.com":          "hCaptcha",
+    "js.hcaptcha.com":       "hCaptcha JS",
+    "challenges.cloudflare.com": "Cloudflare Turnstile",
+    "www.google.com/recaptcha": "reCAPTCHA",
+    "adyen.com":             "Adyen",
+    "checkout.adyen.com":    "Adyen Checkout",
+    "live.adyen.com":        "Adyen Live",
+    "pay.google.com":        "Google Pay",
+    "apple.com/apple-pay":   "Apple Pay",
+    "api.klarna.com":        "Klarna",
+    "x.klarnacdn.net":       "Klarna CDN",
+    "paddle.com":            "Paddle",
+    "buy.paddle.com":        "Paddle Checkout",
+    "mollie.com":            "Mollie",
+    "paystack.com":          "Paystack",
+    "flutterwave.com":       "Flutterwave",
+    "checkout.com":          "Checkout.com",
+    "coinbase.com/commerce": "Coinbase Commerce",
+    "affirm.com":            "Affirm",
+    "afterpay.com":          "Afterpay",
+    "clearpay.co.uk":        "Clearpay",
+}
+
+# ── Webhook URL patterns ───────────────────────────────────────────────────
+_WEBHOOK_PATTERNS = [
+    ("Stripe Webhook",    re.compile(r'(?i)(?:stripe[_\-]?)?webhook[_\-]?(?:url|endpoint|secret)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("PayPal IPN",        re.compile(r'(?i)paypal[_\-]?(?:ipn|webhook)[_\-]?url\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Generic Webhook",   re.compile(r'(?i)webhook[_\-]?(?:url|endpoint)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Callback URL",      re.compile(r'(?i)(?:return|callback|redirect)[_\-]?url\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Success URL",       re.compile(r'(?i)success[_\-]?(?:url|redirect)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Cancel URL",        re.compile(r'(?i)cancel[_\-]?(?:url|redirect)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+]
+
+# ── Currency / locale signals ──────────────────────────────────────────────
+_CURRENCY_RE = re.compile(
+    r'(?i)(?:currency|locale|country)[_\-]?(?:code)?\s*[=:,]\s*["\']([A-Z]{2,6})["\']'
+    r'|["\']currency["\']\s*:\s*["\']([A-Z]{2,6})["\']'
+    r'|amount\s*:\s*(\d{1,10})\s*(?:,|})'
+)
+
+# ── Payment form field fingerprint ────────────────────────────────────────
+_FORM_FIELD_SIGNALS = {
+    "Card Number field":      re.compile(r'(?i)card[_\-]?number|cardnumber|cc[_\-]?num'),
+    "CVV/CVC field":          re.compile(r'(?i)\bcvv\b|\bcvc\b|\bsecurity[_\-]?code'),
+    "Expiry field":           re.compile(r'(?i)exp(?:ir(?:y|ation))?[_\-]?(?:date|month|year)|card[_\-]?exp'),
+    "Cardholder name field":  re.compile(r'(?i)cardholder[_\-]?name|card[_\-]?holder|billing[_\-]?name'),
+    "Billing address field":  re.compile(r'(?i)billing[_\-]?address|billing[_\-]?zip|billing[_\-]?postal'),
+    "UPI field (India)":      re.compile(r'(?i)upi[_\-]?id|vpa[_\-]?address|bhim'),
+    "IBAN/SEPA field":        re.compile(r'(?i)\biban\b|\bsepa\b|bank[_\-]?account'),
+    "Crypto address field":   re.compile(r'(?i)wallet[_\-]?address|crypto[_\-]?address|eth[_\-]?address'),
+}
+
+# ── PCI SAQ level heuristics ──────────────────────────────────────────────
+def _pci_saq_estimate(form_fields: list, gateways: list, csp_gateways: list) -> str:
+    """Estimate PCI DSS SAQ type from integration signals."""
+    has_iframe = any("Stripe" in g or "Braintree" in g or "Square" in g or "Adyen" in g
+                     for g in gateways + csp_gateways)
+    has_raw_fields = any("Card Number" in f or "CVV" in f or "Expiry" in f for f in form_fields)
+
+    if has_raw_fields and not has_iframe:
+        return "⚠️ SAQ D (raw card fields in DOM — PCI scope FULL)"
+    elif has_iframe or has_raw_fields is False:
+        return "✅ SAQ A or A-EP (iframe/redirect — reduced PCI scope)"
+    else:
+        return "⚪ SAQ unclear — manual review needed"
+
+
+def _payconfig_sync(url: str, progress_cb=None) -> dict:
+    """
+    Payment configuration surface auditor.
+    Scans HTML, JS, HTTP headers, CSP for exposed payment integration
+    configuration — gateways, modes, currencies, webhook URLs, form structure,
+    PCI risk tier — without using any found keys to call external APIs.
+    """
+    result = {
+        "url":           url,
+        "page_url":      url,
+        "gateways":      [],
+        "sdk_scripts":   [],
+        "csp_gateways":  [],
+        "currencies":    [],
+        "webhooks":      [],
+        "form_fields":   [],
+        "pci_saq":       "",
+        "pci_risks":     [],
+        "threeds":       [],
+        "key_modes":     {"live": [], "test": [], "unknown": []},
+        "security_headers": {},
+        "findings":      [],   # full paykeys findings reused
+        "gateway_profile": None,
+        "error":         None,
+    }
+
+    if progress_cb: progress_cb("🌐 Fetching page + HTTP headers...")
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy,
+                             timeout=TIMEOUT, verify=False, allow_redirects=True)
+        html      = resp.text
+        final_url = resp.url
+        http_hdrs = dict(resp.headers)
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    result["page_url"] = final_url
+
+    # ── 1. Security headers relevant to payments ──────────────────────────────
+    _SEC_HDRS = {
+        "Content-Security-Policy": "CSP",
+        "Strict-Transport-Security": "HSTS",
+        "X-Frame-Options": "X-Frame-Options",
+        "Referrer-Policy": "Referrer-Policy",
+        "Permissions-Policy": "Permissions-Policy",
+        "Cross-Origin-Opener-Policy": "COOP",
+    }
+    for hdr, label in _SEC_HDRS.items():
+        v = http_hdrs.get(hdr, "") or http_hdrs.get(hdr.lower(), "")
+        if v:
+            result["security_headers"][label] = v[:200]
+
+    # ── 2. CSP payment domain fingerprint ────────────────────────────────────
+    if progress_cb: progress_cb("🔍 Parsing CSP for payment domains...")
+    csp_val = (result["security_headers"].get("CSP", "")
+               or http_hdrs.get("Content-Security-Policy", ""))
+    for domain_kw, gw_name in _PAY_CSP_DOMAINS.items():
+        if domain_kw in csp_val:
+            if gw_name not in result["csp_gateways"]:
+                result["csp_gateways"].append(gw_name)
+
+    # ── 3. Gather JS text corpus ──────────────────────────────────────────────
+    if progress_cb: progress_cb("📦 Fetching JS bundles...")
+    texts: list = [(html, "HTML")]
+    for src in re.findall(r'<script[^>]+src=["\']([^"\'>]+)["\']>', html, re.I)[:25]:
+        js_url = urljoin(final_url, src)
+        if not js_url.startswith("http"):
+            continue
+        try:
+            jr = requests.get(js_url, headers=HEADERS, proxies=proxy_manager.get_proxy(),
+                              timeout=TIMEOUT, verify=False)
+            if jr.status_code == 200:
+                body = jr.text
+                texts.append((body, js_url.split("/")[-1][:40]))
+                # deobfuscation pass
+                _deob = _deobfuscate_text(body)
+                if _deob:
+                    texts.append((_deob, js_url.split("/")[-1][:40] + " [deobfuscated]"))
+        except Exception:
+            pass
+
+    combined = "\n".join(t for t, _ in texts)
+
+    # ── 4. SDK <script> tag fingerprint ──────────────────────────────────────
+    if progress_cb: progress_cb("🏦 Fingerprinting payment SDK scripts...")
+    _SDK_PATTERNS = [
+        (re.compile(r'js\.stripe\.com'),        "Stripe JS SDK"),
+        (re.compile(r'checkout\.stripe\.com'),   "Stripe Checkout"),
+        (re.compile(r'braintreegateway\.com'),    "Braintree JS"),
+        (re.compile(r'paypal\.com/sdk/js'),       "PayPal SDK"),
+        (re.compile(r'www\.paypalobjects\.com'), "PayPal Legacy"),
+        (re.compile(r'js\.razorpay\.com'),       "Razorpay JS"),
+        (re.compile(r'js\.squareup\.com'),       "Square Web SDK"),
+        (re.compile(r'checkout\.adyen\.com'),    "Adyen Web"),
+        (re.compile(r'x\.klarnacdn\.net'),       "Klarna JS"),
+        (re.compile(r'buy\.paddle\.com'),        "Paddle.js"),
+        (re.compile(r'mollie\.com'),              "Mollie JS"),
+        (re.compile(r'paystack\.com/popup'),      "Paystack Popup"),
+        (re.compile(r'flutterwave\.com'),         "Flutterwave JS"),
+        (re.compile(r'checkout\.com'),            "Checkout.com"),
+        (re.compile(r'pay\.google\.com'),        "Google Pay API"),
+        (re.compile(r'apple(?:pay)?\.com'),       "Apple Pay"),
+        (re.compile(r'shop\.app/pay'),            "Shop Pay"),
+        (re.compile(r'cashfree\.com'),            "Cashfree"),
+        (re.compile(r'payu\.in|payu\.com'),      "PayU"),
+        (re.compile(r'coinbase\.com/commerce'),   "Coinbase Commerce"),
+    ]
+    sdk_seen = set()
+    for pat, sdk_name in _SDK_PATTERNS:
+        if pat.search(html) and sdk_name not in sdk_seen:
+            sdk_seen.add(sdk_name)
+            result["sdk_scripts"].append(sdk_name)
+    result["gateways"] = list(set(result["sdk_scripts"] + result["csp_gateways"]))
+
+    # ── 5. Key mode detection (live vs test) ──────────────────────────────────
+    if progress_cb: progress_cb("🔑 Detecting payment key modes (live/test)...")
+    _KEY_MODE_PATS = [
+        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live PK", True),
+        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test PK", False),
+        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live SK ⚠️", True),
+        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test SK", False),
+        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'), "Razorpay Live", True),
+        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'), "Razorpay Test", False),
+        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),      "Flutterwave Live PK", True),
+        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'), "Flutterwave Test PK", False),
+        (re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b'), "Checkout.com Key", None),
+        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live", True),
+        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox", False),
+    ]
+    mode_seen = set()
+    for pat, label, is_live in _KEY_MODE_PATS:
+        for m in pat.finditer(combined):
+            val = m.group(1)
+            key = label + ":" + val[:20]
+            if key in mode_seen:
+                continue
+            mode_seen.add(key)
+            masked = val[:12] + "..." + val[-4:] if len(val) > 16 else val
+            entry = {"label": label, "masked": masked}
+            if is_live is True:
+                result["key_modes"]["live"].append(entry)
+            elif is_live is False:
+                result["key_modes"]["test"].append(entry)
+            else:
+                result["key_modes"]["unknown"].append(entry)
+
+    # ── 6. Currency / locale detection ────────────────────────────────────────
+    if progress_cb: progress_cb("💱 Detecting currencies + locales...")
+    currency_seen = set()
+    for m in _CURRENCY_RE.finditer(combined):
+        val = (m.group(1) or m.group(2) or "").upper()
+        if val and len(val) <= 4 and val.isalpha() and val not in currency_seen:
+            currency_seen.add(val)
+    result["currencies"] = sorted(currency_seen)[:20]
+
+    # ── 7. Webhook / callback URL extraction ─────────────────────────────────
+    if progress_cb: progress_cb("🔗 Extracting webhook + callback URLs...")
+    wh_seen = set()
+    for wh_type, pat in _WEBHOOK_PATTERNS:
+        for m in pat.finditer(combined):
+            wh_url = m.group(1).strip().strip('"\' ')
+            key    = wh_url[:80]
+            if key not in wh_seen and "example" not in key.lower():
+                wh_seen.add(key)
+                result["webhooks"].append({"type": wh_type, "url": wh_url[:100]})
+
+    # ── 8. Form field fingerprint ─────────────────────────────────────────────
+    if progress_cb: progress_cb("📋 Fingerprinting payment form fields...")
+    for field_name, pat in _FORM_FIELD_SIGNALS.items():
+        if pat.search(html):   # only HTML for real form fields
+            result["form_fields"].append(field_name)
+
+    # ── 9. 3DS / SCA signal detection ────────────────────────────────────────
+    _3DS_QUICK = [
+        (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction|authenticateSource'), "Stripe 3DS confirmPayment"),
+        (re.compile(r'(?i)stripe\.confirmCardPayment'),        "Stripe confirmCardPayment"),
+        (re.compile(r'(?i)paymentIntent\.status.*requires_action'), "PaymentIntent requires_action"),
+        (re.compile(r'(?i)threeDS(?:Method|Result|Fingerprint)'), "Adyen/Generic 3DS fingerprint"),
+        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),         "3D Secure reference"),
+        (re.compile(r'(?i)\.redirect(?:To)?3ds'),               "redirect3DS call"),
+        (re.compile(r'(?i)authentication_required'),             "authentication_required status"),
+        (re.compile(r'(?i)sca[_\-]?(?:required|enforcement|challenge)'), "SCA enforcement"),
+    ]
+    for pat, label in _3DS_QUICK:
+        if pat.search(combined) and label not in result["threeds"]:
+            result["threeds"].append(label)
+
+    # ── 10. PCI risk scan ─────────────────────────────────────────────────────
+    _PCI_QUICK = [
+        (re.compile(r'(?i)document\.getElementById.*card.?number'),
+         "⚠️ Raw card number input in DOM — SAQ D scope"),
+        (re.compile(r'(?i)localStorage\.setItem.*(?:card|payment|stripe|token)'),
+         "⚠️ Payment data stored in localStorage"),
+        (re.compile(r'(?i)console\.log.*(?:sk_|pk_|secret)'),
+         "⚠️ Payment key logged to console"),
+        (re.compile(r'(?i)http://(?!localhost).*(?:checkout|payment|pay)'),
+         "⚠️ Non-HTTPS payment page link detected"),
+        (re.compile(r'(?i)cvv|cvc|security.?code'),
+         "⚠️ CVV/CVC field present — PCI scope applies"),
+        (re.compile(r'(?i)eval\s*\(|Function\s*\(["\']return'),
+         "⚠️ eval() in JS — obfuscation risk"),
+    ]
+    for pat, note in _PCI_QUICK:
+        if pat.search(combined) and note not in result["pci_risks"]:
+            result["pci_risks"].append(note)
+
+    # ── 11. PCI SAQ estimate ──────────────────────────────────────────────────
+    result["pci_saq"] = _pci_saq_estimate(
+        result["form_fields"], result["gateways"], result["csp_gateways"]
+    )
+
+    return result
+
+
+@user_guard
+async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payconfig <url> — Payment integration configuration auditor"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/payconfig https://example.com`\n\n"
+            "🔍 *Payment Config Auditor — scans:*\n"
+            "  • Payment SDK scripts (20+ gateways fingerprint)\n"
+            "  • CSP header → payment domain whitelist\n"
+            "  • Key mode detection: 🔴 LIVE vs 🟢 TEST\n"
+            "  • Currencies / locales detected\n"
+            "  • Webhook + callback URLs exposed\n"
+            "  • Payment form field structure\n"
+            "  • 3DS / SCA enforcement signals\n"
+            "  • PCI SAQ scope estimate (A / A-EP / D)\n"
+            "  • Security headers audit (CSP, HSTS, X-Frame)\n"
+            "  • Deobfuscation pass over all JS bundles\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"💳 *Payment Config Auditor*\n"
+        f"🌐 `{escape_md(domain)}`\n\n"
+        "⏳ Scanning payment integration surface...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"💳 *Pay Config — `{escape_md(domain)}`*\n\n{escape_md(t)}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await run_scan(
+            uid, _payconfig_sync, url, lambda t: progress_q.append(t)
+        )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    live_count  = len(result["key_modes"]["live"])
+    test_count  = len(result["key_modes"]["test"])
+    vuln_pci    = len(result["pci_risks"])
+    overall_env = ("🔴 LIVE" if live_count else "🟢 TEST" if test_count else "⚪ UNKNOWN")
+
+    lines = [
+        f"💳 *Payment Config Audit — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(result['page_url'][:80])}`",
+        f"🏦 Gateways: `{len(result['gateways'])}` detected | Mode: *{overall_env}*",
+        f"⚠️ PCI Risks: `{vuln_pci}` | 3DS signals: `{len(result['threeds'])}`",
+        "",
+    ]
+
+    if result["sdk_scripts"]:
+        lines.append("*🏦 Payment SDK Scripts:*")
+        for gw in result["sdk_scripts"]:
+            lines.append(f"  ✅ {gw}")
+        lines.append("")
+
+    if result["csp_gateways"]:
+        lines.append("*🔐 CSP-Whitelisted Gateways:*")
+        for gw in result["csp_gateways"]:
+            lines.append(f"  📋 {gw}")
+        lines.append("")
+
+    if result["key_modes"]["live"] or result["key_modes"]["test"]:
+        lines.append("*🔑 Key Mode Fingerprint:*")
+        for e in result["key_modes"]["live"][:5]:
+            _m = e["masked"].replace("`", "'")
+            lines.append(f"  🔴 LIVE — {escape_md(e['label'])} `{_m}`")
+        for e in result["key_modes"]["test"][:5]:
+            lines.append(f"  🟢 TEST — {escape_md(e['label'])}")
+        for e in result["key_modes"]["unknown"][:3]:
+            lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
+        lines.append("")
+
+    if result["currencies"]:
+        _cur = escape_md(", ".join(result["currencies"][:15]))
+        lines.append(f"*💱 Currencies detected:* `{_cur}`")
+        lines.append("")
+
+    if result["webhooks"]:
+        lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
+        for wh in result["webhooks"][:6]:
+            _wu = wh["url"][:70].replace("`", "'")
+            lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
+        lines.append("")
+
+    if result["pci_risks"]:
+        lines.append("*🚨 PCI Risk Findings:*")
+        for r in result["pci_risks"][:6]:
+            lines.append(f"  {escape_md(r)}")
+        lines.append("")
+
+    if result["pci_saq"]:
+        lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
+        lines.append("")
+
+    if result["security_headers"]:
+        lines.append("*🛡️ Security Headers:*")
+        for k, v in result["security_headers"].items():
+            _v = v[:60].replace("`", "'")
+            lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
+        lines.append("")
+
+    lines += ["━━━━━━━━━━━━━━━━━━", "⚠️ _Authorized testing only_"]
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    # ── Build findings for solver config section ───────────────────────
+    findings = []
+    for _km_entry in result["key_modes"]["live"] + result["key_modes"]["test"]:
+        if _km_entry.get("value"):  # unmasked value if available
+            findings.append({
+                "type":  _km_entry.get("label", "Payment Key"),
+                "value": _km_entry["value"],
+                "confidence": "HIGH" if "live" in str(_km_entry).lower() else "STATIC",
+            })
+
+    # Solver config section (PATCH 5)
+    # Deduplicate
+    findings = _dedup_by_key(findings, "value")
+
+    lines = [
+        "⚙️ *Solver Configurations*",
+        _HEADER_BAR,
+        f"🌐  `{escape_md(domain)}`",
+        f"🔧  Configs: `{escape_md(str(len(findings)))}` keys",
+        "",
+    ]
+
+    if not findings:
+        lines += [
+            "📭 *Configure လုပ်မယ့် key မရှိပါ*",
+            "",
+            "_`/paykeys <url>` သို့မဟုတ် `/sitekey <url>` အရင် run ပါ_",
+        ]
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+        return
+
+    # ── Per-key solver configs ────────────────────────────────
+    _svc_labels = [
+        ("🟢 Capsolver",    "capsolver"),
+        ("🔵 2Captcha",     "2captcha"),
+        ("🟣 AntiCaptcha",  "anticaptcha"),
+        ("🟠 EzCaptcha",    "ezcaptcha"),
+    ]
+
+    for i, f in enumerate(findings, 1):
+        ftype  = f.get("type", "Unknown")
+        value  = f.get("value") or f.get("site_key") or ""
+        params = f.get("solver_params") or _get_solver_params(f)
+
+        # Environment
+        env_raw = _classify_api_env(ftype, value)
+        env_str = "⚪"
+        for ek, ev in _ENV_LABELS.items():
+            if ek in env_raw:
+                env_str = ev
+                break
+
+        # Provider icon
+        provider = _detect_pay_provider(ftype)
+        p_icon   = _PAY_PROVIDER_ICON.get(provider, "🔑")
+
+        lines.append(f"┌{'─' * 34}")
+        lines.append(f"│ {p_icon} *{i}.*  {escape_md(ftype)}")
+        lines.append(f"│ {env_str}")
+        lines.append(f"│ 🔑 `{_key_safe(value)[:65]}`")
+        lines.append(f"│")
+
+        # Per-service solver configs
+        has_any = False
+        for svc_label, svc_key in _svc_labels:
+            cfg = params.get(svc_key)
+            if not cfg:
+                continue
+            has_any = True
+
+            cfg_out = _compact_json(cfg)
+            lines.append(f"│ {svc_label}:")
+            if "\n" in cfg_out:
+                lines.append(f"│ ```\n{cfg_out}\n```")
+            else:
+                lines.append(f"│ ```{cfg_out}```")
+            lines.append(f"│")
+
+        if not has_any:
+            lines.append(f"│ ⚠️ _Auto-config unavailable for this key type_")
+            lines.append(f"│")
+
+        lines.append(f"└{'─' * 34}")
+        lines.append("")
+
+    # ── Quick start guide ─────────────────────────────────────
+    lines += [
+        _HEADER_BAR,
+        "",
+        "📋 *Quick Start — Capsolver:*",
+        "```",
+        "POST https://api.capsolver.com/createTask",
+        "{",
+        '  "clientKey": "YOUR_CAPSOLVER_KEY",',
+        '  "task": { ... config above ... }',
+        "}",
+        "```",
+        "",
+        "📋 *Quick Start — 2Captcha:*",
+        "```",
+        "POST https://2captcha.com/in.php",
+        "  key=YOUR_2CAPTCHA_KEY",
+        "  method=userrecaptcha",
+        "  googlekey=SITE_KEY",
+        "  pageurl=PAGE_URL",
+        "```",
+        "",
+        "⚠️ _YOUR\\_API\\_KEY ကို solver account key နဲ့ အစားထိုးပါ_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    # ── JSON Export ───────────────────────────────────────────
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+
+    export = {
+        "command":    "payconfig",
+        "domain":     domain,
+        "scanned_at": datetime.now().isoformat(),
+        "total":      len(findings),
+        "configs": [
+            {
+                "type":          f.get("type", ""),
+                "value":         f.get("value") or f.get("site_key") or "",
+                "provider":      _detect_pay_provider(f.get("type", "")),
+                "environment":   _classify_api_env(f.get("type", ""), f.get("value", "")),
+                "solver_params": f.get("solver_params") or _get_solver_params(f),
+            }
+            for f in findings
+        ],
+    }
+
+    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
+    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
+
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=json_buf,
+            filename=f"payconfig_{safe_d}_{ts}.json",
+            caption=(
+                f"⚙️ *Payconfig — `{escape_md(domain)}`*\n"
+                f"Configs `{escape_md(str(len(findings)))}` │ "
+                f"💾 `{json_mb:.2f}` MB\n"
+                f"_Solver-ready JSON — copy to API call_"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("Payconfig export error: %s", e)
+
+@user_guard
+async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/entropy <url> [threshold] — High entropy secret hunter"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:*\n"
+            "  `/entropy https://example.com`\n"
+            "  `/entropy https://example.com 4.5`  ← threshold\n\n"
+            "🔬 *Shannon Entropy Secret Hunter:*\n"
+            "  • HTML + JS bundle scan\n"
+            "  • Entropy ≥ 4.2 (default) ကိုသာ ပြသည်\n"
+            "  • Secret context detection (key/token/auth)\n"
+            "  • Base64 / Hex / JWT / AWS / Stripe classification\n"
+            "  • 🔴 HIGH / 🟡 MED / ⚪ LOW risk tiers\n\n"
+            "💡 _Regex နဲ့ မရနိုင်တဲ့ custom keys, rotating tokens တွေကို ရှာဖွေသည်_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    threshold = 4.2
+    if len(context.args) > 1:
+        try:
+            threshold = max(3.0, min(6.0, float(context.args[1])))
+        except ValueError:
+            pass
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🔬 *Entropy Secret Hunter*\n"
+        f"🌐 `{escape_md(domain)}`\n"
+        f"📊 Threshold: `{threshold}`\n\n"
+        "⏳ Scanning HTML + JS bundles...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🔬 *Entropy Hunter — `{escape_md(domain)}`*\n\n{t}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await run_scan(
+            uid, _entropy_hunt_sync, url, threshold, lambda t: progress_q.append(t)
+        )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    findings = result["findings"]
+    high   = [f for f in findings if f["risk"] == "🔴 HIGH"]
+    medium = [f for f in findings if f["risk"] == "🟡 MED"]
+    low    = [f for f in findings if f["risk"] == "⚪ LOW"]
+
+    if not findings:
+        await safe_markdown_reply(msg,
+            f"🔬 *Entropy Hunter — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 High-entropy strings မတွေ့ပါ (threshold ≥ {threshold})\n"
+            f"📦 JS bundles scanned: `{result['js_count']}`"
+        )
+        return
+
+    lines = [
+        f"🔬 *Entropy Secret Hunter — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Threshold: `{threshold}` | JS: `{result['js_count']}` bundles",
+        f"🔴 HIGH: `{len(high)}` | 🟡 MED: `{len(medium)}` | ⚪ LOW: `{len(low)}`",
+        f"📈 Total: `{len(findings)}` high-entropy strings",
+        "",
+    ]
+
+    shown = 0
+    for tier_label, tier_list in [("🔴 HIGH RISK", high), ("🟡 MEDIUM RISK", medium), ("⚪ LOW RISK", low)]:
+        if not tier_list:
+            continue
+        lines.append(f"*{tier_label}*")
+        for f in tier_list[:8]:
+            _val = f["value"][:70].replace("`", "'")
+            _ctx = f.get("context", "")[:60].replace("`", "'").replace("\n", " ")
+            lines.append(f"  H=`{f['entropy']}` [{escape_md(f['kind'])}]")
+            lines.append(f"  └ `{_val}`")
+            if _ctx and f["in_secret_context"]:
+                lines.append(f"  📌 _{escape_md(_ctx)}_")
+            lines.append("")
+            shown += 1
+            if shown >= 20:
+                break
+        if shown >= 20:
+            break
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
+        "_High entropy = likely secret — manual review လိုသည်_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps(result, indent=2, ensure_ascii=False).encode()),
+            filename=f"entropy_{safe_d}_{ts}.json",
+            caption=(
+                f"🔬 Entropy Secrets — `{escape_md(domain)}`\n"
+                f"🔴 HIGH: `{len(high)}` | Total: `{len(findings)}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("entropy export error: %s", e)
+
+
+# ══════════════════════════════════════════════════
+# 🧩  /deobfuscate — JavaScript Secret De-obfuscator
+# ══════════════════════════════════════════════════
+
+def _deobfuscate_sync(url: str, progress_cb=None) -> dict:
+    """
+    Detect and decode obfuscated API keys/secrets in JavaScript files.
+    Handles: Base64 atob(), Hex escapes, Unicode escapes,
+             Array split/join tricks, String.fromCharCode().
+    """
+    import base64 as _b64
+
+    if progress_cb: progress_cb("🌐 Fetching page...")
+
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
+        html  = resp.text
+        final_url = resp.url
+    except Exception as e:
+        return {"error": str(e), "findings": [], "js_count": 0}
+
+    texts_map = {"[HTML]": html}
+    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
+        abs_src = urljoin(final_url, src)
+        if abs_src.startswith("http"):
+            try:
+                r = requests.get(abs_src, headers=HEADERS,
+                                 proxies=proxy_manager.get_proxy(),
+                                 timeout=TIMEOUT, verify=False)
+                if r.status_code == 200 and len(r.text) < 5_000_000:
+                    key = abs_src.split("/")[-1][:40]
+                    texts_map[key] = r.text
+            except Exception:
+                pass
+
+    if progress_cb: progress_cb(f"🧩 Decoding {len(texts_map)} files...")
+
+    _SECRET_KW = re.compile(
+        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|sk_|pk_|'
+        r'AKIA|bearer|webhook|signing|encrypt|password)',
+        re.I
+    )
+
+    seen_decoded: set = set()
+    findings = []
+
+    def _record(method: str, raw: str, decoded: str, source: str, context: str = ""):
+        val = decoded.strip()
+        if val in seen_decoded or len(val) < 8:
+            return
+        score = _entropy(val)
+        if score < 3.5:
+            return
+        seen_decoded.add(val)
+        findings.append({
+            "method":              method,
+            "raw":                 raw[:80],
+            "decoded":             val[:120],
+            "entropy":             round(score, 3),
+            "source":              source,
+            "context":             context[:80],
+            "in_secret_context":   bool(_SECRET_KW.search(context + raw)),
+        })
+
+    for source, text in texts_map.items():
+
+        # Pattern 1: Base64 atob() / Buffer.from(...,'base64')
+        for m in re.finditer(
+            r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']',
+            text
+        ):
+            raw = m.group(1)
+            try:
+                decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Base64 atob()", raw, decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 2: Hex escape sequences \x73\x6b...
+        for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){6,})"', text):
+            raw = m.group(1)
+            try:
+                decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                                  lambda hm: chr(int(hm.group(1), 16)), raw)
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Hex Escape \\x", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 3: Raw hex string that decodes to printable secret
+        for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
+            raw = m.group(1)
+            if len(raw) % 2 != 0:
+                continue
+            try:
+                decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
+                if decoded.isprintable() and _SECRET_KW.search(decoded):
+                    ctx = text[max(0, m.start()-60): m.start()+60]
+                    _record("Raw Hex", raw, decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 4: Unicode escape \u0073\u006b...
+        for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){5,})"', text):
+            raw = m.group(1)
+            try:
+                decoded = raw.encode('utf-8').decode('unicode_escape')
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Unicode \\u", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 5: Array join trick ["sk","_live","_xx"].join("")
+        for m in re.finditer(
+            r'\[([^\]]{10,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
+        ):
+            raw = m.group(1)
+            try:
+                parts   = re.findall(r'["\']([^"\']*)["\']', raw)
+                decoded = "".join(parts)
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("Array join()", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+        # Pattern 6: String.fromCharCode(115,107,95,...)
+        for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{10,300})\)', text):
+            raw = m.group(1)
+            try:
+                codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
+                decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
+                ctx = text[max(0, m.start()-60): m.start()+60]
+                _record("String.fromCharCode", raw[:80], decoded, source, ctx)
+            except Exception:
+                pass
+
+    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
+
+    return {
+        "url":      url,
+        "js_count": len(texts_map) - 1,
+        "findings": findings,
+    }
+
+
+@user_guard
+async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/deobfuscate <url> — Detect & decode obfuscated secrets in JS"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/deobfuscate https://example.com`\n\n"
+            "🧩 *Secret De-obfuscator — Handles:*\n"
+            "  • `atob()` / `Buffer.from(..,'base64')` — Base64 keys\n"
+            "  • `\\x73\\x6b...` — Hex escape sequences\n"
+            "  • `\\u0073\\u006b...` — Unicode escape sequences\n"
+            "  • `['sk','_live','_xx'].join('')` — Array join tricks\n"
+            "  • `String.fromCharCode(115,107,...)` — Char code arrays\n\n"
+            "💡 _Minified JS ထဲ ဖျောက်ထားတဲ့ API keys တွေကို decode လုပ်ပေးသည်_\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🧩 *Secret De-obfuscator*\n"
+        f"🌐 `{escape_md(domain)}`\n\n"
+        "⏳ Fetching JS bundles + decoding obfuscation...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🧩 *De-obfuscator — `{escape_md(domain)}`*\n\n{t}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await run_scan(
+            uid, _deobfuscate_sync, url, lambda t: progress_q.append(t)
+        )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    findings = result["findings"]
+    if not findings:
+        await safe_markdown_reply(msg,
+            f"🧩 *De-obfuscator — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 Obfuscated secrets မတွေ့ပါ\n"
+            f"📦 JS bundles scanned: `{result['js_count']}`"
+        )
+        return
+
+    high   = [f for f in findings if f["in_secret_context"] and f["entropy"] >= 4.5]
+    medium = [f for f in findings if f not in high and f["entropy"] >= 4.0]
+    other  = [f for f in findings if f not in high and f not in medium]
+
+    lines = [
+        f"🧩 *Secret De-obfuscator — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📦 JS bundles: `{result['js_count']}` | Decoded: `{len(findings)}`",
+        f"🔴 High risk: `{len(high)}` | 🟡 Medium: `{len(medium)}` | ⚪ Other: `{len(other)}`",
+        "",
+    ]
+
+    shown = 0
+    for tier_label, tier_list in [("🔴 HIGH RISK", high), ("🟡 MEDIUM", medium), ("⚪ OTHER", other)]:
+        if not tier_list:
+            continue
+        lines.append(f"*{tier_label}*")
+        for f in tier_list[:6]:
+            _raw = f["raw"][:60].replace("`", "'")
+            _dec = f["decoded"][:70].replace("`", "'")
+            lines.append(f"  🔓 `{escape_md(f['method'])}`  📂 _{escape_md(f['source'])}_")
+            lines.append(f"  🔒 Raw:     `{_raw}`")
+            lines.append(f"  ✅ Decoded: `{_dec}`")
+            lines.append(f"  H=`{f['entropy']}`")
+            lines.append("")
+            shown += 1
+            if shown >= 15:
+                break
+        if shown >= 15:
+            break
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "url":        result["url"],
+                "scanned_at": datetime.now().isoformat(),
+                "js_count":   result["js_count"],
+                "findings":   findings,
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"deobfuscate_{safe_d}_{ts}.json",
+            caption=(
+                f"🧩 De-obfuscated Secrets — `{escape_md(domain)}`\n"
+                f"🔴 High: `{len(high)}` | Total: `{len(findings)}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("deobfuscate export error: %s", e)
 
 
 # ══════════════════════════════════════════════════
@@ -11987,6 +14298,13 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+        # Deobfuscation pass: decode atob/hex/join/fromCharCode hidden keys
+        _deob = _deobfuscate_text(text)
+        if _deob:
+            for key_type, pat in _PAY_PATTERNS:
+                for m in pat.finditer(_deob):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add(key_type, val.strip(), label + " [deobfuscated]")
 
     # ── 2. Source map texts ──
     for text, label in sourcemap_texts:
@@ -12198,7 +14516,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_paykeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _paykeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
@@ -12214,115 +14532,586 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_result  = result.get("live_result") or {"live_requests":[],"live_findings":[],"sse_frames":[]}
     findings     = _confidence_crossref(raw_findings, live_result)
     page_url     = result["page_url"]
-    reqs         = result.get("requests", 0)
+    js_count     = result.get("requests", 0)
     live_reqs    = len(live_result.get("live_requests", []))
-    extra        = result.get("extra_scans", {})
 
-    confirmed   = [f for f in findings if "CONFIRMED"   in f.get("confidence","")]
-    high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
-    static_only = [f for f in findings if "STATIC"      in f.get("confidence","")]
-    live_keys   = [f for f in findings if f.get("env") == "🔴 LIVE"]
+    # Ensure findings have required fields
+    for _f in findings:
+        if "value" not in _f:
+            _f["value"] = _f.get("site_key", "")
 
-    if not findings:
-        await safe_markdown_reply(msg,
-            f"💳 *Payment Key Extractor v19 — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No payment keys found\n"
-            f"🌐 `{escape_md(page_url)}`\n"
-            f"📡 Static: `{reqs}` | Live: `{live_reqs}`\n"
-            f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | "
-            f"⚙️ SW: `{extra.get('service_workers',0)}` | "
-            f"🔗 Pages: `{extra.get('subpages',0)}`"
-        )
-        return
+    # Deduplicate
+    findings = _dedup_by_key(findings, "value")
 
-    # ── Build enhanced report ──────────────────────────────────────────────
+    # Count environments
+    prod_count = sum(1 for f in findings if "PROD" in _classify_api_env(f.get("type", ""), f.get("value", "")))
+    test_count = sum(1 for f in findings if "TEST" in _classify_api_env(f.get("type", ""), f.get("value", "")))
+
+    # Risk level
+    if prod_count >= 2:   risk_lbl = "🔴 CRITICAL"
+    elif prod_count >= 1: risk_lbl = "🟠 HIGH"
+    elif test_count >= 1: risk_lbl = "🟡 MEDIUM"
+    else:                 risk_lbl = "🟢 LOW"
+
     lines = [
-        f"💳 *Payment Keys — `{escape_md(domain)}`*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 `{escape_md(page_url[:60])}`",
-        f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
-        f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | ⚙️ SW: `{extra.get('service_workers',0)}` | 🔗 Pages: `{extra.get('subpages',0)}`",
-        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`\n",
+        "💳 *Payment Keys*",
+        _HEADER_BAR,
+        f"🌐  `{escape_md(domain)}`",
+        f"📄  {_url_short(page_url, 58)}",
+        f"⚠️  Risk: *{risk_lbl}*",
+        "",
+        f"📡  JS `{escape_md(str(js_count))}` │ Live `{escape_md(str(live_reqs))}` │ Keys `{escape_md(str(len(findings)))}`",
+        f"🔴 `{escape_md(str(prod_count))}` production   🟡 `{escape_md(str(test_count))}` test",
+        "",
     ]
 
-    # Deduplicated ordering: CONFIRMED → LIVE → STATIC
-    seen_vals = set()
-    ordered   = []
-    for f, badge in (
-        [(f, "✅ CONFIRMED") for f in confirmed] +
-        [(f, "🔴 LIVE")      for f in high_live if f not in confirmed] +
-        [(f, "⚠️ STATIC")   for f in static_only]
-    ):
-        k = f.get("value", "")
-        if k not in seen_vals:
-            seen_vals.add(k)
-            ordered.append((f, badge))
+    if not findings:
+        lines += [
+            "📭 *Payment key မတွေ့ရှိပါ*",
+            "",
+            "_Possible reasons:_",
+            "  • Payment integration မပါ",
+            "  • Server-side only (no publishable key)",
+            "  • Keys in inaccessible iframe",
+        ]
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+        return
 
-    for i, (f, badge) in enumerate(ordered[:50], 1):
-        val     = f.get("value", "")
-        env     = f.get("env", _detect_env(f["type"], val))
-        vfy     = f.get("verified", "")
-        vfy_tag = " ✔️" if vfy == "VALID" else (" ✖️" if vfy == "INVALID" else "")
-        conf    = f.get("confidence", "")
-        src_tag = ""
-        if "SOURCEMAP" in conf: src_tag = " 🗺️"
-        elif "SW"      in conf: src_tag = " ⚙️"
-        elif "SUBPAGE" in conf: src_tag = " 🔗"
-        elif "GRAPHQL" in conf: src_tag = " 📐"
+    # ── Group by provider ─────────────────────────────────────
+    grouped = {}
+    for f in findings:
+        provider = _detect_pay_provider(f.get("type", ""))
+        grouped.setdefault(provider, []).append(f)
 
-        env_warn = " ⚠️" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
+    # Sort providers: known first
+    _prov_order = list(_PAY_PROVIDER_ICON.keys()) + ["Other"]
+    sorted_provs = sorted(
+        grouped.keys(),
+        key=lambda p: (_prov_order.index(p) if p in _prov_order else 99)
+    )
 
-        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
-        lines.append(f"  📌 `{escape_md(f['type'])}`")
-        lines.append(f"  🔑 `{val[:80]}`")
-        lines.append(f"  📂 _{escape_md(f.get('source','')[:60])}_\n")
+    entry_num = 0
+    for provider in sorted_provs:
+        p_findings = grouped[provider]
+        p_icon = _PAY_PROVIDER_ICON.get(provider, "💳")
 
-    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
-
-    # ── Gateway Profile block (v18 unique) ─────────────────────────────────
-    gw_profile = result.get("gateway_profile")
-    if gw_profile:
-        lines += _format_pay_gateway_profile(gw_profile)
-
-    # ── 3DS / SCA Verification block ────────────────────────────────────────
-    tds_result = result.get("tds_result")
-    if tds_result:
+        lines.append(f"{p_icon} *{escape_md(provider)}*")
         lines.append("")
-        lines += _fmt_3ds_result(tds_result)
 
-    report = "\n".join(lines)
+        for f in p_findings:
+            entry_num += 1
+            ftype      = f.get("type", "Unknown")
+            value      = f.get("value") or f.get("site_key") or ""
+            confidence = f.get("confidence", "STATIC")
+            source     = (f.get("source") or "")[:48]
+            validated  = f.get("validated")
 
-    await safe_markdown_reply(msg, _truncate_safe_md(report))
+            # Environment badge
+            env_raw = _classify_api_env(ftype, value)
+            env_str = "⚪ —"
+            for ek, ev in _ENV_LABELS.items():
+                if ek in env_raw:
+                    env_str = ev
+                    break
 
-    # ── Export JSON ────────────────────────────────────────────────────────
+            # Confidence
+            badge = _conf_emoji(confidence)
+            clbl  = _conf_label(confidence)
+
+            # Validation status
+            if validated is True:    valid_str = "✅ Active"
+            elif validated is False: valid_str = "❌ Invalid"
+            else:                    valid_str = "❓ Unverified"
+
+            lines.append(f"  ┌─ *{entry_num}.*  {escape_md(ftype)}")
+            lines.append(f"  │  {env_str}   {badge} {clbl}   {valid_str}")
+            lines.append(f"  │")
+
+            # Full key (copyable)
+            lines.append(f"  │  🔑 *Key:*")
+            lines.append(f"  │  `{_key_safe(value)}`")
+
+            # Source
+            if source:
+                lines.append(f"  │  📂 _{escape_md(source)}_")
+
+            lines.append(f"  └{'─' * 28}")
+            lines.append("")
+
+    # Footer
+    lines += [
+        _HEADER_BAR,
+        "📦 _Full keys + solver configs → JSON export_",
+        "⚠️ _Production keys ကို ခွင့်ပြုချက်မရှိဘဲ မသုံးပါနဲ့_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    # ── JSON Export ───────────────────────────────────────────
     import io as _io
     ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d = re.sub(r'[^\w\-]', '_', domain)
+
+    export = {
+        "command":    "paykeys",
+        "domain":     domain,
+        "page_url":   page_url,
+        "scanned_at": datetime.now().isoformat(),
+        "summary": {
+            "total":      len(findings),
+            "production": prod_count,
+            "test":       test_count,
+        },
+        "findings": [
+            {
+                "type":        f.get("type", ""),
+                "value":       f.get("value") or f.get("site_key") or "",
+                "provider":    _detect_pay_provider(f.get("type", "")),
+                "environment": _classify_api_env(f.get("type", ""), f.get("value", "")),
+                "confidence":  f.get("confidence", ""),
+                "validated":   f.get("validated"),
+                "source":      f.get("source", ""),
+                "solver_params": _get_solver_params(f),
+            }
+            for f in findings
+        ],
+    }
+
+    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
+    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
+
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
-            document=_io.BytesIO(json.dumps({
-                "domain":                  domain,
-                "page_url":                page_url,
-                "scanned_at":             datetime.now().isoformat(),
-                "bot_version":            "v19",
-                "findings":               findings,
-                "live_requests_captured": live_reqs,
-                "sse_frames_captured":    len(live_result.get("sse_frames",[])),
-                "confirmed":              len(confirmed),
-                "live_keys":              len(live_keys),
-                "static_only":            len(static_only),
-                "extra_scans":            extra,
-            }, indent=2, ensure_ascii=False).encode()),
+            document=json_buf,
             filename=f"paykeys_{safe_d}_{ts}.json",
             caption=(
-                f"💳 Payment Keys v19 — `{escape_md(domain)}`\n"
-                f"✅ Confirmed: `{len(confirmed)}` | 🔴 Live: `{len(live_keys)}` | Total: `{len(findings)}`"
+                f"💳 *Paykeys — `{escape_md(domain)}`*\n"
+                f"Keys `{escape_md(str(len(findings)))}` │ "
+                f"Prod `{escape_md(str(prod_count))}` │ "
+                f"💾 `{json_mb:.2f}` MB"
             ),
             parse_mode='Markdown'
         )
     except Exception as e:
-        logger.warning("paykeys export error: %s", e)
+        logger.warning("Paykeys export error: %s", e)
+
+    # ── Inline verify button (only if verifiable keys exist) ───────────────
+    if verifiable:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🔍 Verify Keys ({len(verifiable)})",
+                callback_data=f"vk_run_{uid}"
+            )
+        ]])
+        await update.effective_message.reply_text(
+            f"🔍 *{len(verifiable)} verifiable key(s) တွေ့ပါသည်*\n"
+            "Read-only API check စတင်ရန် နှိပ်ပါ",
+            reply_markup=kb,
+            parse_mode='Markdown'
+        )
+
+# ══════════════════════════════════════════════════
+# 💳  /verifykeys — Payment Key Validator (Read-Only)
+# ══════════════════════════════════════════════════
+
+# Cache: {uid: {"domain": str, "findings": [...], "ts": float}}
+_paykeys_verify_cache: dict = {}
+_PAYKEYS_CACHE_TTL = 600   # 10 minutes
+
+
+# ── Per-gateway verify functions ──────────────────────────────────────────
+
+def _verify_stripe(key: str) -> dict:
+    """Stripe sk_live_ / sk_test_ → GET /v1/balance (read-only)"""
+    env_label = "🔴 LIVE" if key.startswith("sk_live_") else "🟡 TEST"
+    masked    = key[:12] + "..." + key[-4:]
+    try:
+        r = requests.get(
+            "https://api.stripe.com/v1/balance",
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            data  = r.json()
+            avail = data.get("available", [])
+            bal   = ", ".join(
+                f"{b.get('currency','?').upper()} {b.get('amount',0)/100:.2f}"
+                for b in avail[:3]
+            ) or "—"
+            return {"gateway": "Stripe", "status": "✅ VALID", "env": env_label,
+                    "detail": f"Balance: {bal}", "key": masked}
+        elif r.status_code == 401:
+            err = r.json().get("error", {}).get("message", "Unauthorized")
+            return {"gateway": "Stripe", "status": "❌ INVALID / REVOKED",
+                    "env": env_label, "detail": err[:80], "key": masked}
+        elif r.status_code == 403:
+            # Restricted key — still valid but no balance scope
+            return {"gateway": "Stripe", "status": "⚠️ VALID (Restricted)",
+                    "env": env_label, "detail": "Key valid but restricted scope", "key": masked}
+        else:
+            return {"gateway": "Stripe", "status": f"⚠️ HTTP {r.status_code}",
+                    "env": env_label, "detail": r.text[:80], "key": masked}
+    except requests.exceptions.Timeout:
+        return {"gateway": "Stripe", "status": "❌ Timeout", "env": env_label,
+                "detail": "API ကို 12s အတွင်း မရောက်ပါ", "key": masked}
+    except Exception as e:
+        return {"gateway": "Stripe", "status": "❌ Error", "env": env_label,
+                "detail": str(e)[:60], "key": masked}
+
+
+def _verify_stripe_publishable(key: str) -> dict:
+    """Stripe pk_ key — publishable key is public, just classify it"""
+    env_label = "🔴 LIVE" if key.startswith("pk_live_") else "🟡 TEST"
+    masked    = key[:12] + "..." + key[-4:]
+    # Publishable keys cannot authenticate API calls — just fingerprint
+    return {
+        "gateway": "Stripe",
+        "status":  "ℹ️ PUBLISHABLE KEY",
+        "env":     env_label,
+        "detail":  "Public key — frontend only, no secret access",
+        "key":     masked,
+    }
+
+
+def _verify_paypal_pair(client_id: str, secret: str) -> dict:
+    """PayPal client_id + secret → POST /v1/oauth2/token"""
+    masked = client_id[:10] + "..."
+    try:
+        r = requests.post(
+            "https://api-m.paypal.com/v1/oauth2/token",
+            data={"grant_type": "client_credentials"},
+            auth=(client_id, secret),
+            headers={"Accept": "application/json"},
+            timeout=12,
+        )
+        if r.status_code == 200:
+            data  = r.json()
+            scope = data.get("scope", "")
+            # Detect sandbox vs live from scope or URL
+            is_sb = "sandbox" in scope.lower()
+            return {"gateway": "PayPal", "status": "✅ VALID",
+                    "env": "🟡 SANDBOX" if is_sb else "🔴 LIVE",
+                    "detail": f"App: {data.get('app_id','?')} | Expires: {data.get('expires_in','?')}s",
+                    "key": masked}
+        else:
+            err = r.json().get("error_description", r.text[:80])
+            return {"gateway": "PayPal", "status": "❌ INVALID",
+                    "env": "?", "detail": err, "key": masked}
+    except requests.exceptions.Timeout:
+        return {"gateway": "PayPal", "status": "❌ Timeout", "env": "?",
+                "detail": "API တွင်မထွက်ပါ", "key": masked}
+    except Exception as e:
+        return {"gateway": "PayPal", "status": "❌ Error", "env": "?",
+                "detail": str(e)[:60], "key": masked}
+
+
+def _verify_razorpay_pair(key_id: str, key_secret: str) -> dict:
+    """Razorpay rzp_live_/rzp_test_ + secret → GET /v1/balance"""
+    env_label = "🔴 LIVE" if "live" in key_id else "🟡 TEST"
+    masked    = key_id[:12] + "..."
+    try:
+        r = requests.get(
+            "https://api.razorpay.com/v1/balance",
+            auth=(key_id, key_secret),
+            timeout=12,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            bal  = data.get("balance", 0) / 100
+            curr = data.get("currency", "INR")
+            return {"gateway": "Razorpay", "status": "✅ VALID", "env": env_label,
+                    "detail": f"Balance: {curr} {bal:.2f}", "key": masked}
+        elif r.status_code == 401:
+            return {"gateway": "Razorpay", "status": "❌ INVALID", "env": env_label,
+                    "detail": "Bad credentials", "key": masked}
+        else:
+            # Some accounts get 403/404 on /balance but key is valid — try /payments
+            r2 = requests.get(
+                "https://api.razorpay.com/v1/payments?count=1",
+                auth=(key_id, key_secret), timeout=10
+            )
+            if r2.status_code == 200:
+                return {"gateway": "Razorpay", "status": "✅ VALID", "env": env_label,
+                        "detail": "Auth OK (payments endpoint)", "key": masked}
+            elif r2.status_code == 401:
+                return {"gateway": "Razorpay", "status": "❌ INVALID", "env": env_label,
+                        "detail": "401 on both endpoints", "key": masked}
+            else:
+                return {"gateway": "Razorpay", "status": f"⚠️ HTTP {r.status_code}/{r2.status_code}",
+                        "env": env_label, "detail": r2.text[:60], "key": masked}
+    except requests.exceptions.Timeout:
+        return {"gateway": "Razorpay", "status": "❌ Timeout", "env": env_label,
+                "detail": "12s timeout", "key": masked}
+    except Exception as e:
+        return {"gateway": "Razorpay", "status": "❌ Error", "env": env_label,
+                "detail": str(e)[:60], "key": masked}
+
+
+def _verify_square(token: str) -> dict:
+    """Square EAAAl.../sq0atp- → GET /v2/locations (read-only)"""
+    is_sb     = token.startswith("EAAAl") or "sandbox" in token.lower()
+    env_label = "🟡 SANDBOX" if is_sb else "🔴 LIVE"
+    masked    = token[:10] + "..." + token[-4:]
+    base_url  = (
+        "https://connect.squareupsandbox.com"
+        if is_sb else
+        "https://connect.squareup.com"
+    )
+    try:
+        r = requests.get(
+            f"{base_url}/v2/locations",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Square-Version": "2024-06-04",
+                "Content-Type": "application/json",
+            },
+            timeout=12,
+        )
+        if r.status_code == 200:
+            locs = r.json().get("locations", [])
+            names = ", ".join(l.get("name","?") for l in locs[:2])
+            return {"gateway": "Square", "status": "✅ VALID", "env": env_label,
+                    "detail": f"{len(locs)} location(s): {names}", "key": masked}
+        elif r.status_code == 401:
+            return {"gateway": "Square", "status": "❌ INVALID / REVOKED",
+                    "env": env_label, "detail": "401 Unauthorized", "key": masked}
+        elif r.status_code == 403:
+            return {"gateway": "Square", "status": "⚠️ VALID (No location scope)",
+                    "env": env_label, "detail": "Key valid, restricted permissions", "key": masked}
+        else:
+            return {"gateway": "Square", "status": f"⚠️ HTTP {r.status_code}",
+                    "env": env_label, "detail": r.text[:80], "key": masked}
+    except requests.exceptions.Timeout:
+        return {"gateway": "Square", "status": "❌ Timeout", "env": env_label,
+                "detail": "12s timeout", "key": masked}
+    except Exception as e:
+        return {"gateway": "Square", "status": "❌ Error", "env": env_label,
+                "detail": str(e)[:60], "key": masked}
+
+
+def _verify_finding(f: dict) -> dict:
+    """paykeys finding တစ်ခုကို gateway type ပေါ်မူတည်ပြီး verify လုပ်တယ်"""
+    ftype = f.get("type", "")
+    val   = f.get("value", "").strip()
+
+    if not val:
+        return {"gateway": ftype, "status": "⚠️ Empty value", "env": "?",
+                "detail": "Value မပါပါ", "key": "—"}
+
+    # ── Stripe ───────────────────────────────────────────────────────────
+    if "Stripe Secret" in ftype or re.match(r'^sk_(live|test)_', val):
+        return _verify_stripe(val)
+    if "Stripe Publishable" in ftype or re.match(r'^pk_(live|test)_', val):
+        return _verify_stripe_publishable(val)
+
+    # ── Square ───────────────────────────────────────────────────────────
+    if "Square" in ftype or re.match(r'^(EAAA|sq0atp-|sq0idp-)', val):
+        return _verify_square(val)
+
+    # ── Razorpay — needs pair; single key ကို flag ပါ ────────────────────
+    if "Razorpay Key ID" in ftype or re.match(r'^rzp_(live|test)_', val):
+        return {"gateway": "Razorpay", "status": "⚠️ Pair needed",
+                "env": "🔴 LIVE" if "live" in val else "🟡 TEST",
+                "detail": "Razorpay ကို /verifykeys rzp_id rzp_secret နဲ့ manual verify လုပ်ပါ",
+                "key": val[:12]+"..."}
+    if "Razorpay Key Secret" in ftype:
+        return {"gateway": "Razorpay Secret", "status": "⚠️ Pair needed",
+                "env": "?", "detail": "ID+Secret pair လိုပါသည်", "key": val[:8]+"..."}
+
+    # ── PayPal — needs pair ───────────────────────────────────────────────
+    if "PayPal" in ftype:
+        return {"gateway": "PayPal", "status": "⚠️ Pair needed",
+                "env": "?",
+                "detail": "PayPal ကို /verifykeys pp_client_id pp_secret နဲ့ manual verify လုပ်ပါ",
+                "key": val[:10]+"..."}
+
+    return {"gateway": ftype or "Unknown", "status": "⚠️ Auto-detect မရပါ",
+            "env": "?", "detail": "Format မသိ — manual check လုပ်ပါ", "key": val[:10]+"..."}
+
+
+def _run_verify_all(findings: list[dict]) -> list[dict]:
+    """Thread pool ဖြင့် findings တွေကို concurrent verify လုပ်တယ်"""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+        futures = {ex.submit(_verify_finding, f): f for f in findings}
+        results = []
+        for fut in concurrent.futures.as_completed(futures, timeout=60):
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                orig = futures[fut]
+                results.append({
+                    "gateway": orig.get("type", "?"),
+                    "status":  "❌ Error",
+                    "env":     "?",
+                    "detail":  str(e)[:60],
+                    "key":     orig.get("value","")[:8]+"...",
+                })
+    return results
+
+
+def _build_verify_report(results: list[dict], domain: str) -> str:
+    """Verify results ကို Telegram Markdown report အဖြစ် build လုပ်တယ်"""
+    valid   = [r for r in results if "✅" in r["status"]]
+    warn    = [r for r in results if "⚠️" in r["status"]]
+    invalid = [r for r in results if "❌" in r["status"]]
+    live    = [r for r in results if "LIVE" in r.get("env","")]
+
+    lines = [
+        f"🔍 *Payment Key Verifier — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📊 Checked: `{len(results)}` | ✅ Valid: `{len(valid)}` | "
+        f"❌ Invalid: `{len(invalid)}` | 🔴 Live: `{len(live)}`\n",
+    ]
+
+    # Order: valid → warn → invalid
+    ordered = valid + warn + invalid
+    for i, r in enumerate(ordered, 1):
+        lines.append(f"*[{i}]* {r['gateway']} — {r['status']}")
+        lines.append(f"  🌐 `{r.get('env','?')}`")
+        lines.append(f"  🔑 `{escape_md(r['key'])}`")
+        lines.append(f"  📋 _{escape_md(r.get('detail',''))}_\n")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("🔒 _Read-only — No charge/transaction performed_")
+    lines.append("⚠️ _Authorized testing only_")
+    return "\n".join(lines)
+
+
+# ── Inline button callback ────────────────────────────────────────────────
+
+async def verifykeys_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle [🔍 Verify Keys] button from /paykeys"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+
+    # callback_data = "vk_run_{uid}"
+    try:
+        uid = int(query.data.split("_")[2])
+    except Exception:
+        return
+
+    if query.from_user.id != uid:
+        await query.answer("🚫 သင်မဟုတ်ပါ", show_alert=True)
+        return
+
+    cached = _paykeys_verify_cache.get(uid)
+    if not cached or (time.time() - cached.get("ts", 0)) > _PAYKEYS_CACHE_TTL:
+        await query.answer("⚠️ Cache ကုန်ပြီ — /paykeys ထပ်လုပ်ပါ", show_alert=True)
+        return
+
+    findings = cached["findings"]
+    domain   = cached["domain"]
+
+    # Edit button message to show progress
+    try:
+        await query.edit_message_text(
+            f"🔍 *Verifying {len(findings)} key(s) from `{escape_md(domain)}`...*\n\n"
+            "⏳ Read-only API calls လုပ်နေသည်...",
+            parse_mode='Markdown'
+        )
+    except Exception:
+        pass
+
+    results = await asyncio.to_thread(_run_verify_all, findings)
+    report  = _build_verify_report(results, domain)
+
+    try:
+        await query.edit_message_text(
+            _truncate_safe_md(report),
+            parse_mode='Markdown'
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=_truncate_safe_md(report),
+            parse_mode='Markdown'
+        )
+
+
+# ── /verifykeys command (standalone, manual key input) ───────────────────
+
+async def cmd_verifykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/verifykeys <key(s)> — Verify payment keys manually (read-only)"""
+    if not await check_force_join(update, context):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/verifykeys <key1> [key2] ...`\n\n"
+            "💳 *Supported:*\n"
+            "  🔵 Stripe secret  — `sk_live_...` / `sk_test_...`\n"
+            "  🔵 Stripe public  — `pk_live_...` / `pk_test_...`\n"
+            "  🟣 Square         — `EAAA...` / `sq0atp-...`\n"
+            "  🟠 Razorpay pair  — `rzp_live_xxx secret`\n"
+            "  🟡 PayPal pair    — `client_id secret`\n\n"
+            "🔒 *Read-only — No charge/transaction*\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    args = list(context.args)
+    msg  = await update.effective_message.reply_text(
+        f"🔍 *Key Verifier*\n\n⏳ {len(args)} key(s) checking...",
+        parse_mode='Markdown'
+    )
+
+    # Build synthetic findings from raw args, handling pairs
+    findings = []
+    i = 0
+    while i < len(args):
+        key = args[i].strip()
+        nxt = args[i+1].strip() if i+1 < len(args) else ""
+
+        if re.match(r'^rzp_(live|test)_[A-Za-z0-9]{14,}$', key) and nxt:
+            # Razorpay ID+secret pair — verify directly
+            result = await asyncio.to_thread(_verify_razorpay_pair, key, nxt)
+            findings_results = [result]
+            i += 2
+            # Build report immediately
+            report = _build_verify_report(findings_results, "manual")
+            await safe_markdown_reply(msg, _truncate_safe_md(report))
+            return
+
+        elif (re.match(r'^[A-Za-z0-9\-_]{16,80}$', key) and nxt and
+              re.match(r'^[A-Za-z0-9\-_]{16,80}$', nxt) and
+              not re.match(r'^sk_|^pk_|^rzp_|^EAAA|^sq0', key)):
+            # PayPal client_id + secret pair
+            result = await asyncio.to_thread(_verify_paypal_pair, key, nxt)
+            findings_results = [result]
+            i += 2
+            report = _build_verify_report(findings_results, "manual")
+            await safe_markdown_reply(msg, _truncate_safe_md(report))
+            return
+
+        else:
+            # Single key — auto-detect type
+            findings.append({"type": _guess_key_type(key), "value": key})
+            i += 1
+
+    results = await asyncio.to_thread(_run_verify_all, findings)
+    report  = _build_verify_report(results, "manual")
+    await safe_markdown_reply(msg, _truncate_safe_md(report))
+
+
+def _guess_key_type(val: str) -> str:
+    """Raw key string ကနေ gateway type ခန့်မှန်းတယ်"""
+    if re.match(r'^sk_(live|test)_', val):   return "Stripe Secret Key"
+    if re.match(r'^pk_(live|test)_', val):   return "Stripe Publishable Key"
+    if re.match(r'^(EAAA|sq0atp-|sq0idp-)', val): return "Square Access Token"
+    if re.match(r'^rzp_(live|test)_', val):  return "Razorpay Key ID"
+    return "Unknown"
+
 
 # ══════════════════════════════════════════════════
 # 👤  4. /socialkeys — OAuth & Social Login IDs
@@ -12462,7 +15251,7 @@ async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_socialkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _socialkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -12631,7 +15420,7 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_analytics_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _analytics_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -14537,7 +17326,7 @@ async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_jwtlive_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _jwtlive_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -14712,7 +17501,7 @@ async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_pushkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _pushkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -14857,7 +17646,7 @@ async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_chatkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _chatkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -15042,8 +17831,8 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog_task = asyncio.create_task(_prog_loop())
 
     try:
-        result = await asyncio.to_thread(
-            analyze_app_file, save_path, lambda t: prog_q.append(t)
+        result = await run_scan(
+            uid, analyze_app_file, save_path, lambda t: prog_q.append(t)
         )
     except Exception as e:
         prog_task.cancel()
@@ -15542,7 +18331,11 @@ async def _run_download(
             await update.effective_message.reply_text("🚫 Ban ထားပါတယ်"); return
         if not db["settings"]["bot_enabled"] and uid not in ADMIN_IDS:
             _save_db_sync(db)
-            await update.effective_message.reply_text("🔴 Bot ယာယီပိတ်ထားပါတယ်"); return
+            await update.effective_message.reply_text(
+                "🔴 *Bot ယာယီပိတ်ထားသည်*\nAdmin မှ maintenance လုပ်နေပါသည်",
+                parse_mode='Markdown'
+            )
+            return
         if not resume_mode and not can_download(db, u):
             lim = get_limit(db, u)
             _save_db_sync(db)
@@ -15687,25 +18480,67 @@ async def _run_download(
         await msg.edit_text(f"❌ Upload error: {type(e).__name__}")
 
 
-# ── Command wrappers ──────────────────────────────
+# ══════════════════════════════════════════════════
+# 🛑  GLOBAL STOP / TASK REGISTRY
+# ══════════════════════════════════════════════════
+
+def _register_task(uid: int, task: asyncio.Task) -> None:
+    """Register a running scan task for a user (enables /stop for all commands)."""
+    _user_tasks[uid] = task
+
+def _clear_task(uid: int) -> None:
+    _user_tasks.pop(uid, None)
+
+async def run_scan(uid: int, fn, *args, **kwargs):
+    """
+    Wrapper: run blocking fn(*args) in thread, registered so /stop can cancel it.
+    Also acquires _scan_semaphore (max 5 concurrent scans).
+    Usage:
+        result = await run_scan(uid, _my_sync_func, url, progress_cb)
+    """
+    async with _scan_semaphore:
+        task = asyncio.current_task()
+        _register_task(uid, task)
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            _clear_task(uid)
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stop — Cancel current running download"""
-    uid = update.effective_user.id
+    """/stop — လက်ရှိ run နေသော command မည်သည့်အမျိုးအစားမဆို ရပ်ရန်"""
+    uid   = update.effective_user.id
+    msg   = update.effective_message
+    stopped = []
+
+    # 1. Download cancel flag
     event = _cancel_flags.get(uid)
     if event and not event.is_set():
         event.set()
-        await update.effective_message.reply_text(
-            "🛑 *Download cancel လုပ်နေပါတယ်...*\n"
-            "⚙️ လက်ရှိ page/asset ပြီးရင် ရပ်မယ်",
+        stopped.append("📥 Download")
+
+    # 2. Any active scan task
+    task = _user_tasks.get(uid)
+    if task and not task.done():
+        task.cancel()
+        _clear_task(uid)
+        stopped.append("🔍 Scan")
+
+    if stopped:
+        await msg.reply_text(
+            f"🛑 *Stopped:* {', '.join(stopped)}\n"
+            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ",
             parse_mode='Markdown'
         )
     else:
-        await update.effective_message.reply_text(
-            "ℹ️ Cancel လုပ်စရာ Download မရှိပါ\n"
-            "`/download`, `/fullsite` စသည်ဖြင့် download ကနဦးစပါ",
+        await msg.reply_text(
+            "ℹ️ ရပ်ရမည့် operation မရှိပါ\n"
+            "Command တစ်ခုခု run နေမှ `/stop` သုံးပါ",
             parse_mode='Markdown'
         )
+
+# ── Command wrappers ──────────────────────────────
 
 
 async def cmd_download(u, c):
@@ -15752,42 +18587,67 @@ async def cmd_resume(u, c):
 # ══════════════════════════════════════════════════
 
 async def _send_admin_panel(target, db: dict):
-    bot_on    = db["settings"]["bot_enabled"]
-    today     = str(date.today())
-    tu        = len(db["users"])
-    tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
-    banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
-    today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
+    bot_on      = db["settings"]["bot_enabled"]
+    today       = str(date.today())
+    tu          = len(db["users"])
+    tdl         = sum(u.get("total_downloads", 0) for u in db["users"].values())
+    banned_n    = sum(1 for u in db["users"].values() if u.get("banned"))
+    today_dl    = sum(u["count_today"] for u in db["users"].values() if u.get("last_date") == today)
+    active_scans = sum(1 for t in _user_tasks.values() if t and not t.done())
+    proxy_st    = proxy_manager.stats()
+    proxy_live  = proxy_st.get("live", 0)
+    proxy_total = proxy_st.get("total", 0)
+    limit       = db["settings"]["global_daily_limit"]
+
+    bot_icon  = "🟢" if bot_on  else "🔴"
+    bot_label = "ON"  if bot_on else "OFF"
+    pw_icon   = "✅"  if PLAYWRIGHT_OK else "❌"
+
+    text = (
+        f"👑 *PhantomScope Admin Panel*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{bot_icon} Bot: *{bot_label}* | 🕸️ JS Engine: {pw_icon}\n"
+        f"⚡ Active Scans: `{active_scans}/{MAX_WORKERS}` | Queue cap: `{QUEUE_MAX}`\n\n"
+        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total DL: `{tdl}` | 📅 Today: `{today_dl}`\n"
+        f"🌐 Proxy: `{proxy_live}/{proxy_total}` live | "
+        f"📏 Limit: `{limit}/day`"
+    )
+
     kb = [
         [
-            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
+            InlineKeyboardButton("📊 Stats",      callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
+            InlineKeyboardButton("🌐 Proxy",      callback_data="adm_proxy"),
+        ],
+        [
+            InlineKeyboardButton("📡 Active Scans", callback_data="adm_active"),
+            InlineKeyboardButton("📜 Log",        callback_data="adm_log"),
+        ],
+        [
+            InlineKeyboardButton("📢 Broadcast",  callback_data="adm_broadcast_prompt"),
+            InlineKeyboardButton("🚫 Ban User",   callback_data="adm_ban_prompt"),
+        ],
+        [
             InlineKeyboardButton(
-                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
+                f"{'🔴 Bot OFF' if bot_on else '🟢 Bot ON'}",
                 callback_data="adm_toggle_bot"
             ),
+            InlineKeyboardButton("🛑 Kill All Tasks", callback_data="adm_killall"),
         ],
-        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
-    text = (
-        f"👑 *Admin Panel v17.0*\n\n"
-        f"👥 Users: `{escape_md(tu)}` | 🚫 Banned: `{escape_md(banned_n)}`\n"
-        f"📦 Total: `{escape_md(tdl)}` | Today: `{escape_md(today_dl)}`\n"
-        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
-        f"⚡ Concurrent: `{escape_md(MAX_WORKERS)}` | Limit: `{db['settings']['global_daily_limit']}`\n"
-        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PLAYWRIGHT_OK else '❌'}"
-    )
+
     markup = InlineKeyboardMarkup(kb)
     try:
         if hasattr(target, 'edit_message_text'):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest: pass
+    except BadRequest:
+        pass
 
 @admin_only
 
@@ -16678,7 +19538,7 @@ ALL_API_PATHS = list(dict.fromkeys(
 
 # ── API URL patterns in JS bundles ─────────────
 _JS_API_PATTERNS = [
-    re.compile(r"""(?:fetch|axios\\.(?:get|post|put|delete|patch))\\s*\\(\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
+    re.compile(r"""(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*['"`]([^'"`\s]{5,200})['"`]"""),
     re.compile(r"""(?:url|endpoint|baseURL|apiUrl|API_URL)\\s*[:=]\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
     re.compile(r"""['"`](/api/[^\\s'"`\\?#]{3,100})['"`]"""),
     re.compile(r"""['"`](/rest/[^\\s'"`\\?#]{3,100})['"`]"""),
@@ -17946,7 +20806,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return detected, notable, resp.status_code
 
     try:
-        detected, notable, status = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status = await run_scan(uid, _do_tech_scan)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -18324,7 +21184,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return sources, source_origins, findings
 
     try:
-        sources, source_origins, findings = await asyncio.to_thread(_do_extract)
+        sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
@@ -18719,7 +21579,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        results = await asyncio.to_thread(_bypass_sync, url)
+        results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -18990,7 +21850,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
+        data = await run_scan(uid, _subdomains_sync, raw, progress_q)
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -19407,10 +22271,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _extract_apk_assets_sync, filepath, wanted_cats,
+        result = await run_scan(
+            uid, _extract_apk_assets_sync, filepath, wanted_cats,
             lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -19589,7 +22457,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return {"success": False, "error": str(e)}
 
     try:
-        res = await asyncio.to_thread(_run_antibot)
+        res = await run_scan(uid, _run_antibot)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -20403,6 +23271,38 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_db_sync(db2)
             new_state = db2["settings"]["bot_enabled"]
         await query.answer(f"Bot is now {'🟢 ON' if new_state else '🔴 OFF'}", show_alert=True)
+
+        # ── Bot OFF → cancel ALL active tasks + notify users ─────────────
+        if not new_state:
+            killed = 0
+            for task_uid, task in list(_user_tasks.items()):
+                if task and not task.done():
+                    task.cancel()
+                    killed += 1
+                    try:
+                        await context.bot.send_message(
+                            chat_id=task_uid,
+                            text=(
+                                "🔴 *Bot ကို Admin မှ ပိတ်လိုက်ပါသည်*\n"
+                                "⚙️ လက်ရှိ operation ရပ်သွားပါပြီ\n"
+                                "_Bot ပြန်ဖွင့်မှ သုံးနိုင်မည်_"
+                            ),
+                            parse_mode='Markdown'
+                        )
+                    except Exception:
+                        pass
+            # cancel download flags too
+            for ev_uid, ev in list(_cancel_flags.items()):
+                if ev and not ev.is_set():
+                    ev.set()
+                    killed += 1
+            _user_tasks.clear()
+            if killed:
+                await query.message.reply_text(
+                    f"🛑 Active operations `{killed}` ကို ရပ်လိုက်ပါပြီ",
+                    parse_mode='Markdown'
+                )
+
         async with db_lock:
             db3 = _load_db_sync()
         await _send_admin_panel(query, db3)
@@ -20419,6 +23319,78 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
             "\n".join(lines) if len(lines)>1 else "Empty",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_proxy":
+        st   = proxy_manager.stats()
+        icon = "🟢" if st["enabled"] else "🔴"
+        kb   = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            f"🌐 *Proxy Status*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon} Status  : `{'ENABLED' if st['enabled'] else 'DISABLED'}`\n"
+            f"📋 Total  : `{st['total']}`\n"
+            f"✅ Live   : `{st['live']}`\n"
+            f"⏳ Cooldown: `{st['in_cooldown']}`\n"
+            f"🚀 Free   : `{st['available']}`\n\n"
+            f"Use `/proxy reload` to refresh",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_active":
+        active = [(uid, t) for uid, t in _user_tasks.items() if t and not t.done()]
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        if not active:
+            txt = "📡 *Active Scans*\n━━━━━━━━━━━━━━━━━━━━\n\n✅ ဘာမှ run မနေပါ"
+        else:
+            lines = ["📡 *Active Scans*", "━━━━━━━━━━━━━━━━━━━━", ""]
+            for task_uid, task in active:
+                u_data = db["users"].get(str(task_uid), {})
+                name   = u_data.get("name", f"uid:{task_uid}")
+                lines.append(f"🔄 `{escape_md(name)}` (`{task_uid}`)")
+            lines.append(f"\n🔢 Total: `{len(active)}/{MAX_WORKERS}`")
+            txt = "\n".join(lines)
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == "adm_killall":
+        killed = 0
+        for task_uid, task in list(_user_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+                killed += 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=task_uid,
+                        text="🛑 *Admin မှ operation ရပ်လိုက်ပါသည်*",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+        for ev_uid, ev in list(_cancel_flags.items()):
+            if ev and not ev.is_set():
+                ev.set()
+                killed += 1
+        _user_tasks.clear()
+        await query.answer(f"🛑 {killed} tasks killed", show_alert=True)
+        async with db_lock:
+            db_r = _load_db_sync()
+        await _send_admin_panel(query, db_r)
+
+    elif data == "adm_broadcast_prompt":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            "📢 *Broadcast*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Command ကိုသုံးပါ:\n`/broadcast <message>`",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_ban_prompt":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            "🚫 *Ban User*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Command ကိုသုံးပါ:\n`/ban <user_id>`\n`/unban <user_id>`\n\n"
+            "User ID ကြည့်ရန်:\n`/allusers` သို့မဟုတ် `/userinfo <id>`",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
@@ -21096,6 +24068,120 @@ def _is_obfuscated(js_text: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 🧩  SHARED DE-OBFUSCATION LAYER
+# Used by keydump, paykeys, sitekey, firebase as a corpus pre-processor.
+# Call: extra = _deobfuscate_text(js_text) → append to scan corpus.
+# ═══════════════════════════════════════════════════════════════
+
+def _deobfuscate_text(text: str) -> str:
+    """
+    Decode common JS obfuscation patterns and return decoded strings
+    as a single block to append to any scan corpus.
+
+    Patterns handled:
+      1. atob("...") / Buffer.from("...","base64")
+      2. Hex escape sequences  "\\x73\\x6b..."
+      3. Unicode escapes       "\\u0073\\u006b..."
+      4. Array join tricks     ["sk","_live","_xx"].join("")
+      5. String.fromCharCode(115,107,95,...)
+      6. Simple string concat  "sk" + "_live" + "_secret_xxx"
+      7. Hex string → printable ASCII  (32-char raw hex values)
+    """
+    import base64 as _b64
+    decoded_parts: list = []
+
+    # ── 1. Base64 atob() / Buffer.from(...,"base64") ──────────────
+    for m in re.finditer(
+        r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']'
+        r'(?:\s*,\s*["\']base64["\'])?\s*\)',
+        text
+    ):
+        raw = m.group(1)
+        try:
+            decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
+            if len(decoded) >= 8 and decoded.isprintable():
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 2. Hex escape  \x73\x6b\x5f... ───────────────────────────
+    for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){5,})"', text):
+        raw = m.group(1)
+        try:
+            decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                              lambda hm: chr(int(hm.group(1), 16)), raw)
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 3. Unicode escape  \u0073\u006b... ───────────────────────
+    for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){4,})"', text):
+        raw = m.group(1)
+        try:
+            decoded = raw.encode("utf-8").decode("unicode_escape")
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 4. Array join trick  ["sk","_live","_xx"].join("") ────────
+    for m in re.finditer(
+        r'\[([^\]]{8,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
+    ):
+        raw = m.group(1)
+        try:
+            parts  = re.findall(r'["\']([^"\']*)["\']', raw)
+            joined = "".join(parts)
+            if len(joined) >= 8:
+                decoded_parts.append(joined)
+        except Exception:
+            pass
+
+    # ── 5. String.fromCharCode(115,107,95,...) ────────────────────
+    for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{8,300})\)', text):
+        raw = m.group(1)
+        try:
+            codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
+            decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 6. String concatenation  "sk" + "_live" + "_secret_xxx" ──
+    for m in re.finditer(
+        r'(?:=|:|\()\s*["\']([A-Za-z0-9_\-]{2,30})["\']'
+        r'(?:\s*\+\s*["\']([^"\']{1,50})["\'])+',
+        text
+    ):
+        try:
+            all_parts = re.findall(r'["\']([^"\']*)["\']', m.group(0))
+            joined    = "".join(all_parts)
+            if len(joined) >= 10:
+                decoded_parts.append(joined)
+        except Exception:
+            pass
+
+    # ── 7. Raw hex string → printable ASCII ───────────────────────
+    for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
+        raw = m.group(1)
+        if len(raw) % 2 != 0:
+            continue
+        try:
+            decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
+            if (decoded.isprintable() and len(decoded) >= 12
+                    and re.search(r'(?i)(key|secret|token|api|auth|pass|sk_|pk_)', decoded)):
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    if not decoded_parts:
+        return ""
+    return "\n// [DEOBFUSCATED]\n" + "\n".join(decoded_parts)
+
+
+# ═══════════════════════════════════════════════════════════════
 
 def _entropy(s: str) -> float:
     """Calculate Shannon entropy of a string."""
@@ -21767,6 +24853,18 @@ def _run_keydump_sync(url: str) -> dict:
 
     _kd_pattern_scan(corpus)  # main corpus
 
+    # ── 2b. Deobfuscation pass — decode atob/hex/unicode/join/fromCharCode ────
+    _deob_hits = 0
+    for _js_text in ([data["html"]] + [_js for _, _js in data["js_sources"]] + inline_scripts):
+        if len(_js_text) < 50:
+            continue
+        _extra = _deobfuscate_text(_js_text)
+        if _extra:
+            _deob_hits += 1
+            _kd_pattern_scan(_extra, "[deobfuscated]")
+    if _deob_hits:
+        out["deobfuscated_files"] = _deob_hits
+
     # ── 3. High-entropy — threshold 4.2 (was 4.5) ────────────────────────────
     # Lowering from 4.5 → 4.2 catches more real secrets (AWS, GCP tokens,
     # random API keys) while hex-32/hex-64 patterns add structural coverage.
@@ -22124,7 +25222,7 @@ def _format_keydump_report(result: dict) -> tuple:
                     lines.append(f"  ┌ {badge} *{label}*")
                     for v in vals[:3]:
                         safe = v.replace("`", "'")
-                        lines.append(f"  └ `{escape_md(safe[:70])}`")
+                        lines.append(f"  └ `{safe[:70]}`")
                     # ── Exploit hint (unique to v18) ──────────────────────
                     hint = _kd_exploit_hint(label)
                     if hint:
@@ -22162,7 +25260,9 @@ def _format_keydump_report(result: dict) -> tuple:
             lines.append(f"🍪 *Auth Cookies* `({len(interesting_cookies)})`")
             for c in interesting_cookies[:5]:
                 badge, _ = _kd_confidence("Token", c["value"])
-                lines.append(f"  {badge} `{c['name']}` = `{c['value'][:50]}`")
+                _cn = c['name'].replace('`', "'")
+                _cv = c['value'][:50].replace('`', "'")
+                lines.append(f"  {badge} `{_cn}` = `{_cv}`")
             lines.append("")
 
         # ── High-entropy strings ──────────────────────────────────────────────
@@ -22170,8 +25270,9 @@ def _format_keydump_report(result: dict) -> tuple:
             lines.append(f"🔬 *High-Entropy Strings* `(H≥4.2)` — `{len(entropy)}` found")
             for item in entropy[:6]:
                 badge, _ = _kd_confidence("entropy", item["value"])
+                _ev = item['value'][:55].replace('`', "'")
                 lines.append(
-                    f"  {badge} H=`{item['entropy']}` `{item['value'][:55]}`"
+                    f"  {badge} H=`{item['entropy']}` `{_ev}`"
                 )
             lines.append("")
 
@@ -22262,36 +25363,188 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await asyncio.to_thread(_run_keydump_sync, url)
+        result = await run_scan(uid, _run_keydump_sync, url)
     except Exception as e:
         await msg.edit_text(
             f"❌ *KeyDump Error*\n`{type(e).__name__}: {str(e)[:100]}`",
             parse_mode="Markdown")
         return
 
-    # ENH K5: Cache key = uid+timestamp to prevent concurrent-run overwrite
+    # ── Build flat findings list from raw_hits ────────────────────────
     import time as _time
     cache_key = f"{uid}_{int(_time.time())}"
-    _kd_cache[uid] = result          # still keep uid lookup for callbacks
-    _kd_cache[cache_key] = result    # timestamped key for concurrent safety
+    _kd_cache[uid] = result
+    _kd_cache[cache_key] = result
 
-    report, _ = _format_keydump_report(result)
+    js_count  = result.get("js_count", 0)
+    page_url  = result.get("url", "")
+    live_result_kd = result.get("live_result") or {}
+    live_reqs = len(live_result_kd.get("live_requests", []))
 
-    total = sum(len(v) for cat in result["by_category"].values() for v in cat.values())
-    kb = _keydump_keyboard(uid) if total > 0 or result["high_entropy"] else None
+    findings = []
+    for _lbl, _vals in result.get("raw_hits", {}).items():
+        for _val in _vals:
+            _badge, _lvl = _kd_confidence(_lbl, _val)
+            findings.append({
+                "type":       _lbl,
+                "value":      _val,
+                "confidence": _lvl,
+                "risk":       "🔴" if _lvl == "HIGH" else "🟡" if _lvl == "MED" else "⚪",
+                "source":     "",
+            })
+
+    # Deduplicate
+    findings = _dedup_by_key(findings, "value")
+
+    # Counts
+    cnt_confirmed = sum(1 for f in findings if "CONFIRMED" in f.get("confidence", ""))
+    cnt_high      = sum(1 for f in findings if "HIGH" in f.get("confidence", ""))
+    cnt_medium    = sum(1 for f in findings if "MEDIUM" in f.get("confidence", "") or f.get("risk") == "🟡")
+    cnt_critical  = sum(1 for f in findings if f.get("risk") == "🔴")
+
+    # Overall risk
+    if cnt_critical >= 3 or cnt_confirmed >= 3:
+        risk_lbl = "🔴 CRITICAL"
+    elif cnt_critical >= 1 or cnt_confirmed >= 1:
+        risk_lbl = "🟠 HIGH"
+    elif cnt_high >= 2 or cnt_medium >= 2:
+        risk_lbl = "🟡 MEDIUM"
+    else:
+        risk_lbl = "🟢 LOW"
+
+    lines = [
+        "🗝️ *API Key Dump*",
+        _HEADER_BAR,
+        f"🌐  `{escape_md(domain)}`",
+        f"⚠️  Risk: *{risk_lbl}*",
+        "",
+        f"📡  JS `{escape_md(str(js_count))}` │ Live `{escape_md(str(live_reqs))}` │ Keys `{escape_md(str(len(findings)))}`",
+        f"🔴 `{escape_md(str(cnt_critical))}` critical   "
+        f"🟠 `{escape_md(str(cnt_high))}` high   "
+        f"🟡 `{escape_md(str(cnt_medium))}` medium",
+        "",
+    ]
+
+    if not findings:
+        lines += [
+            "📭 *API key / secret မတွေ့ရှိပါ*",
+            "",
+            "_Scanned: HTML source + all JS bundles + network traffic_",
+            "_Site may not expose client-side keys._",
+        ]
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+        return
+
+    # ── Group by category ─────────────────────────────────────
+    grouped = {}
+    for f in findings:
+        cat = _categorize_key_type(f.get("type", ""))
+        grouped.setdefault(cat, []).append(f)
+
+    # Sort categories
+    _cat_priority = [
+        "Payment", "AI / ML", "Cloud", "Auth / Token",
+        "Communication", "DevOps", "Database", "Analytics",
+        "Captcha", "Other",
+    ]
+    sorted_cats = sorted(
+        grouped.keys(),
+        key=lambda c: (_cat_priority.index(c) if c in _cat_priority else 99)
+    )
+
+    entry_num = 0
+    for cat in sorted_cats:
+        cat_findings = grouped[cat]
+        cat_icon = _KEY_CAT_ICON.get(cat, "🔑")
+
+        lines.append(f"{cat_icon} *{cat}*  (`{escape_md(str(len(cat_findings)))}`)")
+        lines.append("")
+
+        for f in cat_findings:
+            entry_num += 1
+            ftype      = f.get("type", "Unknown")
+            value      = f.get("value") or f.get("site_key") or ""
+            confidence = f.get("confidence", "")
+            source     = (f.get("source") or "")[:48]
+            risk_icon  = f.get("risk", "")
+
+            # Env detection
+            env_raw = _classify_api_env(ftype, value)
+            env_str = ""
+            for ek, ev in _ENV_LABELS.items():
+                if ek in env_raw:
+                    env_str = f"  {ev}"
+                    break
+
+            badge = _conf_emoji(confidence)
+
+            # Value display (masked for Telegram)
+            val_display = _key_masked(value)
+
+            lines.append(f"  {badge} *{entry_num}.*  {escape_md(ftype)}{env_str}")
+            lines.append(f"       {val_display}")
+            if source:
+                lines.append(f"       📂 _{escape_md(source)}_")
+            lines.append("")
+
+    # Footer
+    lines += [
+        _HEADER_BAR,
+        "📦 _Full unmasked values → JSON export file_",
+        "⚠️ _Authorized security research only_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    # ── JSON Export ───────────────────────────────────────────
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+
+    export = {
+        "command":    "keydump",
+        "domain":     domain,
+        "page_url":   page_url,
+        "scanned_at": datetime.now().isoformat(),
+        "summary": {
+            "total":     len(findings),
+            "confirmed": cnt_confirmed,
+            "high":      cnt_high,
+            "critical":  cnt_critical,
+        },
+        "findings": [
+            {
+                "type":        f.get("type", ""),
+                "value":       f.get("value") or f.get("site_key") or "",
+                "confidence":  f.get("confidence", ""),
+                "category":    _categorize_key_type(f.get("type", "")),
+                "environment": _classify_api_env(f.get("type", ""), f.get("value", "")),
+                "source":      f.get("source", ""),
+                "risk":        f.get("risk", ""),
+            }
+            for f in findings
+        ],
+    }
+
+    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
+    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
 
     try:
-        if len(report) <= 4000:
-            await msg.edit_text(report, parse_mode="Markdown",
-                                reply_markup=kb)
-        else:
-            await msg.edit_text(_truncate_safe_md(report),
-                                parse_mode="Markdown", reply_markup=kb)
-            await update.effective_message.reply_text(
-                report[4000:8000], parse_mode="Markdown")
-    except Exception:
-        await update.effective_message.reply_text(
-            _truncate_safe_md(report), parse_mode="Markdown")
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=json_buf,
+            filename=f"keydump_{safe_d}_{ts}.json",
+            caption=(
+                f"🗝️ *Keydump — `{escape_md(domain)}`*\n"
+                f"Keys `{escape_md(str(len(findings)))}` │ "
+                f"Critical `{escape_md(str(cnt_critical))}` │ "
+                f"💾 `{json_mb:.2f}` MB"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("Keydump export error: %s", e)
+
 
 
 async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -22834,7 +26087,7 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = asyncio.create_task(_prog())
 
     try:
-        result = await asyncio.to_thread(_webhooks_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _webhooks_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23058,7 +26311,7 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_vuln_scan_sync, url, progress_q)
+        result = await run_scan(uid, _vuln_scan_sync, url, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Scan error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -23110,7 +26363,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23193,7 +26446,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        found, baseline = await asyncio.to_thread(_fuzz_sync, url, mode, progress_q)
+        found, baseline = await run_scan(uid, _fuzz_sync, url, mode, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23267,7 +26520,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 words = ["api", "admin", "login", "user", "config", "static", "assets"]
             progress_q.append(f"🧠 Wordlist built: `{len(words)}` words — probing...")
             return _smartfuzz_probe_sync(url, words, lambda t: progress_q.append(t))
-        found = await asyncio.to_thread(_run)
+        found = await run_scan(uid, _run)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23327,7 +26580,7 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp_atk   = _jwt_exp_forgery(token)
         return decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk
     try:
-        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await asyncio.to_thread(_run)
+        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await run_scan(uid, _run)
     except Exception as e:
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -23393,7 +26646,7 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_hiddenkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _hiddenkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23508,7 +26761,7 @@ async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23578,7 +26831,7 @@ async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_oauthscan_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _oauthscan_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -23869,8 +27122,9 @@ def main():
     )
 
     # ── Init asyncio primitives (event loop must be running) ─
-    global download_semaphore, db_lock, _dl_queue
+    global download_semaphore, db_lock, _dl_queue, _scan_semaphore
     download_semaphore = asyncio.Semaphore(MAX_WORKERS)
+    _scan_semaphore    = asyncio.Semaphore(MAX_WORKERS)   # 5 concurrent scans
     db_lock            = asyncio.Lock()
     _dl_queue          = asyncio.Queue(maxsize=QUEUE_MAX)
 
@@ -23905,7 +27159,12 @@ def main():
     # ── Key Extractor commands ────────────────────────
     app.add_handler(CommandHandler("apikeys",         cmd_apikeys))
     app.add_handler(CommandHandler("firebase",        cmd_firebase))
+    app.add_handler(CommandHandler("firecheck",       cmd_firecheck))
+    app.add_handler(CommandHandler("entropy",         cmd_entropy))
+    app.add_handler(CommandHandler("deobfuscate",     cmd_deobfuscate))
+    app.add_handler(CommandHandler("payconfig",       cmd_payconfig))
     app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
+    app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
     app.add_handler(CommandHandler("hiddenkeys",      cmd_hiddenkeys))
@@ -23936,6 +27195,7 @@ def main():
     ))
     # ── Callbacks ─────────────────────────────────────
     app.add_handler(CallbackQueryHandler(keydump_callback,      pattern="^kd_"))
+    app.add_handler(CallbackQueryHandler(verifykeys_callback,   pattern="^vk_"))
     app.add_handler(CallbackQueryHandler(force_join_callback,   pattern="^fj_check$"))
     app.add_handler(CallbackQueryHandler(appassets_cat_callback, pattern="^apa_"))
     app.add_handler(CallbackQueryHandler(admin_callback,        pattern="^adm_"))
@@ -23987,7 +27247,7 @@ def main():
                     BotCommand("jsdownload",  "JS/React/Vue site download"),
                     BotCommand("jsfullsite",  "JS + Full crawl"),
                     BotCommand("resume",      "Download ဆက်လုပ်ရန်"),
-                    BotCommand("stop",        "Download ရပ်ရန်"),
+                    BotCommand("stop",        "လက်ရှိ operation အကုန် ရပ်ရန်"),
                     BotCommand("vuln",        "Security vulnerability scan"),
                     BotCommand("api",         "API endpoint discovery"),
                     BotCommand("tech",        "Tech stack fingerprint"),
@@ -23998,7 +27258,12 @@ def main():
                     BotCommand("keydump",     "All-in-one key dump"),
                     BotCommand("apikeys",     "API key extractor"),
                     BotCommand("firebase",    "Firebase config extractor"),
+                    BotCommand("firecheck",   "Firebase misconfig scanner"),
+                    BotCommand("entropy",     "High entropy secret hunter"),
+                    BotCommand("deobfuscate", "JS secret de-obfuscator"),
+                    BotCommand("payconfig",   "Payment config auditor"),
                     BotCommand("paykeys",     "Payment key extractor"),
+                    BotCommand("verifykeys",  "Payment key validator (read-only)"),
                     BotCommand("socialkeys",  "OAuth / social key extractor"),
                     BotCommand("analytics",   "Analytics ID extractor"),
                     BotCommand("hiddenkeys",  "CSRF / hidden token extractor"),
@@ -24012,6 +27277,10 @@ def main():
                     BotCommand("smartfuzz",   "Context-aware smart fuzzer"),
                     BotCommand("monitor",     "Page change alert monitor"),
                     BotCommand("appassets",   "Web app asset analyzer"),
+                    BotCommand("kdexport",    "Keydump JSON export"),
+                    BotCommand("jwtlive",     "JWT live network interceptor"),
+                    BotCommand("chatkeys",    "Chat/messaging key extractor"),
+                    BotCommand("stop",        "လက်ရှိ operation ရပ်ရန်"),
                     BotCommand("status",      "Daily usage & limit"),
                     BotCommand("history",     "Download history"),
                     BotCommand("mystats",     "Detailed statistics"),
@@ -24027,6 +27296,7 @@ def main():
                     BotCommand("setpages",    "Set max pages"),
                     BotCommand("setassets",   "Set max assets"),
                     BotCommand("proxy",       "Proxy pool status"),
+                    BotCommand("setproxy",    "Set proxy (url/file/off)"),
                     BotCommand("setforcejoin","Set force join channel"),
                 ]
                 try:
