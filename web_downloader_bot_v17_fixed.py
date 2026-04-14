@@ -892,7 +892,7 @@ async def safe_edit(msg, text: str, **kwargs):
     Silently ignores BadRequest 'Message is not modified' errors.
     """
     try:
-        await msg.edit_text(text, **kwargs)
+        await safe_markdown_reply(msg, text, **kwargs)
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
             pass  # Content unchanged — not an error
@@ -3117,7 +3117,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ")
         return
 
     url = context.args[0].strip()
@@ -3188,8 +3188,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         detected, notable, status, final_url, js_cnt = await run_scan(uid, _do_tech_scan)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
-                            parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(type(e).__name__)}: {escape_md(str(e)[:80])}`")
         return
 
     # ── Build report ──────────────────────────────
@@ -3618,7 +3617,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(type(e).__name__)}: {escape_md(str(e)[:80])}`")
         return
 
     # ── Sort findings by risk ────────────────────────────
@@ -3697,7 +3696,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }, ensure_ascii=False, indent=2)
 
     # ── Build ZIP in memory ──────────────────────────────
-    await msg.edit_text(
+    await safe_markdown_reply(msg, 
         f"🗜️ Building ZIP for `{escape_md(domain)}`...\n"
         f"📂 `{len(sources)}` source files + reports",
         parse_mode='Markdown'
@@ -3764,7 +3763,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await msg.edit_text(_truncate_safe_md(tg_text), parse_mode='Markdown')
+            await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
         else:
             await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
     except Exception:
@@ -4026,7 +4025,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
 
     baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
@@ -4301,8 +4300,8 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
-                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}", parse_mode='Markdown')
+                    await safe_markdown_reply(msg, 
+                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}")
                 except Exception:
                     pass
 
@@ -4311,11 +4310,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await run_scan(uid, _subdomains_sync, raw, progress_q)
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
@@ -4735,8 +4734,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
-                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}", parse_mode='Markdown')
+                    await safe_markdown_reply(msg, 
+                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}")
                 except Exception:
                     pass
 
@@ -4748,18 +4747,18 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
         _err_txt = '\n'.join(result['errors'][:3])
-        await msg.edit_text(f"❌ `{escape_md(_err_txt)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(_err_txt)}`")
         return
 
     stats = result["stats"]
@@ -4768,7 +4767,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     if extracted == 0:
         stat_lines = "\n".join(f"  {cat}: `0`" for cat in sorted(wanted_cats))
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"📭 *No files found*\n\nCategory တွေမှာ ဖိုင် မတွေ့ပါ:\n{stat_lines}",
             parse_mode='Markdown'
         )
@@ -4780,14 +4779,11 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
     zip_buf.seek(0)
     zip_size_mb = zip_buf.getbuffer().nbytes / 1024 / 1024
 
-    await msg.edit_text(
-        f"✅ *Extraction ပြီးပါပြီ*\n\n"
+    await safe_markdown_reply(msg, f"✅ *Extraction ပြီးပါပြီ*\n\n"
         f"📦 Extracted: `{escape_md(extracted)}` files\n"
         f"💾 Size: `{zip_size_mb:.2f}` MB\n\n"
         f"*Per Category:*\n{stat_lines}\n\n"
-        "📤 ZIP upload နေပါသည်...",
-        parse_mode='Markdown'
-    )
+        "📤 ZIP upload နေပါသည်...")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_fname = re.sub(r'[^\w\-]', '_', os.path.splitext(os.path.basename(filepath))[0])
@@ -4807,7 +4803,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             parse_mode='Markdown'
         )
     except Exception as e:
-        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`", parse_mode='Markdown')
+        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`")
 
 
 # ══════════════════════════════════════════════════
@@ -4940,11 +4936,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await run_scan(uid, _run_antibot)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
 
     if not res["success"]:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"❌ *Bypass မအောင်မြင်ဘူး*\n\n"
             f"Error: `{res['error']}`\n\n"
             "_Challenge level မြင့်လွန်းနိုင်သည် သို့မဟုတ် manual CAPTCHA solve လိုနိုင်ပါသည်_",
@@ -4962,14 +4958,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_d = re.sub(r'[^\w\-]', '_', domain)
     html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
 
-    await msg.edit_text(
-        f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
+    await safe_markdown_reply(msg, f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
         f"🌐 `{escape_md(domain)}`\n"
         f"⚙️ Method: `{escape_md(method)}`\n"
         f"📄 HTML Size: `{html_size_kb:.1f}` KB\n\n"
-        "📤 HTML file upload နေပါသည်...",
-        parse_mode='Markdown'
-    )
+        "📤 HTML file upload နေပါသည်...")
 
     try:
         await context.bot.send_document(
@@ -4984,7 +4977,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     except Exception as e:
-        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`")
 
 
 # ══════════════════════════════════════════════════
@@ -7498,7 +7491,7 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
 
     # ── ★ NEW Phase B: JSON blob extraction ────────────────────────────────────
     # Parse window.__NEXT_DATA__, __NUXT__, window.CONFIG etc. from HTML
-    if progress_cb: progress_cb("📦 Phase B: JSON blob scan (__NEXT_DATA__ / __NUXT__ / __CONFIG__)...")
+    if progress_cb: progress_cb("📦 Phase B: JSON blob scan (`__NEXT_DATA__` / `__NUXT__` / `__CONFIG__`)...")
     _page_html = result.get("html", "")
     if _page_html:
         _blob_findings = _nextdata_json_sitekey_extract(_page_html, url)
@@ -8392,13 +8385,13 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     await asyncio.sleep(0.5)
-    await msg.edit_text(
+    await safe_markdown_reply(msg, 
         f"🔑 *Site Key Extractor*\n🌐 `{escape_md(domain)}`\n\n"
         "🌐 Launching headless browser...\n"
         "📡 Intercepting network requests...\n"
         "🔍 Scanning DOM + console logs...\n"
         "🗺️ Source map extraction...\n"
-        "📦 JSON blob scan (__NEXT_DATA__ / __NUXT__)...\n"
+        "📦 JSON blob scan (`__NEXT_DATA__` / `__NUXT__`)...\n"
         "🗂️ Config endpoint probe...\n⏳",
         parse_mode='Markdown'
     )
@@ -8411,9 +8404,10 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
-                        f"🔑 *Scanning `{escape_md(domain)}`*\n\n{txt}",
-                        parse_mode='Markdown')
+                    await safe_markdown_reply(
+                        msg,
+                        f"🔑 *Scanning `{escape_md(domain)}`*\n\n{escape_md(txt)}"
+                    )
                 except BadRequest:
                     pass
 
@@ -8424,19 +8418,19 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(str(e))}`")
         return
     finally:
         prog.cancel()
 
     if result.get("error"):
-        await msg.edit_text(
-            f"❌ *Fetch error*\n`{escape_md(str(result['error'])[:80])}`",
-            parse_mode='Markdown'
+        await safe_markdown_reply(
+            msg,
+            f"❌ *Fetch error*\n`{escape_md(str(result['error'])[:80])}`"
         )
         return
 
@@ -8509,15 +8503,87 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── No captcha found ──────────────────────────────────────
     if not findings:
-        lines += [
-            "📭 *Captcha မတွေ့ရှိပါ*",
-            "",
-            "_Possible reasons:_",
-            "  • Site မှာ captcha မပါ",
-            "  • Server-side only (no client key)",
-            "  • User interaction ပြီးမှ load",
-            "  • Obfuscated / encrypted JS bundle",
+        # ── Captcha SDK / platform detection even when keys=0 ─────────────
+        _captcha_sdk_hints = []
+        _combined_sk = "\n".join(t for t, _ in _gather_all_text_v2(result, live_result))
+        _CAPTCHA_SDK_SIGNALS = [
+            ("reCAPTCHA v2/v3",         r'google\.com/recaptcha|recaptcha/api\.js|grecaptcha'),
+            ("reCAPTCHA Enterprise",     r'recaptcha/enterprise\.js|enterprise\.js.*sitekey'),
+            ("hCaptcha",                 r'hcaptcha\.com/1/api\.js|hcaptcha\.com|h-captcha'),
+            ("Cloudflare Turnstile",     r'challenges\.cloudflare\.com/turnstile|cf-turnstile'),
+            ("FunCaptcha / Arkose",      r'funcaptcha\.com|arkoselabs\.com|enforcement\.arkoselabs'),
+            ("GeeTest",                  r'geetest\.com|initGeetest|gt\.js'),
+            ("DataDome",                 r'datadome\.co|dd_cookie|DataDome'),
+            ("PerimeterX / HUMAN",       r'perimeterx\.net|px\.js|pxchallenge'),
+            ("Akamai Bot Manager",       r'akamai\.com.*bot|_abck|bm_sz'),
+            ("Kasada",                   r'kasada\.io|kpsdk|kcurl'),
+            ("AWS WAF Captcha",          r'aws\.amazon\.com.*waf|captcha\.awswaf|AwsWafIntegration'),
+            ("Imperva / Incapsula",      r'incapsula\.com|imperva\.com|reese84'),
+            ("Shape Security",           r'shapesecurity\.com|shape_utmz'),
+            ("FriendlyCaptcha",          r'friendlycaptcha\.com|frcaptcha'),
+            ("MTCaptcha",               r'mtcaptcha\.com|mtcaptcha\.js'),
+            ("Altcha",                   r'altcha\.org|AltchaWidget'),
         ]
+        for sdk_name, pattern in _CAPTCHA_SDK_SIGNALS:
+            if re.search(pattern, _combined_sk, re.I):
+                _captcha_sdk_hints.append(sdk_name)
+
+        _captcha_iframes = []
+        try:
+            dom_sk = result.get("dom_result") or {}
+            ifr_json = dom_sk.get("__iframes__", "[]")
+            ifr_list = json.loads(ifr_json) if isinstance(ifr_json, str) else []
+            _CAPTCHA_IFRAME_DOMAINS = {
+                "google.com", "recaptcha.net", "hcaptcha.com",
+                "challenges.cloudflare.com", "funcaptcha.com",
+                "arkoselabs.com", "geetest.com",
+            }
+            for entry in ifr_list:
+                src = entry.split("||")[0] if "||" in entry else entry
+                netloc = urlparse(src).netloc
+                if any(cd in netloc for cd in _CAPTCHA_IFRAME_DOMAINS):
+                    if netloc not in _captcha_iframes:
+                        _captcha_iframes.append(netloc)
+        except Exception:
+            pass
+
+        lines += ["📭 *Captcha မတွေ့ရှိပါ*", ""]
+
+        if _captcha_sdk_hints:
+            lines.append(f"🔍 *Detected Captcha Systems:* `{'`, `'.join(_captcha_sdk_hints)}`")
+            lines.append("_(Script loaded ဖြစ်သော်လည်း `sitekey` parameter မတွေ့ရ)_")
+            lines.append("")
+            if "reCAPTCHA v2/v3" in _captcha_sdk_hints or "reCAPTCHA Enterprise" in _captcha_sdk_hints:
+                lines.append("💡 *reCAPTCHA:* Key သည် JS `grecaptcha.render()` ထဲ runtime inject")
+                lines.append("   ဖြစ်နိုင်၍ headless browser ဖြင့် interaction လိုအပ်မည်")
+            if "Cloudflare Turnstile" in _captcha_sdk_hints:
+                lines.append("💡 *Turnstile:* Key သည် HTML `data-sitekey` attribute ထဲ")
+                lines.append("   `0x4A...` / `1x00...` format — CF bot protection active")
+            if "FunCaptcha / Arkose" in _captcha_sdk_hints:
+                lines.append("💡 *Arkose Labs:* `enforcement.arkoselabs.com` challenge")
+                lines.append("   Key သည် JS init call ထဲ — deep deobfuscation လိုအပ်")
+            if any(x in _captcha_sdk_hints for x in ["Akamai Bot Manager", "Kasada", "DataDome", "PerimeterX / HUMAN"]):
+                lines.append("💡 *Bot Manager detected:* Frontend key မပါ — server-side only")
+                lines.append("   Challenge response ကို intercept မှ မြင်ရမည်")
+        elif _captcha_iframes:
+            pass  # covered below
+
+        if _captcha_iframes:
+            lines.append("🪟 *Captcha iframes detected:*")
+            for d in _captcha_iframes[:5]:
+                lines.append(f"  • `{escape_md(d)}`")
+            lines.append("_(Cross-origin iframe — sitekey ကို directly access မရ)_")
+            lines.append("")
+
+        if not _captcha_sdk_hints and not _captcha_iframes:
+            lines += [
+                "_Possible reasons:_",
+                "  • Site မှာ captcha မပါ",
+                "  • Server-side only (no client key in frontend)",
+                "  • User interaction / login ပြီးမှ load",
+                "  • Obfuscated / encrypted JS bundle",
+            ]
+
         await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
         return
 
@@ -8696,7 +8762,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     deob_lines.append("")
                 deob_lines.append("⚠️ _Authorized testing only_")
                 await update.effective_message.reply_text(
-                    _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
+                    _truncate_safe_md("\n".join(deob_lines)))
     except Exception as deob_err:
         logger.debug("sitekey deobfuscate layer error: %s", deob_err)
 
@@ -11670,7 +11736,7 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔑 *API Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🔑 *API Keys — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
@@ -11681,12 +11747,12 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"\u274c `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"\u274c `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"\u274c `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"\u274c `{escape_md(str(result['error'])[:80])}`")
         return
     raw_findings = result["findings"]
     findings = _confidence_crossref(raw_findings, live_result)
@@ -11697,11 +11763,10 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
     static_only = [f for f in findings if "STATIC" in f.get("confidence","")]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"\U0001f511 *API Key Extractor \u2014 `{escape_md(domain)}`*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
             f"\U0001f4ed No API keys found\n\U0001f310 `{escape_md(page_url)}`\n"
-            f"\U0001f4e1 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`",
-            parse_mode='Markdown')
+            f"\U0001f4e1 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`")
         return
     lines = [
         f"\U0001f511 *API Keys \u2014 `{escape_md(domain)}`*", "\u2501"*20,
@@ -11905,27 +11970,26 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔥 *Firebase — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🔥 *Firebase — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _firebase_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
         return
     findings = result["findings"]
     page_url = result["page_url"]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"🔥 *Firebase Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No Firebase config found\n🌐 `{escape_md(page_url)}`",
-            parse_mode='Markdown')
+            f"📭 No Firebase config found\n🌐 `{escape_md(page_url)}`")
         return
     lines = [f"🔥 *Firebase Config — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}` config(s)\n"]
@@ -12122,7 +12186,7 @@ async def cmd_firecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await asyncio.to_thread(_firecheck_sync, project_id, api_key)
     except Exception as e:
-        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
         return
 
     vuln_count = sum(1 for v in res.values() if "VULNERABLE" in v.get("status", ""))
@@ -12871,7 +12935,7 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
+                    await safe_markdown_reply(msg, 
                         f"💳 *Pay Config — `{escape_md(domain)}`*\n\n{escape_md(t)}",
                         parse_mode='Markdown'
                     )
@@ -12885,11 +12949,11 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
         return
     finally:
         prog.cancel()
@@ -13114,9 +13178,7 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Configs `{escape_md(str(len(findings)))}` │ "
                 f"💾 `{json_mb:.2f}` MB\n"
                 f"_Solver-ready JSON — copy to API call_"
-            ),
-            parse_mode='Markdown'
-        )
+            ))
     except Exception as e:
         logger.warning("Payconfig export error: %s", e)
 
@@ -13188,7 +13250,7 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
+                    await safe_markdown_reply(msg, 
                         f"🔬 *Entropy Hunter — `{escape_md(domain)}`*\n\n{t}",
                         parse_mode='Markdown'
                     )
@@ -13202,11 +13264,11 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
         return
     finally:
         prog.cancel()
@@ -13298,9 +13360,7 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 f"🔬 Entropy Secrets — `{escape_md(domain)}`\n"
                 f"🔴 HIGH: `{len(high)}` | Total: `{len(findings)}`"
-            ),
-            parse_mode='Markdown'
-        )
+            ))
     except Exception as e:
         logger.warning("entropy export error: %s", e)
 
@@ -13514,7 +13574,7 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
+                    await safe_markdown_reply(msg, 
                         f"🧩 *De-obfuscator — `{escape_md(domain)}`*\n\n{t}",
                         parse_mode='Markdown'
                     )
@@ -13528,11 +13588,11 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
         return
     finally:
         prog.cancel()
@@ -13604,9 +13664,7 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 f"🧩 De-obfuscated Secrets — `{escape_md(domain)}`\n"
                 f"🔴 High: `{len(high)}` | Total: `{len(findings)}`"
-            ),
-            parse_mode='Markdown'
-        )
+            ))
     except Exception as e:
         logger.warning("deobfuscate export error: %s", e)
 
@@ -13703,6 +13761,22 @@ _PAY_PATTERNS = [
     ("Midtrans Client Key",          re.compile(r'\b((?:Mid-client|SB-Mid-client)-[A-Za-z0-9_\-]{20,50})\b')),
     # ══ Payhere (Sri Lanka) ═══════════════════════════════════════════════════
     ("Payhere Merchant ID",          re.compile(r'(?i)payhere[_-]?merchant[_-]?(?:id|secret)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
+    # ══ PayPal SDK URL (script src / fetch URL) ═══════════════════════════════
+    ("PayPal Client ID (SDK URL)",   re.compile(r'paypal\.com/sdk/js[?&][^"\'>\s]*client-id=([A-Za-z0-9_-]{10,97})')),
+    ("PayPal Client ID (SDK URL)",   re.compile(r'(?i)["\']client[-_]?id["\']\s*:\s*["\']([A-Za-z0-9_-]{10,97})["\']')),
+    # ══ Authorize.Net ═════════════════════════════════════════════════════════
+    ("Authorize.Net API Login ID",   re.compile(r'(?i)(?:login|api)[_-]?id\s*[=:]\s*["\']([0-9A-Za-z]{6,20})["\']')),
+    ("Authorize.Net Client Key",     re.compile(r'(?i)(?:client|public)[_-]?key\s*[=:]\s*["\']([0-9A-Za-z]{64,80})["\']')),
+    # ══ BigCommerce ═══════════════════════════════════════════════════════════
+    ("BigCommerce Payments Token",   re.compile(r'(?i)bigcommerce[_-]?(?:payments?[_-]?)?token\s*[=:]\s*["\']([A-Za-z0-9_.\-]{20,80})["\']')),
+    ("BigCommerce Client ID",        re.compile(r'(?i)(?:bigcommerce|bc)[_-]?client[_-]?id\s*[=:]\s*["\']([A-Za-z0-9]{20,60})["\']')),
+    ("BigCommerce Store Hash",       re.compile(r'(?i)store[_-]?hash\s*[=:]\s*["\']([a-z0-9]{6,12})["\']')),
+    # ══ NMI / Network Merchants ═══════════════════════════════════════════════
+    ("NMI Public Key",               re.compile(r'(?i)nmi[_-]?(?:public[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9]{16,50})["\']')),
+    # ══ Spreedly ══════════════════════════════════════════════════════════════
+    ("Spreedly Environment Key",     re.compile(r'(?i)spreedly[_-]?(?:env(?:ironment)?[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9]{20,50})["\']')),
+    # ══ Bolt ══════════════════════════════════════════════════════════════════
+    ("Bolt Publishable Key",         re.compile(r'(?i)bolt[_-]?(?:publishable[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_.\-]{20,80})["\']')),
 ]
 
 # ── Gateway prefix lookup for live/test detection ─────────────────────────
@@ -15338,7 +15412,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
+                    await safe_markdown_reply(msg, 
                         f"💳 *Payment Keys v19 — `{escape_md(domain)}`*\n\n{escape_md(t)}",
                         parse_mode='Markdown'
                     )
@@ -15397,14 +15471,84 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if not findings:
-        lines += [
-            "📭 *Payment key မတွေ့ရှိပါ*",
-            "",
-            "_Possible reasons:_",
-            "  • Payment integration မပါ",
-            "  • Server-side only (no publishable key)",
-            "  • Keys in inaccessible iframe",
+        # ── SDK / platform detection even when keys=0 ─────────────────────
+        _sdk_hints = []
+        _combined_scan = "\n".join(t for t, _ in _gather_all_text_v2(result, live_result))
+        _SDK_SIGNALS = [
+            ("Stripe.js",          r'js\.stripe\.com|stripe\.js|Stripe\s*\('),
+            ("PayPal SDK",         r'paypal\.com/sdk/js|paypal\.Buttons|PAYPAL'),
+            ("Braintree",          r'braintree|braintreewebclient'),
+            ("Square Web Payments",r'square\.com/web-payments|payments\.js|squareup\.com'),
+            ("Adyen",              r'adyen|checkout\.adyen\.com'),
+            ("Klarna",             r'klarna\.com|KlarnaCheckout'),
+            ("Afterpay/Clearpay",  r'afterpay|clearpay\.io'),
+            ("Affirm",             r'cdn1\.affirm\.com|affirm\.com/libs'),
+            ("Bolt",               r'bolt\.com/track|bolt\.js'),
+            ("Sezzle",             r'sezzle\.com/widget'),
+            ("NMI / Collect.js",   r'secure\.networkmerchants\.com|CollectJS|collect\.js'),
+            ("Authorize.Net",      r'js\.authorize\.net|AcceptJS|accept\.js'),
+            ("BigCommerce",        r'bigcommerce|bigcommerceapp|store-[a-z0-9]{6,}'),
+            ("Shopify Checkout",   r'cdn\.shopify\.com|myshopify\.com|shopify\.js'),
+            ("WooCommerce",        r'woocommerce|wc-stripe|wc_stripe_params'),
+            ("Cybersource",        r'cybersource|flex\.cybersource'),
+            ("Spreedly",           r'spreedly\.com/js|spreedly\.frames'),
+            ("Recurly",            r'recurly\.com/js|recurly\.configure'),
+            ("Chargebee",          r'chargebee\.com/js|Chargebee\.init'),
         ]
+        for sdk_name, pattern in _SDK_SIGNALS:
+            if re.search(pattern, _combined_scan, re.I):
+                _sdk_hints.append(sdk_name)
+
+        _iframe_domains = []
+        try:
+            dom = result.get("dom_result") or {}
+            iframe_json = dom.get("__iframes__", "[]")
+            iframes = json.loads(iframe_json) if isinstance(iframe_json, str) else []
+            for entry in iframes:
+                src = entry.split("||")[0] if "||" in entry else entry
+                domain_part = urlparse(src).netloc
+                if domain_part and domain_part not in _iframe_domains:
+                    _iframe_domains.append(domain_part)
+        except Exception:
+            pass
+
+        lines += ["📭 *Payment key မတွေ့ရှိပါ*", ""]
+
+        if _sdk_hints:
+            lines.append(f"🔍 *Detected SDKs:* `{'`, `'.join(_sdk_hints)}`")
+            lines.append("_(SDK loaded ဖြစ်သော်လည်း publishable key frontend မှာ မပါ)_")
+            lines.append("")
+            # Give specific hints per SDK
+            if "Shopify Checkout" in _sdk_hints:
+                lines.append("💡 *Shopify:* checkout.shopify.com မှာ hosted ဖြစ်ပြီး")
+                lines.append("   keys merchant site မှာ မပါ — Shopify admin မှာသာ ရှိမည်")
+            if "BigCommerce" in _sdk_hints:
+                lines.append("💡 *BigCommerce:* payments API server-side only")
+                lines.append("   `/checkout` page session cookie လိုအပ်မည်")
+            if any(x in _sdk_hints for x in ["Stripe.js", "Authorize.Net", "Braintree", "NMI / Collect.js"]):
+                lines.append("💡 *Hint:* Keys likely in `/checkout` or `/cart` page")
+                lines.append("   Session cookie ရယူပြီးမှ scan လုပ်ကြည့်ပါ")
+
+        if _iframe_domains:
+            lines.append(f"🪟 *Payment iframes:*")
+            for d in _iframe_domains[:5]:
+                lines.append(f"  • `{escape_md(d)}`")
+            lines.append("_(Cross-origin iframe — frontend မှ key ကို access မရ)_")
+            lines.append("")
+
+        if not _sdk_hints and not _iframe_domains:
+            lines += [
+                "_Possible reasons:_",
+                "  • Payment integration မပါ (COD/bank transfer only)",
+                "  • Server-side payment processing only",
+                "  • Keys in cross-origin iframe (Shopify/PayPal hosted)",
+                "  • Dynamic load — checkout ရောက်မှ key inject",
+            ]
+
+        # Show gateway profile even when keys=0 — may show payment methods
+        gw_profile_lines = _format_pay_gateway_profile(result.get("gateway_profile", {}))
+        lines += gw_profile_lines
+
         await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
         return
 
@@ -15963,7 +16107,7 @@ async def cmd_verifykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ")
         return
 
     args = list(context.args)
@@ -16331,22 +16475,22 @@ async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"👤 *Social Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"👤 *Social Keys — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _socialkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
+        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"👤 *OAuth Key Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No social/OAuth keys found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
+            f"📭 No social/OAuth keys found\n🌐 `{escape_md(page_url)}`")
         return
     lines = [f"👤 *Social / OAuth Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -16513,22 +16657,22 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"📊 *Analytics — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"📊 *Analytics — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _analytics_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
+        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"📊 *Analytics Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No analytics IDs found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
+            f"📭 No analytics IDs found\n🌐 `{escape_md(page_url)}`")
         return
     lines = [f"📊 *Analytics IDs — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18432,22 +18576,22 @@ async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔒 *JWT Live — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🔒 *JWT Live — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _jwtlive_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
+        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"🔒 *JWT Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No JWT tokens found (may require login)\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
+            f"📭 No JWT tokens found (may require login)\n🌐 `{escape_md(page_url)}`")
         return
     lines = [f"🔒 *JWT Tokens — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18620,22 +18764,22 @@ async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"📡 *Push Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"📡 *Push Keys — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _pushkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
+        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"📡 *Push Key Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No push/CDN keys found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
+            f"📭 No push/CDN keys found\n🌐 `{escape_md(page_url)}`")
         return
     lines = [f"📡 *Push / CDN Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18778,22 +18922,22 @@ async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"💬 *Chat Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"💬 *Chat Keys — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _chatkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
+        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"💬 *Chat Key Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No chat/monitoring keys found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
+            f"📭 No chat/monitoring keys found\n🌐 `{escape_md(page_url)}`")
         return
     lines = [f"💬 *Chat & Monitoring Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18928,7 +19072,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(doc.file_id)
         await tg_file.download_to_drive(save_path)
     except Exception as e:
-        await msg.edit_text(f"❌ Download error: `{escape_md(type(e).__name__)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Download error: `{escape_md(type(e).__name__)}`")
         return
 
     # ── Save path for /appassets command ─────────
@@ -18938,7 +19082,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u2["last_uploaded_app"] = save_path
         _save_db_sync(db2)
 
-    await msg.edit_text(
+    await safe_markdown_reply(msg, 
         f"📱 *{file_type} — `{escape_md(fname)}`*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ Downloaded `{fsize_mb:.1f}MB`\n\n"
@@ -18957,10 +19101,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if prog_q:
                 txt = prog_q[-1]; prog_q.clear()
                 try:
-                    await msg.edit_text(
-                        f"📱 *Analyzing `{escape_md(fname)}`*\n\n{txt}",
-                        parse_mode='Markdown'
-                    )
+                    await safe_markdown_reply(msg, f"📱 *Analyzing `{escape_md(fname)}`*\n\n{escape_md(str(txt))}")
                 except Exception:
                     pass
 
@@ -18972,8 +19113,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog_task.cancel()
-        await msg.edit_text(f"❌ Analysis error: `{escape_md(type(e).__name__)}`\n`{escape_md(str(e)[:100])}`",
-                            parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Analysis error: `{escape_md(type(e).__name__)}`\n`{escape_md(str(e)[:100])}`")
         try: os.remove(save_path)
         except: pass
         return
@@ -19500,7 +19640,7 @@ async def _run_download(
                 return
             if last['t']:
                 try:
-                    await msg.edit_text(
+                    await safe_markdown_reply(msg, 
                         f"⏳ *Download နေဆဲ...*\n🔗 `{escape_md(sanitize_log_url(url))}`\n\n{last['t']}",
                         parse_mode='Markdown'
                     )
@@ -19516,7 +19656,7 @@ async def _run_download(
         if cancel_event.is_set():
             prog.cancel()
             _cancel_flags.pop(uid, None)
-            await msg.edit_text("🛑 Download cancelled")
+            await safe_markdown_reply(msg, "🛑 Download cancelled")
             return
         try:
             async with db_lock:
@@ -19535,13 +19675,11 @@ async def _run_download(
                 "SSLError":         "🔒 SSL certificate ပြဿနာ",
                 "TooManyRedirects": "🔄 Redirect loop ဖြစ်နေတယ်",
             }.get(err_name, f"⚠️ {err_name}")
-            await msg.edit_text(
+            await safe_markdown_reply(msg,
                 f"❌ *Download မအောင်မြင်ဘူး*\n\n"
-                f"{err_hint}\n\n"
-                f"▸ ဆက်လုပ်ဖို့: `/resume {url}`\n"
-                f"▸ JS site ဆိုရင်: `/jsdownload {url}`",
-                parse_mode='Markdown'
-            )
+                f"{escape_md(str(err_hint))}\n\n"
+                f"▸ ဆက်လုပ်ဖို့: `/resume {escape_md(url)}`\n"
+                f"▸ JS site ဆိုရင်: `/jsdownload {escape_md(url)}`")
             async with db_lock:
                 db3 = _load_db_sync()
                 u3  = get_user(db3, uid)
@@ -19555,18 +19693,16 @@ async def _run_download(
 
     # Check if cancelled during download
     if cancel_event.is_set():
-        await msg.edit_text("🛑 Download ကို cancel လုပ်ပြီးပါပြီ")
+        await safe_markdown_reply(msg, "🛑 Download ကို cancel လုပ်ပြီးပါပြီ")
         return
 
     if error:
-        await msg.edit_text(f"❌ {error}"); return
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(error))}`"); return
 
     is_split = len(files) > 1
-    await msg.edit_text(
+    await safe_markdown_reply(msg,
         f"📤 Upload နေပါတယ်...\n💾 {size_mb:.1f} MB"
-        + (f" → {len(files)} parts" if is_split else ""),
-        parse_mode='Markdown'
-    )
+        + (f" → {len(files)} parts" if is_split else ""))
 
     try:
         for i, fpath in enumerate(files):
@@ -19602,7 +19738,7 @@ async def _run_download(
             "\n\n*Combine လုပ်နည်း:*\n```\ncat *.part*.zip > full.zip\n```"
         ) if is_split else ""
 
-        await msg.edit_text(f"✅ ပြီးပါပြီ 🎉{join_hint}", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"✅ ပြီးပါပြီ 🎉{join_hint}")
 
         async with db_lock:
             db4 = _load_db_sync()
@@ -19611,9 +19747,9 @@ async def _run_download(
             _save_db_sync(db4)
 
     except RetryAfter as e:
-        await msg.edit_text(f"❌ Telegram flood limit — `{e.retry_after}s` နောက်မှ ထပ်ကြိုးစားပါ")
+        await safe_markdown_reply(msg, f"❌ Telegram flood limit — `{e.retry_after}s` နောက်မှ ထပ်ကြိုးစားပါ")
     except Exception as e:
-        await msg.edit_text(f"❌ Upload error: {type(e).__name__}")
+        await safe_markdown_reply(msg, f"❌ Upload error: `{escape_md(type(e).__name__)}`")
 
 
 # ══════════════════════════════════════════════════
@@ -19676,9 +19812,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stopped:
         await msg.reply_text(
             f"🛑 *Stopped:* {', '.join(stopped)}\n"
-            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ",
-            parse_mode='Markdown'
-        )
+            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ")
     else:
         await msg.reply_text(
             "ℹ️ ရပ်ရမည့် operation မရှိပါ\n"
@@ -19691,7 +19825,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_download(u, c):
     if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/download <url>`", parse_mode='Markdown')
+    if not c.args: return await u.message.reply_text("Usage: `/download <url>`")
     url = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
     await enqueue_download(u, c, url, False, False)
 
@@ -21983,7 +22117,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         detected, notable, status = await run_scan(uid, _do_tech_scan)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
 
     domain = urlparse(url).hostname
@@ -22367,7 +22501,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(type(e).__name__)}: {escape_md(str(e)[:80])}`")
         return
 
     # ── Sort findings by risk ────────────────────────────
@@ -22446,7 +22580,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }, ensure_ascii=False, indent=2)
 
     # ── Build ZIP in memory ──────────────────────────────
-    await msg.edit_text(
+    await safe_markdown_reply(msg, 
         f"🗜️ Building ZIP for `{escape_md(domain)}`...\n"
         f"📂 `{len(sources)}` source files + reports",
         parse_mode='Markdown'
@@ -22513,7 +22647,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await msg.edit_text(_truncate_safe_md(tg_text), parse_mode='Markdown')
+            await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
         else:
             await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
     except Exception:
@@ -22771,7 +22905,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
 
     baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
@@ -23042,8 +23176,8 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
-                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}", parse_mode='Markdown')
+                    await safe_markdown_reply(msg, 
+                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}")
                 except Exception:
                     pass
 
@@ -23052,11 +23186,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await run_scan(uid, _subdomains_sync, raw, progress_q)
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
@@ -23472,8 +23606,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await msg.edit_text(
-                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}", parse_mode='Markdown')
+                    await safe_markdown_reply(msg, 
+                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}")
                 except Exception:
                     pass
 
@@ -23485,18 +23619,18 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
         return
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
         _err_txt = '\n'.join(result['errors'][:3])
-        await msg.edit_text(f"❌ `{escape_md(_err_txt)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(_err_txt)}`")
         return
 
     stats = result["stats"]
@@ -23505,7 +23639,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     if extracted == 0:
         stat_lines = "\n".join(f"  {cat}: `0`" for cat in sorted(wanted_cats))
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"📭 *No files found*\n\nCategory တွေမှာ ဖိုင် မတွေ့ပါ:\n{stat_lines}",
             parse_mode='Markdown'
         )
@@ -23517,14 +23651,11 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
     zip_buf.seek(0)
     zip_size_mb = zip_buf.getbuffer().nbytes / 1024 / 1024
 
-    await msg.edit_text(
-        f"✅ *Extraction ပြီးပါပြီ*\n\n"
+    await safe_markdown_reply(msg, f"✅ *Extraction ပြီးပါပြီ*\n\n"
         f"📦 Extracted: `{escape_md(extracted)}` files\n"
         f"💾 Size: `{zip_size_mb:.2f}` MB\n\n"
         f"*Per Category:*\n{stat_lines}\n\n"
-        "📤 ZIP upload နေပါသည်...",
-        parse_mode='Markdown'
-    )
+        "📤 ZIP upload နေပါသည်...")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_fname = re.sub(r'[^\w\-]', '_', os.path.splitext(os.path.basename(filepath))[0])
@@ -23544,7 +23675,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             parse_mode='Markdown'
         )
     except Exception as e:
-        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`", parse_mode='Markdown')
+        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`")
 
 
 # ══════════════════════════════════════════════════
@@ -23673,11 +23804,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await run_scan(uid, _run_antibot)
     except Exception as e:
-        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
         return
 
     if not res["success"]:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"❌ *Bypass မအောင်မြင်ဘူး*\n\n"
             f"Error: `{res['error']}`\n\n"
             "_Challenge level မြင့်လွန်းနိုင်သည် သို့မဟုတ် manual CAPTCHA solve လိုနိုင်ပါသည်_",
@@ -23695,14 +23826,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_d = re.sub(r'[^\w\-]', '_', domain)
     html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
 
-    await msg.edit_text(
-        f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
+    await safe_markdown_reply(msg, f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
         f"🌐 `{escape_md(domain)}`\n"
         f"⚙️ Method: `{escape_md(method)}`\n"
         f"📄 HTML Size: `{html_size_kb:.1f}` KB\n\n"
-        "📤 HTML file upload နေပါသည်...",
-        parse_mode='Markdown'
-    )
+        "📤 HTML file upload နေပါသည်...")
 
     try:
         await context.bot.send_document(
@@ -23717,7 +23845,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     except Exception as e:
-        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`", parse_mode='Markdown')
+        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`")
 
 
 # ══════════════════════════════════════════════════
@@ -26715,7 +26843,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await run_scan(uid, _run_keydump_sync, url)
     except Exception as e:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"❌ *KeyDump Error*\n`{type(e).__name__}: {str(e)[:100]}`",
             parse_mode="Markdown")
         return
@@ -27405,7 +27533,7 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • Telegram bot webhook URLs\n"
             "  • Datadog / Atlassian / Generic webhooks\n"
             "  • GitHub webhook secrets\n\n"
-            "⚠️ _Authorized testing only_", parse_mode='Markdown')
+            "⚠️ _Authorized testing only_")
         return
 
     uid = update.effective_user.id
@@ -27444,8 +27572,8 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(
-                    f"🪝 *Webhook Extractor — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, 
+                    f"🪝 *Webhook Extractor — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
 
@@ -27453,13 +27581,13 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await run_scan(uid, _webhooks_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
 
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
         return
 
     findings = result["findings"]
@@ -27467,11 +27595,10 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reqs     = result.get("requests", 0)
 
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"🪝 *Webhook Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 No webhook URLs found\n"
-            f"🌐 `{escape_md(page_url)}`\n📡 Requests: `{escape_md(reqs)}`",
-            parse_mode='Markdown')
+            f"🌐 `{escape_md(page_url)}`\n📡 Requests: `{escape_md(reqs)}`")
         return
 
     lines = [
@@ -27683,14 +27810,14 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🛡️ *Vuln Scan — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🛡️ *Vuln Scan — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _vuln_scan_sync, url, progress_q)
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ Scan error: `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ Scan error: `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
@@ -27748,19 +27875,19 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔍 *API Scan — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🔍 *API Scan — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
         return
     findings = result["findings"]
     gql      = result.get("graphql", {})
@@ -27844,21 +27971,21 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🧪 *Fuzzing — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🧪 *Fuzzing — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         found, baseline = await run_scan(uid, _fuzz_sync, url, mode, progress_q)
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if not found:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"🧪 *Fuzzer — `{escape_md(domain)}`*\n\n📭 No interesting paths found.\n"
-            f"_(Baseline: `{escape_md(baseline)}`)_", parse_mode='Markdown')
+            f"_(Baseline: `{escape_md(baseline)}`)_")
         return
     lines = [f"🧪 *Fuzzer — `{escape_md(domain)}`* (`{escape_md(mode)}`)", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(found)}` paths\n"]
@@ -27922,7 +28049,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
@@ -27938,12 +28065,12 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         found = await run_scan(uid, _run)
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if not found:
-        await msg.edit_text(f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n📭 No interesting paths found.", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n📭 No interesting paths found.")
         return
     lines = [f"🤖 *SmartFuzz — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(found)}` paths\n"]
@@ -28007,7 +28134,7 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await run_scan(uid, _run)
     except Exception as e:
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     lines = ["🔐 *JWT Attack Report*", "━━━━━━━━━━━━━━━━━━━━"]
     if not decoded.get("error"):
@@ -28080,19 +28207,19 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔑 *Hidden Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🔑 *Hidden Keys — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _hiddenkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
         return
     raw_findings = result["findings"]
     live_result  = result.get("live_result") or {"live_requests": [], "live_findings": [], "sse_frames": []}
@@ -28111,9 +28238,9 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     high_live   = [f for f in findings if f.get("confidence", "").startswith("HIGH")]
     static_only = [f for f in findings if "STATIC" in f.get("confidence", "")]
     if not findings:
-        await msg.edit_text(
+        await safe_markdown_reply(msg, 
             f"🔑 *Hidden Keys — `{escape_md(domain)}`*\n\n📭 No hidden tokens found.\n"
-            f"📡 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`", parse_mode='Markdown')
+            f"📡 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`")
         return
     lines = [
         f"🔑 *Hidden Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
@@ -28208,23 +28335,23 @@ async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"📡 *Endpoints — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"📡 *Endpoints — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
         return
     findings = result["findings"]
     if not findings:
-        await msg.edit_text(f"📡 *Endpoints — `{escape_md(domain)}`*\n\n📭 No endpoints found.", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"📡 *Endpoints — `{escape_md(domain)}`*\n\n📭 No endpoints found.")
         return
     lines = [f"📡 *Endpoints — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(findings)}`\n"]
@@ -28291,24 +28418,24 @@ async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await msg.edit_text(f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
+                try: await safe_markdown_reply(msg, f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n{t}")
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _oauthscan_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
         return
     findings = result["findings"]
     risks    = result.get("risks", [])
     if not findings and not risks:
-        await msg.edit_text(f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n📭 No OAuth artifacts found.", parse_mode='Markdown')
+        await safe_markdown_reply(msg, f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n📭 No OAuth artifacts found.")
         return
     lines = [f"🔐 *OAuth Scan — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(findings)}` | ⚠️ Risks: `{len(risks)}`\n"]
@@ -28464,7 +28591,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await msg.edit_text(f"✅ Sent: `{escape_md(ok)}` | ❌ Failed: `{escape_md(fail)}`", parse_mode='Markdown')
+    await safe_markdown_reply(msg, f"✅ Sent: `{escape_md(ok)}` | ❌ Failed: `{escape_md(fail)}`")
 
 
 @admin_only
