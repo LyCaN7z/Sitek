@@ -892,7 +892,7 @@ async def safe_edit(msg, text: str, **kwargs):
     Silently ignores BadRequest 'Message is not modified' errors.
     """
     try:
-        await safe_markdown_reply(msg, text, **kwargs)
+        await msg.edit_text(text, **kwargs)
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
             pass  # Content unchanged — not an error
@@ -3117,7 +3117,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ")
+            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     url = context.args[0].strip()
@@ -3188,7 +3188,8 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         detected, notable, status, final_url, js_cnt = await run_scan(uid, _do_tech_scan)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(type(e).__name__)}: {escape_md(str(e)[:80])}`")
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
+                            parse_mode='Markdown')
         return
 
     # ── Build report ──────────────────────────────
@@ -3617,7 +3618,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(type(e).__name__)}: {escape_md(str(e)[:80])}`")
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
 
     # ── Sort findings by risk ────────────────────────────
@@ -3696,7 +3697,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }, ensure_ascii=False, indent=2)
 
     # ── Build ZIP in memory ──────────────────────────────
-    await safe_markdown_reply(msg, 
+    await msg.edit_text(
         f"🗜️ Building ZIP for `{escape_md(domain)}`...\n"
         f"📂 `{len(sources)}` source files + reports",
         parse_mode='Markdown'
@@ -3763,7 +3764,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
+            await msg.edit_text(_truncate_safe_md(tg_text), parse_mode='Markdown')
         else:
             await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
     except Exception:
@@ -4025,7 +4026,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
 
     baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
@@ -4300,8 +4301,8 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
-                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}")
+                    await msg.edit_text(
+                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}", parse_mode='Markdown')
                 except Exception:
                     pass
 
@@ -4310,11 +4311,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await run_scan(uid, _subdomains_sync, raw, progress_q)
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -4734,8 +4735,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
-                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}")
+                    await msg.edit_text(
+                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}", parse_mode='Markdown')
                 except Exception:
                     pass
 
@@ -4747,18 +4748,18 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
         _err_txt = '\n'.join(result['errors'][:3])
-        await safe_markdown_reply(msg, f"❌ `{escape_md(_err_txt)}`")
+        await msg.edit_text(f"❌ `{escape_md(_err_txt)}`", parse_mode='Markdown')
         return
 
     stats = result["stats"]
@@ -4767,7 +4768,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     if extracted == 0:
         stat_lines = "\n".join(f"  {cat}: `0`" for cat in sorted(wanted_cats))
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"📭 *No files found*\n\nCategory တွေမှာ ဖိုင် မတွေ့ပါ:\n{stat_lines}",
             parse_mode='Markdown'
         )
@@ -4779,11 +4780,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
     zip_buf.seek(0)
     zip_size_mb = zip_buf.getbuffer().nbytes / 1024 / 1024
 
-    await safe_markdown_reply(msg, f"✅ *Extraction ပြီးပါပြီ*\n\n"
+    await msg.edit_text(
+        f"✅ *Extraction ပြီးပါပြီ*\n\n"
         f"📦 Extracted: `{escape_md(extracted)}` files\n"
         f"💾 Size: `{zip_size_mb:.2f}` MB\n\n"
         f"*Per Category:*\n{stat_lines}\n\n"
-        "📤 ZIP upload နေပါသည်...")
+        "📤 ZIP upload နေပါသည်...",
+        parse_mode='Markdown'
+    )
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_fname = re.sub(r'[^\w\-]', '_', os.path.splitext(os.path.basename(filepath))[0])
@@ -4803,7 +4807,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             parse_mode='Markdown'
         )
     except Exception as e:
-        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`")
+        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`", parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -4936,11 +4940,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await run_scan(uid, _run_antibot)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
 
     if not res["success"]:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"❌ *Bypass မအောင်မြင်ဘူး*\n\n"
             f"Error: `{res['error']}`\n\n"
             "_Challenge level မြင့်လွန်းနိုင်သည် သို့မဟုတ် manual CAPTCHA solve လိုနိုင်ပါသည်_",
@@ -4958,11 +4962,14 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_d = re.sub(r'[^\w\-]', '_', domain)
     html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
 
-    await safe_markdown_reply(msg, f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
+    await msg.edit_text(
+        f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
         f"🌐 `{escape_md(domain)}`\n"
         f"⚙️ Method: `{escape_md(method)}`\n"
         f"📄 HTML Size: `{html_size_kb:.1f}` KB\n\n"
-        "📤 HTML file upload နေပါသည်...")
+        "📤 HTML file upload နေပါသည်...",
+        parse_mode='Markdown'
+    )
 
     try:
         await context.bot.send_document(
@@ -4977,7 +4984,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     except Exception as e:
-        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`")
+        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`", parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -5382,51 +5389,23 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'grecaptcha_sitekey\s*=\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
         re.compile(r'["\']sitekey["\']\s*:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
         re.compile(r'captcha[_\-]?key\s*[=:]\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ ENV VAR patterns (Next.js / CRA / Vite / Nuxt inlined)
-        re.compile(r'(?:NEXT_PUBLIC_|REACT_APP_|VITE_|NUXT_PUBLIC_)(?:RECAPTCHA|CAPTCHA)[_A-Z]*SITE[_A-Z]*KEY[^=]*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'(?:NEXT_PUBLIC_|REACT_APP_|VITE_|NUXT_PUBLIC_)(?:RECAPTCHA|CAPTCHA)[_A-Z]*KEY[^=]*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ window / process.env inlined by bundler
-        re.compile(r'process\.env\.(?:REACT_APP_|NEXT_PUBLIC_|VITE_)[A-Z_]*RECAPTCHA[A-Z_]*KEY\s*\|\|\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'window\.__(?:RECAPTCHA|CAPTCHA)_(?:SITE_)?KEY__\s*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ JSON config blobs (window.__CONFIG__, __ENV__, etc.)
-        re.compile(r'(?:recaptchaKey|captchaSiteKey|recaptchaSiteKey|siteKeyRecaptcha)\s*[=:]\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'["\'](?:recaptcha[_\-]?key|captcha[_\-]?site[_\-]?key)["\']:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ Webpack compiled const (t.SITE_KEY = "6L...")
-        re.compile(r'[a-zA-Z_$]\.[A-Z_]*(?:SITE_KEY|CAPTCHA_KEY|RECAPTCHA_KEY)\s*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ gtag / Analytics style
-        re.compile(r'grecaptcha_ready_called[^"\']*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
     ],
     "reCAPTCHA v3": [
         re.compile(r'grecaptcha\.execute\s*\(\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
         re.compile(r'grecaptcha\.execute\s*\(\s*([6L][A-Za-z0-9_\-]{38})\s*,', re.I),
         re.compile(r'\/recaptcha\/api\.js\?render=([0-9A-Za-z_\-]{40})', re.I),
         re.compile(r'["\']render["\']\s*:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ ENV VAR / bundler inlined
-        re.compile(r'(?:NEXT_PUBLIC_|REACT_APP_|VITE_|NUXT_PUBLIC_)RECAPTCHA_V3[A-Z_]*KEY[^=]*=\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'["\'](?:recaptchaV3Key|captchaV3SiteKey|recaptcha_v3_key)["\']:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        # ★ loadReCaptcha / react-google-recaptcha-v3
-        re.compile(r'loadReCaptcha\s*\(\s*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'GoogleReCaptchaProvider[^>]*reCaptchaKey=["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
-        re.compile(r'useGoogleReCaptcha[^;]*["\']([6L][A-Za-z0-9_\-]{38})["\']', re.I),
     ],
     "reCAPTCHA Enterprise": [
         re.compile(r'grecaptcha\.enterprise\.execute\s*\(\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
         re.compile(r'\/recaptcha\/enterprise\.js\?render=([0-9A-Za-z_\-]{40})', re.I),
         re.compile(r'enterprise\.js[^"\']*["\']sitekey["\']\s*:\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
-        # ★ Cloud identity verification
-        re.compile(r'grecaptcha\.enterprise\.ready[^;]*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
-        re.compile(r'["\'](?:enterpriseSiteKey|recaptchaEnterpriseKey)["\']:\s*["\']([0-9A-Za-z_\-]{40})["\']', re.I),
     ],
     "hCaptcha": [
         re.compile(r'data-sitekey=["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']', re.I),
         re.compile(r'hcaptcha\.render\([^)]*["\']sitekey["\']\s*:\s*["\']([a-f0-9-]{36})["\']', re.I),
         re.compile(r'window\.hcaptcha\s*=.*?["\']([a-f0-9-]{36})["\']', re.I),
         re.compile(r'hcaptcha\.com/1/api\.js.*?(?:hl=[a-z]+&)?(?:sitekey=([a-f0-9-]{36}))', re.I),
-        # ★ ENV VAR patterns
-        re.compile(r'(?:NEXT_PUBLIC_|REACT_APP_|VITE_)HCAPTCHA[_A-Z]*SITE[_A-Z]*KEY[^=]*=\s*["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']', re.I),
-        re.compile(r'["\'](?:hcaptchaSiteKey|hcaptcha_site_key|HCAPTCHA_KEY)["\']:\s*["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']', re.I),
-        # ★ @hcaptcha/react-hcaptcha component
-        re.compile(r'HCaptcha[^>]*sitekey=["\']([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})["\']', re.I),
     ],
     "Cloudflare Turnstile": [
         re.compile(r'data-sitekey=["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
@@ -5435,9 +5414,6 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'cf-turnstile[^>]*data-sitekey=["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
         # ★ Managed challenge (no explicit key — domain-level)
         re.compile(r'challenges\.cloudflare\.com/cdn-cgi/challenge-platform', re.I),
-        # ★ ENV VAR patterns
-        re.compile(r'(?:NEXT_PUBLIC_|REACT_APP_|VITE_)(?:CF_|CLOUDFLARE_)?TURNSTILE[_A-Z]*KEY[^=]*=\s*["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
-        re.compile(r'["\'](?:turnstileSiteKey|cloudflare_turnstile_key|TURNSTILE_SITE_KEY)["\']:\s*["\']([01]x[A-Za-z0-9_\-]{20,60})["\']', re.I),
     ],
     "FunCaptcha": [
         re.compile(r'(?:pk|data-pkey|public_key)\s*[=:]\s*["\']([A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12})["\']', re.I),
@@ -7462,72 +7438,6 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                         "confidence": "HIGH ✅",
                     })
 
-    # ── ★ NEW Phase A: Source Map extraction ──────────────────────────────────
-    # Fetch .js.map files → parse sourcesContent → scan unminified source code
-    if progress_cb: progress_cb("🗺️ Phase A: Source map scan (unminified code)...")
-    _js_url_list = list(existing_keys)   # reuse collected JS URLs from prior phases
-    # Collect JS URLs from network_log and new_assets
-    _js_urls_for_map = []
-    for asset in (new_assets or []):
-        _u = asset.get("url", "")
-        if _u.endswith(".js") and _u.startswith("http"):
-            _js_urls_for_map.append(_u)
-    for nlog_item in result.get("network_log", []):
-        _u = nlog_item.get("url", "") if isinstance(nlog_item, dict) else str(nlog_item)
-        if _u.endswith(".js") and _u.startswith("http") and _u not in _js_urls_for_map:
-            _js_urls_for_map.append(_u)
-    # Also try common main bundle paths
-    _parsed_base = urlparse(url)
-    _base_origin = f"{_parsed_base.scheme}://{_parsed_base.netloc}"
-    for _common in ["/static/js/main.js", "/assets/index.js", "/js/app.js", "/bundle.js"]:
-        _js_urls_for_map.append(_base_origin + _common)
-
-    _map_findings = _sourcemap_sitekey_scan(url, _js_urls_for_map[:40], progress_cb)
-    for f in _map_findings:
-        sk = f.get("site_key", "")
-        if sk and sk not in existing_keys:
-            result.setdefault("findings", []).append(f)
-            existing_keys.add(sk)
-
-    # ── ★ NEW Phase B: JSON blob extraction ────────────────────────────────────
-    # Parse window.__NEXT_DATA__, __NUXT__, window.CONFIG etc. from HTML
-    if progress_cb: progress_cb("📦 Phase B: JSON blob scan (`__NEXT_DATA__` / `__NUXT__` / `__CONFIG__`)...")
-    _page_html = result.get("html", "")
-    if _page_html:
-        _blob_findings = _nextdata_json_sitekey_extract(_page_html, url)
-        for f in _blob_findings:
-            sk = f.get("site_key", "")
-            if sk and sk not in existing_keys:
-                result.setdefault("findings", []).append(f)
-                existing_keys.add(sk)
-        if progress_cb and _blob_findings:
-            progress_cb(f"  → JSON blobs: {len(_blob_findings)} key(s) found")
-
-    # ── ★ NEW Phase C: Config endpoint probing ─────────────────────────────────
-    # Probe /config.js, /env.js, /api/config, /manifest.json etc.
-    if progress_cb: progress_cb("🗂️ Phase C: Config endpoint probe (/config.js, /env.js, /api/config...)...")
-    _config_files = _config_endpoint_probe(url, progress_cb)
-    if _config_files:
-        _cfg_js_map = {cfg_url: cfg_text for cfg_url, cfg_text in _config_files}
-        _cfg_findings = _extract_captcha_info("", url, _cfg_js_map)
-        # Also run JSON blob extract on each config file text
-        for cfg_url, cfg_text in _config_files:
-            for f in _nextdata_json_sitekey_extract(cfg_text, url):
-                sk = f.get("site_key", "")
-                if sk and sk not in existing_keys:
-                    f["source"] = f"ConfigProbe({cfg_url.split('/')[-1]})"
-                    result.setdefault("findings", []).append(f)
-                    existing_keys.add(sk)
-        for f in _cfg_findings:
-            sk = f.get("site_key", "")
-            if sk and sk not in existing_keys:
-                f["source"] = f.get("source", "") + " [config-probe]"
-                f["confidence"] = "HIGH ✅"
-                result.setdefault("findings", []).append(f)
-                existing_keys.add(sk)
-        if progress_cb:
-            progress_cb(f"  → Config files: {len(_config_files)} probed")
-
     # ── LIVE ENHANCEMENTS: CSP + well-known + advanced params + postMessage + interact ──
     if progress_cb: progress_cb("🔑 Live sitekey enhancements (CSP/postMsg/interact)...")
     _enh_html     = result.get("html", "")
@@ -7907,233 +7817,7 @@ def _format_sitekey_bypass_block(finding: dict) -> list:
     return lines
 
 
-def _sourcemap_sitekey_scan(base_url: str, js_urls: list, progress_cb=None) -> list:
-    """
-    ★ NEW Phase: Fetch .js.map source maps → parse sourcesContent → scan
-    unminified original source code for captcha keys.
-    Source maps expose full unminified code, making regex far more effective.
-    Returns list of findings with confidence=HIGH.
-    """
-    findings   = []
-    seen_keys  = set()
-    session    = requests.Session()
-    session.headers.update(_get_headers())
-    map_fetched = 0
-
-    for js_url in js_urls[:30]:
-        # Try <script>.js → <script>.js.map
-        map_url = js_url.rstrip() + ".map"
-        if not map_url.startswith("http"):
-            continue
-        try:
-            r = session.get(map_url, timeout=8, verify=False)
-            if r.status_code != 200 or len(r.text) < 50:
-                continue
-            data = json.loads(r.text)
-        except Exception:
-            continue
-
-        map_fetched += 1
-        # sourcesContent: array of original file contents
-        sources_content = data.get("sourcesContent") or []
-        source_names    = data.get("sources") or []
-
-        for idx, src_text in enumerate(sources_content):
-            if not src_text or len(src_text) < 20:
-                continue
-            src_name = (source_names[idx] if idx < len(source_names) else f"src_{idx}")[:60]
-            label    = f"SourceMap({src_name})"
-
-            for cap_type in _CAPTCHA_SCAN_ORDER:
-                patterns  = _CAPTCHA_PATTERNS.get(cap_type, [])
-                validator = _KEY_VALIDATORS.get(cap_type)
-                for pat in patterns:
-                    for m in pat.finditer(src_text):
-                        key = next((g for g in m.groups() if g), None) if m.lastindex else None
-                        if not key:
-                            try: key = m.group(1)
-                            except IndexError: key = m.group(0)
-                        if not key or len(key) < 10:
-                            continue
-                        key = key.strip()
-                        if validator and not validator(key):
-                            continue
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        # action context
-                        action = ""
-                        ctx = src_text[max(0, m.start()-300):m.end()+300]
-                        for ap in _ACTION_PATTERNS:
-                            am = ap.search(ctx)
-                            if am and am.group(1) not in ('get','set','use','new','add','key','id'):
-                                action = am.group(1); break
-
-                        findings.append({
-                            "type":       cap_type,
-                            "site_key":   key,
-                            "page_url":   base_url,
-                            "action":     action,
-                            "source":     label,
-                            "confidence": "HIGH ✅",
-                            "invisible":  any(p.search(ctx) for p in _INVISIBLE_PATTERNS),
-                            "min_score":  next((mp.search(ctx).group(1) for mp in _MIN_SCORE_PATTERNS if mp.search(ctx)), ""),
-                            "enterprise": cap_type == "reCAPTCHA Enterprise",
-                            "s_param": "", "hl": "", "co": "", "badge": "",
-                            "theme": "", "size": "", "callback": "", "user_agent": "",
-                        })
-
-    if progress_cb and map_fetched:
-        progress_cb(f"🗺️ Source maps: {map_fetched} fetched → {len(findings)} keys found")
-    return findings
-
-
-def _nextdata_json_sitekey_extract(html: str, page_url: str) -> list:
-    """
-    ★ NEW Phase: Parse JSON config blobs embedded in HTML:
-      - window.__NEXT_DATA__   (Next.js)
-      - window.__NUXT__        (Nuxt.js)
-      - window.__APP_CONFIG__  (generic)
-      - window.CONFIG / window.ENV / window._env_
-      - <meta name="config" content='...json...'>
-      - <script type="application/json">
-    These blobs often contain captcha keys as plain strings.
-    Returns list of findings.
-    """
-    findings  = []
-    seen_keys = set()
-
-    _JSON_BLOB_PATTERNS = [
-        re.compile(r'__NEXT_DATA__\s*=\s*(\{.{20,500000}?\})\s*(?:<\/script>|;)', re.S),
-        re.compile(r'__NUXT__\s*=\s*(\{.{20,200000}?\})\s*(?:<\/script>|;)', re.S),
-        re.compile(r'window\.__(?:CONFIG|APP_CONFIG|ENV|RUNTIME_CONFIG|SETTINGS|INIT_DATA)__\s*=\s*(\{.{10,200000}?\})\s*;', re.S),
-        re.compile(r'window\.(?:appConfig|appSettings|APP_CONFIG|ENV|_env_)\s*=\s*(\{.{10,100000}?\})\s*;', re.S),
-        re.compile(r'<script[^>]+type=["\']application/json["\'][^>]*>\s*(\{.{10,200000}?\})\s*<\/script>', re.S | re.I),
-        re.compile(r'<meta[^>]+(?:name=["\'](?:config|app-config|settings)["\'])[^>]*content=["\'](\{.{10,5000}?\})["\']', re.I),
-    ]
-
-    # Captcha key field names to search in JSON
-    _JSON_KEY_FIELDS = [
-        "sitekey", "site_key", "siteKey", "captchaKey", "captchaSiteKey",
-        "recaptchaKey", "recaptchaSiteKey", "recaptcha_key", "recaptcha_site_key",
-        "hcaptchaKey", "hcaptcha_site_key", "turnstileKey", "turnstile_site_key",
-        "RECAPTCHA_SITE_KEY", "HCAPTCHA_SITE_KEY", "CF_TURNSTILE_SITE_KEY",
-        "NEXT_PUBLIC_RECAPTCHA_SITE_KEY", "REACT_APP_RECAPTCHA_KEY",
-        "VITE_RECAPTCHA_KEY", "NUXT_PUBLIC_RECAPTCHA_SITE_KEY",
-    ]
-    _KEY_FIELD_RE = re.compile(
-        r'["\'](' + '|'.join(re.escape(f) for f in _JSON_KEY_FIELDS) + r')\s*["\']'
-        r'\s*:\s*["\']([A-Za-z0-9_\-]{20,100})["\']',
-        re.I
-    )
-
-    def _classify_key(val: str):
-        """Return captcha type from key value format."""
-        if re.match(r'^6[A-Za-z0-9_\-]{39}$', val):  return "reCAPTCHA v2"
-        if re.match(r'^L[A-Za-z0-9_\-]{39}$', val):  return "reCAPTCHA v2"
-        if re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', val, re.I):
-            return "hCaptcha"
-        if re.match(r'^[01]x[A-Za-z0-9_\-]{20,60}$', val):
-            return "Cloudflare Turnstile"
-        if re.match(r'^[A-Z0-9]{8}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{12}$', val):
-            return "FunCaptcha"
-        if re.match(r'^[0-9a-f]{32}$', val, re.I):   return "GeeTest"
-        return None
-
-    blobs_searched = 0
-    for blob_re in _JSON_BLOB_PATTERNS:
-        for blob_match in blob_re.finditer(html):
-            blob_text  = blob_match.group(1)
-            blobs_searched += 1
-            # Search for captcha key fields inside this blob
-            for m in _KEY_FIELD_RE.finditer(blob_text):
-                field_name = m.group(1)
-                val        = m.group(2).strip()
-                if len(val) < 20 or val in seen_keys:
-                    continue
-                cap_type = _classify_key(val)
-                if not cap_type:
-                    # Guess from field name
-                    fn_lower = field_name.lower()
-                    if "hcaptcha" in fn_lower:    cap_type = "hCaptcha"
-                    elif "turnstile" in fn_lower: cap_type = "Cloudflare Turnstile"
-                    elif "recaptcha" in fn_lower: cap_type = "reCAPTCHA v2"
-                    else: continue
-                # Validate
-                validator = _KEY_VALIDATORS.get(cap_type)
-                if validator and not validator(val):
-                    continue
-                seen_keys.add(val)
-                findings.append({
-                    "type":       cap_type,
-                    "site_key":   val,
-                    "page_url":   page_url,
-                    "action":     "",
-                    "source":     f"JSON blob ({field_name})",
-                    "confidence": "CONFIRMED ✅",
-                    "invisible":  False,
-                    "min_score":  "",
-                    "enterprise": cap_type == "reCAPTCHA Enterprise",
-                    "s_param": "", "hl": "", "co": "", "badge": "",
-                    "theme": "", "size": "", "callback": "", "user_agent": "",
-                })
-    return findings
-
-
-def _config_endpoint_probe(base_url: str, progress_cb=None) -> list:
-    """
-    ★ NEW Phase: Probe common config/env file endpoints that apps serve
-    separately. These often contain plain-text captcha keys before bundling.
-    Returns list of (url, text) tuples for further scanning.
-    """
-    parsed  = urlparse(base_url)
-    origin  = f"{parsed.scheme}://{parsed.netloc}"
-    session = requests.Session()
-    session.headers.update(_get_headers())
-
-    _CONFIG_PATHS = [
-        # Common config JS files
-        "/config.js", "/env.js", "/settings.js", "/app.config.js",
-        "/static/js/env.js", "/assets/config.js", "/public/config.js",
-        "/js/config.js", "/js/settings.js", "/js/app.js",
-        # JSON config files
-        "/config.json", "/env.json", "/settings.json", "/app.config.json",
-        "/public/env.json", "/static/config.json", "/.env.json",
-        # Next.js / CRA / Vite build artifacts
-        "/_next/static/chunks/app/layout.js",
-        "/static/js/main.chunk.js",
-        "/assets/index.js",
-        # API config endpoints
-        "/api/config", "/api/settings", "/api/env",
-        "/api/v1/config", "/api/public/config",
-        # PWA / app manifest (sometimes embeds API keys)
-        "/manifest.json", "/site.webmanifest",
-        # Well-known paths
-        "/.well-known/assetlinks.json",
-    ]
-
-    results = []   # list of (url, content_text)
-    fetched = 0
-
-    for path in _CONFIG_PATHS:
-        url = origin + path
-        try:
-            r = session.get(url, timeout=6, verify=False, allow_redirects=True)
-            if r.status_code == 200 and len(r.text) > 30:
-                ct = r.headers.get("content-type", "")
-                if any(x in ct for x in ("javascript", "json", "text")) or path.endswith((".js",".json")):
-                    results.append((url, r.text[:600_000]))
-                    fetched += 1
-        except Exception:
-            pass
-
-    if progress_cb and fetched:
-        progress_cb(f"🗂️ Config probe: {fetched} files found → scanning for keys...")
-    return results
-
-
-
+def _sitekey_static(url: str, progress_cb=None) -> dict:
     """Fallback: requests-based static HTML + JS scan (no browser)."""
     session = requests.Session()
     session.headers.update(_get_headers())
@@ -8328,6 +8012,7 @@ def _get_solver_params(f: dict) -> dict:
     return {"2captcha": p2c, "anticaptcha": pac, "capsolver": pcs, "ezcaptcha": pez}
 
 
+@user_guard
 async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/sitekey <url> — Extract reCAPTCHA/hCaptcha/Turnstile site_key, page_url, action"""
     if not await check_force_join(update, context):
@@ -8385,14 +8070,11 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     await asyncio.sleep(0.5)
-    await safe_markdown_reply(msg, 
+    await msg.edit_text(
         f"🔑 *Site Key Extractor*\n🌐 `{escape_md(domain)}`\n\n"
         "🌐 Launching headless browser...\n"
         "📡 Intercepting network requests...\n"
-        "🔍 Scanning DOM + console logs...\n"
-        "🗺️ Source map extraction...\n"
-        "📦 JSON blob scan (`__NEXT_DATA__` / `__NUXT__`)...\n"
-        "🗂️ Config endpoint probe...\n⏳",
+        "🔍 Scanning DOM + console logs...\n⏳",
         parse_mode='Markdown'
     )
 
@@ -8404,10 +8086,9 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(
-                        msg,
-                        f"🔑 *Scanning `{escape_md(domain)}`*\n\n{escape_md(txt)}"
-                    )
+                    await msg.edit_text(
+                        f"🔑 *Scanning `{escape_md(domain)}`*\n\n{txt}",
+                        parse_mode='Markdown')
                 except BadRequest:
                     pass
 
@@ -8418,19 +8099,19 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(str(e))}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
 
     if result.get("error"):
-        await safe_markdown_reply(
-            msg,
-            f"❌ *Fetch error*\n`{escape_md(str(result['error'])[:80])}`"
+        await msg.edit_text(
+            f"❌ *Fetch error*\n`{escape_md(str(result['error'])[:80])}`",
+            parse_mode='Markdown'
         )
         return
 
@@ -8439,11 +8120,6 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     page_url     = result["page_url"]
     js_count     = result.get("js_fetched", 0)
     live_reqs    = len(live_result.get("live_requests", []))
-
-    # Count per-source findings for stats
-    _src_map_count  = sum(1 for f in raw_findings if "SourceMap" in f.get("source",""))
-    _blob_count     = sum(1 for f in raw_findings if "JSON blob" in f.get("source","") or "__NEXT_DATA__" in f.get("source",""))
-    _cfg_count      = sum(1 for f in raw_findings if "config-probe" in f.get("source","") or "ConfigProbe" in f.get("source",""))
 
     # Cross-reference for confidence scoring
     for f in raw_findings:
@@ -8494,96 +8170,20 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ `{escape_md(str(len(confirmed)))}` confirmed   "
         f"🔴 `{escape_md(str(len(high_live)))}` live   "
         f"⚪ `{escape_md(str(len(static_only)))}` static",
-        # ★ NEW: phase source breakdown
-        f"🗺️ SourceMap `{escape_md(str(_src_map_count))}` │ "
-        f"📦 JSONBlob `{escape_md(str(_blob_count))}` │ "
-        f"🗂️ ConfigProbe `{escape_md(str(_cfg_count))}`",
         "",
     ]
 
     # ── No captcha found ──────────────────────────────────────
     if not findings:
-        # ── Captcha SDK / platform detection even when keys=0 ─────────────
-        _captcha_sdk_hints = []
-        _combined_sk = "\n".join(t for t, _ in _gather_all_text_v2(result, live_result))
-        _CAPTCHA_SDK_SIGNALS = [
-            ("reCAPTCHA v2/v3",         r'google\.com/recaptcha|recaptcha/api\.js|grecaptcha'),
-            ("reCAPTCHA Enterprise",     r'recaptcha/enterprise\.js|enterprise\.js.*sitekey'),
-            ("hCaptcha",                 r'hcaptcha\.com/1/api\.js|hcaptcha\.com|h-captcha'),
-            ("Cloudflare Turnstile",     r'challenges\.cloudflare\.com/turnstile|cf-turnstile'),
-            ("FunCaptcha / Arkose",      r'funcaptcha\.com|arkoselabs\.com|enforcement\.arkoselabs'),
-            ("GeeTest",                  r'geetest\.com|initGeetest|gt\.js'),
-            ("DataDome",                 r'datadome\.co|dd_cookie|DataDome'),
-            ("PerimeterX / HUMAN",       r'perimeterx\.net|px\.js|pxchallenge'),
-            ("Akamai Bot Manager",       r'akamai\.com.*bot|_abck|bm_sz'),
-            ("Kasada",                   r'kasada\.io|kpsdk|kcurl'),
-            ("AWS WAF Captcha",          r'aws\.amazon\.com.*waf|captcha\.awswaf|AwsWafIntegration'),
-            ("Imperva / Incapsula",      r'incapsula\.com|imperva\.com|reese84'),
-            ("Shape Security",           r'shapesecurity\.com|shape_utmz'),
-            ("FriendlyCaptcha",          r'friendlycaptcha\.com|frcaptcha'),
-            ("MTCaptcha",               r'mtcaptcha\.com|mtcaptcha\.js'),
-            ("Altcha",                   r'altcha\.org|AltchaWidget'),
+        lines += [
+            "📭 *Captcha မတွေ့ရှိပါ*",
+            "",
+            "_Possible reasons:_",
+            "  • Site မှာ captcha မပါ",
+            "  • Server-side only (no client key)",
+            "  • User interaction ပြီးမှ load",
+            "  • Obfuscated / encrypted JS bundle",
         ]
-        for sdk_name, pattern in _CAPTCHA_SDK_SIGNALS:
-            if re.search(pattern, _combined_sk, re.I):
-                _captcha_sdk_hints.append(sdk_name)
-
-        _captcha_iframes = []
-        try:
-            dom_sk = result.get("dom_result") or {}
-            ifr_json = dom_sk.get("__iframes__", "[]")
-            ifr_list = json.loads(ifr_json) if isinstance(ifr_json, str) else []
-            _CAPTCHA_IFRAME_DOMAINS = {
-                "google.com", "recaptcha.net", "hcaptcha.com",
-                "challenges.cloudflare.com", "funcaptcha.com",
-                "arkoselabs.com", "geetest.com",
-            }
-            for entry in ifr_list:
-                src = entry.split("||")[0] if "||" in entry else entry
-                netloc = urlparse(src).netloc
-                if any(cd in netloc for cd in _CAPTCHA_IFRAME_DOMAINS):
-                    if netloc not in _captcha_iframes:
-                        _captcha_iframes.append(netloc)
-        except Exception:
-            pass
-
-        lines += ["📭 *Captcha မတွေ့ရှိပါ*", ""]
-
-        if _captcha_sdk_hints:
-            lines.append(f"🔍 *Detected Captcha Systems:* `{'`, `'.join(_captcha_sdk_hints)}`")
-            lines.append("_(Script loaded ဖြစ်သော်လည်း `sitekey` parameter မတွေ့ရ)_")
-            lines.append("")
-            if "reCAPTCHA v2/v3" in _captcha_sdk_hints or "reCAPTCHA Enterprise" in _captcha_sdk_hints:
-                lines.append("💡 *reCAPTCHA:* Key သည် JS `grecaptcha.render()` ထဲ runtime inject")
-                lines.append("   ဖြစ်နိုင်၍ headless browser ဖြင့် interaction လိုအပ်မည်")
-            if "Cloudflare Turnstile" in _captcha_sdk_hints:
-                lines.append("💡 *Turnstile:* Key သည် HTML `data-sitekey` attribute ထဲ")
-                lines.append("   `0x4A...` / `1x00...` format — CF bot protection active")
-            if "FunCaptcha / Arkose" in _captcha_sdk_hints:
-                lines.append("💡 *Arkose Labs:* `enforcement.arkoselabs.com` challenge")
-                lines.append("   Key သည် JS init call ထဲ — deep deobfuscation လိုအပ်")
-            if any(x in _captcha_sdk_hints for x in ["Akamai Bot Manager", "Kasada", "DataDome", "PerimeterX / HUMAN"]):
-                lines.append("💡 *Bot Manager detected:* Frontend key မပါ — server-side only")
-                lines.append("   Challenge response ကို intercept မှ မြင်ရမည်")
-        elif _captcha_iframes:
-            pass  # covered below
-
-        if _captcha_iframes:
-            lines.append("🪟 *Captcha iframes detected:*")
-            for d in _captcha_iframes[:5]:
-                lines.append(f"  • `{escape_md(d)}`")
-            lines.append("_(Cross-origin iframe — sitekey ကို directly access မရ)_")
-            lines.append("")
-
-        if not _captcha_sdk_hints and not _captcha_iframes:
-            lines += [
-                "_Possible reasons:_",
-                "  • Site မှာ captcha မပါ",
-                "  • Server-side only (no client key in frontend)",
-                "  • User interaction / login ပြီးမှ load",
-                "  • Obfuscated / encrypted JS bundle",
-            ]
-
         await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
         return
 
@@ -8612,21 +8212,6 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"┌{'─' * 32}")
         lines.append(f"│ {icon}  *#{i}*  {escape_md(full_type)}")
         lines.append(f"│ {badge} {clbl}   {diff_emoji} Difficulty `{escape_md(str(diff_score))}/10` _{diff_label}_")
-
-        # ★ Source origin badge
-        _src_badge = ""
-        _src_lower = source.lower()
-        if "sourcemap" in _src_lower:       _src_badge = "🗺️ SourceMap"
-        elif "json blob" in _src_lower:     _src_badge = "📦 JSONBlob"
-        elif "config" in _src_lower:        _src_badge = "🗂️ ConfigProbe"
-        elif "live stream" in _src_lower:   _src_badge = "🔴 LiveStream"
-        elif "playwright" in _src_lower:    _src_badge = "🌐 Dynamic"
-        elif "deep fetch" in _src_lower:    _src_badge = "📥 DeepFetch"
-        elif "deobfuscated" in _src_lower:  _src_badge = "🧩 Deobf"
-        elif "postmessage" in _src_lower:   _src_badge = "📨 PostMsg"
-        elif "well-known" in _src_lower:    _src_badge = "📋 WellKnown"
-        if _src_badge:
-            lines.append(f"│ {_src_badge}")
         lines.append(f"│")
 
         # Key (full, copyable)
@@ -8762,7 +8347,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     deob_lines.append("")
                 deob_lines.append("⚠️ _Authorized testing only_")
                 await update.effective_message.reply_text(
-                    _truncate_safe_md("\n".join(deob_lines)))
+                    _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
     except Exception as deob_err:
         logger.debug("sitekey deobfuscate layer error: %s", deob_err)
 
@@ -11736,7 +11321,7 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🔑 *API Keys — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🔑 *API Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
@@ -11747,12 +11332,12 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"\u274c `{escape_md(e)}`")
+        await msg.edit_text(f"\u274c `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"\u274c `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"\u274c `{result['error']}`", parse_mode='Markdown')
         return
     raw_findings = result["findings"]
     findings = _confidence_crossref(raw_findings, live_result)
@@ -11763,10 +11348,11 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
     static_only = [f for f in findings if "STATIC" in f.get("confidence","")]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"\U0001f511 *API Key Extractor \u2014 `{escape_md(domain)}`*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
             f"\U0001f4ed No API keys found\n\U0001f310 `{escape_md(page_url)}`\n"
-            f"\U0001f4e1 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`")
+            f"\U0001f4e1 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`",
+            parse_mode='Markdown')
         return
     lines = [
         f"\U0001f511 *API Keys \u2014 `{escape_md(domain)}`*", "\u2501"*20,
@@ -11970,26 +11556,27 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🔥 *Firebase — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🔥 *Firebase — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _firebase_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
     findings = result["findings"]
     page_url = result["page_url"]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"🔥 *Firebase Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No Firebase config found\n🌐 `{escape_md(page_url)}`")
+            f"📭 No Firebase config found\n🌐 `{escape_md(page_url)}`",
+            parse_mode='Markdown')
         return
     lines = [f"🔥 *Firebase Config — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}` config(s)\n"]
@@ -12186,7 +11773,7 @@ async def cmd_firecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await asyncio.to_thread(_firecheck_sync, project_id, api_key)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
         return
 
     vuln_count = sum(1 for v in res.values() if "VULNERABLE" in v.get("status", ""))
@@ -12259,303 +11846,102 @@ async def cmd_firecheck(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> dict:
     """
-    v20 — Improved Shannon Entropy Secret Hunter.
-    Improvements over v17:
-      • Expanded false-positive blocklist (base64 images, CDN hashes, fonts, UUIDs, CSS)
-      • Variable-name context scoring (high weight when adjacent to secret var names)
-      • Token shape classification for 15+ key formats
-      • Source map scan (unminified code — much better extraction)
-      • Secondary config file probe (/env.js, /config.js, /api/config)
-      • Entropy normalization by token length
-      • Risk tier refined: shape + entropy + context scoring combined
+    Shannon Entropy-based secret hunter.
+    Scans HTML + JS bundles for high-entropy strings likely to be secrets.
+    Classifies results by risk tier and string type.
     """
-    import math
-
-    # ══ STEP 1: Fetch HTML ════════════════════════════════════════════════════
     if progress_cb: progress_cb("🌐 Fetching HTML...")
+
     try:
         proxy = proxy_manager.get_proxy()
-        resp  = requests.get(url, headers=HEADERS, proxies=proxy,
-                             timeout=TIMEOUT, verify=False, allow_redirects=True)
-        html      = resp.text
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy, timeout=TIMEOUT, verify=False)
+        html  = resp.text
         final_url = resp.url
     except Exception as e:
         return {"error": str(e), "findings": [], "js_count": 0}
 
-    parsed_base = urlparse(final_url)
-    base_origin = f"{parsed_base.scheme}://{parsed_base.netloc}"
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    # ══ STEP 2: Collect JS bundles ════════════════════════════════════════════
-    js_urls = []
-    js_seen_set = set()
-    def _add_js(u):
-        if u and u.startswith("http") and u not in js_seen_set:
-            js_seen_set.add(u); js_urls.append(u)
-
+    texts = [html]
+    js_urls: set = set()
     for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
-        _add_js(urljoin(final_url, src))
+        abs_src = urljoin(final_url, src)
+        if abs_src.startswith("http"):
+            js_urls.add(abs_src)
 
     if progress_cb: progress_cb(f"📦 Fetching {len(js_urls)} JS bundles...")
-    texts_map = {"[HTML]": html}  # label → text
-    for js_url in js_urls[:30]:
+    for js_url in list(js_urls)[:20]:
         try:
-            r = session.get(js_url, proxies=proxy_manager.get_proxy(),
-                            timeout=TIMEOUT, verify=False)
-            if r.status_code == 200 and len(r.text) > 100:
-                texts_map[js_url] = r.text[:800_000]
-        except Exception:
-            pass
-
-    # ══ STEP 3: Source map scan ───────────────────────────────────────────────
-    if progress_cb: progress_cb("🗺️ Scanning source maps...")
-    for js_url in js_urls[:25]:
-        try:
-            r = session.get(js_url + ".map", proxies=proxy_manager.get_proxy(),
-                            timeout=8, verify=False)
+            r = requests.get(js_url, headers=HEADERS,
+                             proxies=proxy_manager.get_proxy(), timeout=TIMEOUT, verify=False)
             if r.status_code == 200:
-                try:
-                    sm_data = json.loads(r.text)
-                    for idx, src_content in enumerate(sm_data.get("sourcesContent") or []):
-                        if src_content and len(src_content) > 50:
-                            src_name = (sm_data.get("sources") or [""])[idx] if idx < len(sm_data.get("sources") or []) else f"src_{idx}"
-                            texts_map[f"[SourceMap:{src_name[-40:]}]"] = src_content[:500_000]
-                except Exception:
-                    pass
+                texts.append(r.text)
         except Exception:
             pass
 
-    # ══ STEP 4: Config file probe ─────────────────────────────────────────────
-    if progress_cb: progress_cb("🗂️ Probing config endpoints...")
-    for _path in ["/env.js", "/config.js", "/settings.js", "/api/config",
-                  "/config.json", "/env.json", "/static/js/env.js"]:
-        try:
-            r = session.get(base_origin + _path, timeout=6, verify=False)
-            if r.status_code == 200 and len(r.text) > 30:
-                texts_map[f"[ConfigProbe:{_path}]"] = r.text[:300_000]
-        except Exception:
-            pass
-
-    # ══ FALSE POSITIVE patterns ═══════════════════════════════════════════════
-    # Blocklist: these patterns almost never contain real secrets
-    _FP_VALUE_RE = re.compile(
-        r'^[0-9a-f]{3,8}$'                                # CSS hex color
-        r'|^(?:true|false|null|undefined|NaN|Infinity)$'  # JS literals
-        r'|\.(js|css|png|jpg|jpeg|svg|woff|woff2|ttf|eot|html|json|map|ts|tsx|jsx)$'
-        r'|^https?://'                                      # URLs
-        r'|^data:[a-z]+/[a-z]+'                            # data URIs
-        r'|^[0-9]+\.[0-9]+\.[0-9]'                        # version strings
-        r'|^(?:[0-9a-f]{8}-){4}[0-9a-f]{8}$'             # long UUID
-        r'|^(?:sha256|sha384|sha512)-[A-Za-z0-9+/=]{40,}'  # SRI hashes
-        r'|^[A-Za-z0-9+/]{4,}={0,2}$' ,                   # (checked later for images)
-        re.I
-    )
-    # Base64 image/font signatures — very common false positives
-    _B64_IMAGE_SIGS = ('iVBOR', '/9j/', 'AAAB', 'R0lGO', 'UklGR', 'AAAP', 'PD94')
-    # CSS / asset context near the token → skip
-    _FP_CONTEXT_RE = re.compile(
-        r'(?i)(?:className|class\s*=|font\-family|background(?:\-image)?|'
-        r'url\s*\(|href\s*=|src\s*=|import\s|require\s*\(|'
-        r'integrity\s*=|nonce\s*=|data\-v\-|webpack|__webpack_|'
-        r'module\.exports|exports\.|Object\.defineProperty|'
-        r'sourceMappingURL|css_|scss_)',
-        re.I
-    )
-    # Variable name context: adjacent key/secret/token var names → HIGH confidence
-    _SECRET_VAR_RE = re.compile(
-        r'(?i)(?:'
-        r'api[_\-]?key|secret[_\-]?key|access[_\-]?token|auth[_\-]?token|'
-        r'private[_\-]?key|client[_\-]?secret|webhook[_\-]?secret|'
-        r'signing[_\-]?secret|encryption[_\-]?key|bearer[_\-]?token|'
-        r'sk_live|pk_live|sk_test|rk_live|AKIA|ya29\.|eyJhbGc|'
-        r'ghp_|ghs_|npm_|xox[bpsa]-|hvs\.|pat-|'
-        r'stripe[_\-]?key|stripe[_\-]?secret|braintree[_\-]?key|'
-        r'paypal[_\-]?secret|adyen[_\-]?key|twilio[_\-]?auth|'
-        r'sendgrid[_\-]?key|mailgun[_\-]?key|firebase[_\-]?key|'
-        r'aws[_\-]?(?:access|secret)|gcp[_\-]?key|azure[_\-]?secret'
-        r')'
-    )
-    # Broader context signal: general secret-adjacent words
-    _CONTEXT_RE = re.compile(
-        r'(?i)(?:key|secret|token|api|auth|pass|cred|private|access|'
-        r'bearer|credential|signing|encryption|webhook|client_secret)',
-        re.I
-    )
-
-    # ══ TOKEN SHAPE CLASSIFIER ════════════════════════════════════════════════
-    def _classify_kind(val: str) -> tuple:
-        """
-        Returns (kind_label, risk_boost).
-        risk_boost: +2 = definitely a key shape, +1 = likely, 0 = unknown
-        """
-        # JWT
-        if re.match(r'^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*$', val):
-            return "JWT", 2
-        # Stripe
-        if re.match(r'^sk_(live|test)_[A-Za-z0-9]{24,}$', val):  return "Stripe Secret Key", 2
-        if re.match(r'^pk_(live|test)_[A-Za-z0-9]{24,}$', val):  return "Stripe Publishable", 1
-        if re.match(r'^rk_(live|test)_[A-Za-z0-9]{24,}$', val):  return "Stripe Restricted", 2
-        if re.match(r'^whsec_[A-Za-z0-9]{32,}$', val):           return "Stripe Webhook", 2
-        # AWS
-        if re.match(r'^AKIA[A-Z0-9]{16}$', val):  return "AWS Access Key", 2
-        if re.match(r'^ASIA[A-Z0-9]{16}$', val):  return "AWS Temp Key", 2
-        # Google
-        if re.match(r'^ya29\.[A-Za-z0-9_\-]+$', val):            return "Google OAuth Token", 2
-        if re.match(r'^AIza[A-Za-z0-9_\-]{35}$', val):           return "Google API Key", 2
-        # GitHub
-        if re.match(r'^ghp_[A-Za-z0-9]{36}$', val):              return "GitHub PAT", 2
-        if re.match(r'^ghs_[A-Za-z0-9]{36}$', val):              return "GitHub App Token", 2
-        if re.match(r'^github_pat_[A-Za-z0-9_]{59}$', val):      return "GitHub Fine-grained PAT", 2
-        # npm
-        if re.match(r'^npm_[A-Za-z0-9]{36}$', val):              return "npm Token", 2
-        # Slack
-        if re.match(r'^xox[bpsa]-[0-9]+-[0-9]+-[A-Za-z0-9]+$', val): return "Slack Token", 2
-        # Firebase
-        if re.match(r'^AIza[A-Za-z0-9_\-]{35}$', val):           return "Firebase Key", 2
-        # HuggingFace
-        if re.match(r'^hf_[A-Za-z0-9]{34}$', val):               return "HuggingFace Token", 2
-        # Anthropic
-        if re.match(r'^sk-ant-[A-Za-z0-9_\-]{90,}$', val):       return "Anthropic API Key", 2
-        # OpenAI
-        if re.match(r'^sk-[A-Za-z0-9]{48}$', val):               return "OpenAI Key", 2
-        if re.match(r'^sk-proj-[A-Za-z0-9_\-]{80,}$', val):      return "OpenAI Project Key", 2
-        # Twilio
-        if re.match(r'^SK[a-f0-9]{32}$', val):                   return "Twilio API Key", 2
-        if re.match(r'^AC[a-f0-9]{32}$', val):                   return "Twilio Account SID", 1
-        # SendGrid
-        if re.match(r'^SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}$', val): return "SendGrid Key", 2
-        # Braintree
-        if re.match(r'^[a-z0-9]{16,32}$', val) and len(val) in (16, 32): return "Braintree-like", 1
-        # Adyen
-        if re.match(r'^AQE[a-zA-Z0-9+/]{8,}={0,2}$', val):      return "Adyen API Key", 2
-        # Paystack
-        if re.match(r'^sk_(live|test)_[a-zA-Z0-9]{40}$', val):   return "Paystack Secret", 2
-        if re.match(r'^pk_(live|test)_[a-zA-Z0-9]{40}$', val):   return "Paystack Public", 1
-        # HashiCorp Vault
-        if re.match(r'^hvs\.[A-Za-z0-9_\-]{90,}$', val):         return "Vault Token", 2
-        # Generic hex
-        if re.match(r'^[0-9a-fA-F]{32}$', val):  return "Hex-32 (possible MD5/key)", 0
-        if re.match(r'^[0-9a-fA-F]{40}$', val):  return "Hex-40 (possible SHA1/key)", 0
-        if re.match(r'^[0-9a-fA-F]{64}$', val):  return "Hex-64 (SHA256/key)", 1
-        # Base64
-        if re.match(r'^[A-Za-z0-9+/]{32,}={0,2}$', val) and len(val) % 4 == 0:
-            return "Base64", 0
-        return "Unknown", 0
-
-    # ══ MAIN SCAN LOOP ════════════════════════════════════════════════════════
     if progress_cb: progress_cb("🔬 Running Shannon entropy analysis...")
 
-    # Candidate patterns — ordered from most-specific to broad
-    _CANDIDATE_PATTERNS = [
-        # Pattern A: var_name = "VALUE" / var_name: "VALUE"
-        re.compile(
-            r'(?:key|secret|token|api|auth|pass|cred|private|access|'
-            r'bearer|signing|webhook|encryption|client_secret)'
-            r'[_\-A-Za-z0-9]*\s*[:=]\s*["\']([A-Za-z0-9+/=_\-\.]{16,200})["\']',
-            re.I
-        ),
-        # Pattern B: "KEY_NAME": "VALUE" JSON style
-        re.compile(
-            r'["\'](?:key|secret|token|apiKey|accessToken|authToken|'
-            r'privateKey|clientSecret|webhookSecret|signingKey)["\']'
-            r'\s*:\s*["\']([A-Za-z0-9+/=_\-\.]{16,200})["\']',
-            re.I
-        ),
-        # Pattern C: any quoted string 20-120 chars (entropy-filtered)
-        re.compile(r'["\']([A-Za-z0-9+/=_\-\.]{20,120})["\']'),
-    ]
+    _CANDIDATE_RE = re.compile(
+        r'["\']([A-Za-z0-9+/=_\-\.]{16,120})["\']'
+        r'|(?:key|secret|token|pass|api|auth|credential|private|access)'
+        r'[_\-]?\s*["\s:=]+\s*["\']([A-Za-z0-9+/=_\-\.]{8,120})["\']',
+        re.I
+    )
+    _CONTEXT_RE = re.compile(
+        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|bearer|'
+        r'client_secret|webhook|signing|encryption|sk_|pk_|AKIA|ya29|eyJ)',
+        re.I
+    )
+    _FP_RE = re.compile(
+        r'^(?:[0-9a-f]{3,8})$'
+        r'|^(?:true|false|null|undefined)$'
+        r'|\.(js|css|png|jpg|svg|woff|html|json)$'
+        r'|^https?://',
+        re.I
+    )
 
-    seen     = set()
+    seen = set()
     findings = []
 
-    for source_label, text in texts_map.items():
-        for pat_idx, pat in enumerate(_CANDIDATE_PATTERNS):
-            for m in pat.finditer(text):
-                val = m.group(1).strip()
-                if not val or len(val) < 16 or val in seen:
-                    continue
+    for text in texts:
+        for m in _CANDIDATE_RE.finditer(text):
+            val = (m.group(1) or m.group(2) or "").strip()
+            if not val or val in seen or len(val) < 12:
+                continue
+            if _FP_RE.search(val):
+                continue
+            seen.add(val)
 
-                # ── Fast false positive filters ────────────────────────────
-                # Base64 image signatures
-                if any(val.startswith(sig) for sig in _B64_IMAGE_SIGS):
-                    continue
-                # SRI hash prefix
-                if re.match(r'^(?:sha256|sha384|sha512)-', val, re.I):
-                    continue
-                # Pure numeric / short hex color
-                if re.match(r'^[0-9]+$', val) or re.match(r'^[0-9a-f]{3,8}$', val, re.I):
-                    continue
-                # JS literals / URLs / data URIs
-                if re.match(r'^(?:true|false|null|undefined)$', val, re.I):
-                    continue
-                if val.startswith(('http://', 'https://', 'data:')):
-                    continue
+            score = _entropy(val)
+            if score < threshold:
+                continue
 
-                # ── Context window ─────────────────────────────────────────
-                ctx_start = max(0, m.start() - 120)
-                ctx_end   = min(len(text), m.end() + 120)
-                ctx       = re.sub(r'\s+', ' ', text[ctx_start:ctx_end]).strip()
+            ctx_start = max(0, m.start() - 80)
+            ctx       = text[ctx_start: m.start() + len(val) + 80]
+            ctx       = re.sub(r'\s+', ' ', ctx).strip()
+            in_ctx    = bool(_CONTEXT_RE.search(ctx))
 
-                # Skip CSS/asset context (Pattern C only — A and B already specific)
-                if pat_idx == 2 and _FP_CONTEXT_RE.search(ctx):
-                    continue
+            risk = ("🔴 HIGH" if (score >= 4.8 and in_ctx) else
+                    "🟡 MED"  if (score >= 4.4 or in_ctx) else
+                    "⚪ LOW")
 
-                # ── Entropy check ──────────────────────────────────────────
-                score = _entropy(val)
-                # Normalize: short strings need higher entropy
-                min_e = threshold
-                if len(val) < 24:   min_e = max(threshold, 4.6)
-                elif len(val) < 32: min_e = max(threshold, 4.4)
-                if score < min_e and pat_idx == 2:  # broad pattern: strict entropy gate
-                    continue
-                if score < 3.5:     # absolute minimum even for specific patterns
-                    continue
+            kind = "Unknown"
+            if re.match(r'^eyJ', val):               kind = "JWT"
+            elif re.match(r'^sk_|^pk_|^rk_', val):  kind = "Stripe-like"
+            elif re.match(r'^AKIA', val):             kind = "AWS Key"
+            elif re.match(r'^ya29\.', val):           kind = "Google Token"
+            elif re.match(r'^[0-9a-fA-F]+$', val):   kind = "Hex"
+            elif re.match(r'^[A-Za-z0-9+/]+=*$', val) and len(val) % 4 == 0:
+                kind = "Base64"
 
-                # ── Context scoring ────────────────────────────────────────
-                has_secret_var = bool(_SECRET_VAR_RE.search(ctx))
-                has_context    = bool(_CONTEXT_RE.search(ctx))
-                in_ctx         = has_secret_var or has_context
+            findings.append({
+                "value":              val,
+                "entropy":            round(score, 3),
+                "risk":               risk,
+                "kind":               kind,
+                "context":            ctx[:100],
+                "in_secret_context":  in_ctx,
+            })
 
-                # ── Token shape classification ─────────────────────────────
-                kind, risk_boost = _classify_kind(val)
-
-                # ── Risk tier ──────────────────────────────────────────────
-                # Score: entropy weight + context weight + shape weight
-                risk_score = 0
-                if score >= 5.0: risk_score += 3
-                elif score >= 4.6: risk_score += 2
-                elif score >= 4.2: risk_score += 1
-                if has_secret_var:  risk_score += 3
-                elif has_context:   risk_score += 1
-                risk_score += risk_boost
-
-                if risk_score >= 6:   risk = "🔴 HIGH"
-                elif risk_score >= 3: risk = "🟡 MED"
-                else:                 risk = "⚪ LOW"
-
-                seen.add(val)
-                findings.append({
-                    "value":             val,
-                    "entropy":           round(score, 3),
-                    "risk":              risk,
-                    "kind":              kind,
-                    "context":           ctx[:120],
-                    "in_secret_context": in_ctx,
-                    "source":            source_label,
-                    "risk_score":        risk_score,
-                })
-
-    # ── Sort: HIGH first, then by risk_score desc, then entropy desc ─────────
-    findings.sort(key=lambda x: (
-        0 if x["risk"] == "🔴 HIGH" else 1 if x["risk"] == "🟡 MED" else 2,
-        -x.get("risk_score", 0),
-        -x["entropy"]
-    ))
-
-    # Deduplicate across sources by value (already done via seen set)
-    # Cap at 100 findings total
-    findings = findings[:100]
+    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
 
     return {
         "url":       url,
@@ -12563,7 +11949,6 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
         "js_count":  len(js_urls),
         "threshold": threshold,
         "findings":  findings,
-        "sources":   list(texts_map.keys()),
     }
 
 
@@ -12935,7 +12320,7 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
+                    await msg.edit_text(
                         f"💳 *Pay Config — `{escape_md(domain)}`*\n\n{escape_md(t)}",
                         parse_mode='Markdown'
                     )
@@ -12949,11 +12334,11 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped")
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -13178,7 +12563,9 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Configs `{escape_md(str(len(findings)))}` │ "
                 f"💾 `{json_mb:.2f}` MB\n"
                 f"_Solver-ready JSON — copy to API call_"
-            ))
+            ),
+            parse_mode='Markdown'
+        )
     except Exception as e:
         logger.warning("Payconfig export error: %s", e)
 
@@ -13250,7 +12637,7 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
+                    await msg.edit_text(
                         f"🔬 *Entropy Hunter — `{escape_md(domain)}`*\n\n{t}",
                         parse_mode='Markdown'
                     )
@@ -13264,11 +12651,11 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped")
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -13293,7 +12680,7 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         f"🔬 *Entropy Secret Hunter — `{escape_md(domain)}`*",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"📊 Threshold: `{threshold}` | JS: `{result['js_count']}` | Sources: `{len(result.get('sources', []))}`",
+        f"📊 Threshold: `{threshold}` | JS: `{result['js_count']}` bundles",
         f"🔴 HIGH: `{len(high)}` | 🟡 MED: `{len(medium)}` | ⚪ LOW: `{len(low)}`",
         f"📈 Total: `{len(findings)}` high-entropy strings",
         "",
@@ -13307,33 +12694,10 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for f in tier_list[:8]:
             _val = f["value"][:70].replace("`", "'")
             _ctx = f.get("context", "")[:60].replace("`", "'").replace("\n", " ")
-            _src = f.get("source", "")[:40].replace("`", "'")
-            _kind = f.get("kind", "Unknown")
-
-            # Kind badge
-            _kind_badge = ""
-            kl = _kind.lower()
-            if "jwt"       in kl: _kind_badge = "🎟️"
-            elif "stripe"  in kl: _kind_badge = "💳"
-            elif "aws"     in kl: _kind_badge = "☁️"
-            elif "google"  in kl: _kind_badge = "🔵"
-            elif "github"  in kl: _kind_badge = "🐙"
-            elif "openai"  in kl: _kind_badge = "🤖"
-            elif "twilio"  in kl: _kind_badge = "📱"
-            elif "sendgrid"in kl: _kind_badge = "📧"
-            elif "slack"   in kl: _kind_badge = "💬"
-            elif "adyen"   in kl: _kind_badge = "💳"
-            elif "paystack"in kl: _kind_badge = "💳"
-            elif "firebase"in kl: _kind_badge = "🔥"
-            elif "vault"   in kl: _kind_badge = "🔒"
-            elif "anthropic"in kl:_kind_badge = "🧠"
-
-            lines.append(f"  {_kind_badge} H=`{f['entropy']}` [{escape_md(_kind)}]")
+            lines.append(f"  H=`{f['entropy']}` [{escape_md(f['kind'])}]")
             lines.append(f"  └ `{_val}`")
-            if _ctx and f.get("in_secret_context"):
+            if _ctx and f["in_secret_context"]:
                 lines.append(f"  📌 _{escape_md(_ctx)}_")
-            if _src and "[HTML]" not in _src:
-                lines.append(f"  📂 _{escape_md(_src)}_")
             lines.append("")
             shown += 1
             if shown >= 20:
@@ -13360,7 +12724,9 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 f"🔬 Entropy Secrets — `{escape_md(domain)}`\n"
                 f"🔴 HIGH: `{len(high)}` | Total: `{len(findings)}`"
-            ))
+            ),
+            parse_mode='Markdown'
+        )
     except Exception as e:
         logger.warning("entropy export error: %s", e)
 
@@ -13574,7 +12940,7 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
+                    await msg.edit_text(
                         f"🧩 *De-obfuscator — `{escape_md(domain)}`*\n\n{t}",
                         parse_mode='Markdown'
                     )
@@ -13588,11 +12954,11 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped")
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -13664,7 +13030,9 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 f"🧩 De-obfuscated Secrets — `{escape_md(domain)}`\n"
                 f"🔴 High: `{len(high)}` | Total: `{len(findings)}`"
-            ))
+            ),
+            parse_mode='Markdown'
+        )
     except Exception as e:
         logger.warning("deobfuscate export error: %s", e)
 
@@ -13761,22 +13129,6 @@ _PAY_PATTERNS = [
     ("Midtrans Client Key",          re.compile(r'\b((?:Mid-client|SB-Mid-client)-[A-Za-z0-9_\-]{20,50})\b')),
     # ══ Payhere (Sri Lanka) ═══════════════════════════════════════════════════
     ("Payhere Merchant ID",          re.compile(r'(?i)payhere[_-]?merchant[_-]?(?:id|secret)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
-    # ══ PayPal SDK URL (script src / fetch URL) ═══════════════════════════════
-    ("PayPal Client ID (SDK URL)",   re.compile(r'paypal\.com/sdk/js[?&][^"\'>\s]*client-id=([A-Za-z0-9_-]{10,97})')),
-    ("PayPal Client ID (SDK URL)",   re.compile(r'(?i)["\']client[-_]?id["\']\s*:\s*["\']([A-Za-z0-9_-]{10,97})["\']')),
-    # ══ Authorize.Net ═════════════════════════════════════════════════════════
-    ("Authorize.Net API Login ID",   re.compile(r'(?i)(?:login|api)[_-]?id\s*[=:]\s*["\']([0-9A-Za-z]{6,20})["\']')),
-    ("Authorize.Net Client Key",     re.compile(r'(?i)(?:client|public)[_-]?key\s*[=:]\s*["\']([0-9A-Za-z]{64,80})["\']')),
-    # ══ BigCommerce ═══════════════════════════════════════════════════════════
-    ("BigCommerce Payments Token",   re.compile(r'(?i)bigcommerce[_-]?(?:payments?[_-]?)?token\s*[=:]\s*["\']([A-Za-z0-9_.\-]{20,80})["\']')),
-    ("BigCommerce Client ID",        re.compile(r'(?i)(?:bigcommerce|bc)[_-]?client[_-]?id\s*[=:]\s*["\']([A-Za-z0-9]{20,60})["\']')),
-    ("BigCommerce Store Hash",       re.compile(r'(?i)store[_-]?hash\s*[=:]\s*["\']([a-z0-9]{6,12})["\']')),
-    # ══ NMI / Network Merchants ═══════════════════════════════════════════════
-    ("NMI Public Key",               re.compile(r'(?i)nmi[_-]?(?:public[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9]{16,50})["\']')),
-    # ══ Spreedly ══════════════════════════════════════════════════════════════
-    ("Spreedly Environment Key",     re.compile(r'(?i)spreedly[_-]?(?:env(?:ironment)?[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9]{20,50})["\']')),
-    # ══ Bolt ══════════════════════════════════════════════════════════════════
-    ("Bolt Publishable Key",         re.compile(r'(?i)bolt[_-]?(?:publishable[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_.\-]{20,80})["\']')),
 ]
 
 # ── Gateway prefix lookup for live/test detection ─────────────────────────
@@ -15351,6 +14703,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
     }
 
 
+@user_guard
 async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/paykeys <url> — Extract payment keys from all major gateways"""
     if not await check_force_join(update, context): return
@@ -15412,7 +14765,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
+                    await msg.edit_text(
                         f"💳 *Payment Keys v19 — `{escape_md(domain)}`*\n\n{escape_md(t)}",
                         parse_mode='Markdown'
                     )
@@ -15471,84 +14824,14 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     if not findings:
-        # ── SDK / platform detection even when keys=0 ─────────────────────
-        _sdk_hints = []
-        _combined_scan = "\n".join(t for t, _ in _gather_all_text_v2(result, live_result))
-        _SDK_SIGNALS = [
-            ("Stripe.js",          r'js\.stripe\.com|stripe\.js|Stripe\s*\('),
-            ("PayPal SDK",         r'paypal\.com/sdk/js|paypal\.Buttons|PAYPAL'),
-            ("Braintree",          r'braintree|braintreewebclient'),
-            ("Square Web Payments",r'square\.com/web-payments|payments\.js|squareup\.com'),
-            ("Adyen",              r'adyen|checkout\.adyen\.com'),
-            ("Klarna",             r'klarna\.com|KlarnaCheckout'),
-            ("Afterpay/Clearpay",  r'afterpay|clearpay\.io'),
-            ("Affirm",             r'cdn1\.affirm\.com|affirm\.com/libs'),
-            ("Bolt",               r'bolt\.com/track|bolt\.js'),
-            ("Sezzle",             r'sezzle\.com/widget'),
-            ("NMI / Collect.js",   r'secure\.networkmerchants\.com|CollectJS|collect\.js'),
-            ("Authorize.Net",      r'js\.authorize\.net|AcceptJS|accept\.js'),
-            ("BigCommerce",        r'bigcommerce|bigcommerceapp|store-[a-z0-9]{6,}'),
-            ("Shopify Checkout",   r'cdn\.shopify\.com|myshopify\.com|shopify\.js'),
-            ("WooCommerce",        r'woocommerce|wc-stripe|wc_stripe_params'),
-            ("Cybersource",        r'cybersource|flex\.cybersource'),
-            ("Spreedly",           r'spreedly\.com/js|spreedly\.frames'),
-            ("Recurly",            r'recurly\.com/js|recurly\.configure'),
-            ("Chargebee",          r'chargebee\.com/js|Chargebee\.init'),
+        lines += [
+            "📭 *Payment key မတွေ့ရှိပါ*",
+            "",
+            "_Possible reasons:_",
+            "  • Payment integration မပါ",
+            "  • Server-side only (no publishable key)",
+            "  • Keys in inaccessible iframe",
         ]
-        for sdk_name, pattern in _SDK_SIGNALS:
-            if re.search(pattern, _combined_scan, re.I):
-                _sdk_hints.append(sdk_name)
-
-        _iframe_domains = []
-        try:
-            dom = result.get("dom_result") or {}
-            iframe_json = dom.get("__iframes__", "[]")
-            iframes = json.loads(iframe_json) if isinstance(iframe_json, str) else []
-            for entry in iframes:
-                src = entry.split("||")[0] if "||" in entry else entry
-                domain_part = urlparse(src).netloc
-                if domain_part and domain_part not in _iframe_domains:
-                    _iframe_domains.append(domain_part)
-        except Exception:
-            pass
-
-        lines += ["📭 *Payment key မတွေ့ရှိပါ*", ""]
-
-        if _sdk_hints:
-            lines.append(f"🔍 *Detected SDKs:* `{'`, `'.join(_sdk_hints)}`")
-            lines.append("_(SDK loaded ဖြစ်သော်လည်း publishable key frontend မှာ မပါ)_")
-            lines.append("")
-            # Give specific hints per SDK
-            if "Shopify Checkout" in _sdk_hints:
-                lines.append("💡 *Shopify:* checkout.shopify.com မှာ hosted ဖြစ်ပြီး")
-                lines.append("   keys merchant site မှာ မပါ — Shopify admin မှာသာ ရှိမည်")
-            if "BigCommerce" in _sdk_hints:
-                lines.append("💡 *BigCommerce:* payments API server-side only")
-                lines.append("   `/checkout` page session cookie လိုအပ်မည်")
-            if any(x in _sdk_hints for x in ["Stripe.js", "Authorize.Net", "Braintree", "NMI / Collect.js"]):
-                lines.append("💡 *Hint:* Keys likely in `/checkout` or `/cart` page")
-                lines.append("   Session cookie ရယူပြီးမှ scan လုပ်ကြည့်ပါ")
-
-        if _iframe_domains:
-            lines.append(f"🪟 *Payment iframes:*")
-            for d in _iframe_domains[:5]:
-                lines.append(f"  • `{escape_md(d)}`")
-            lines.append("_(Cross-origin iframe — frontend မှ key ကို access မရ)_")
-            lines.append("")
-
-        if not _sdk_hints and not _iframe_domains:
-            lines += [
-                "_Possible reasons:_",
-                "  • Payment integration မပါ (COD/bank transfer only)",
-                "  • Server-side payment processing only",
-                "  • Keys in cross-origin iframe (Shopify/PayPal hosted)",
-                "  • Dynamic load — checkout ရောက်မှ key inject",
-            ]
-
-        # Show gateway profile even when keys=0 — may show payment methods
-        gw_profile_lines = _format_pay_gateway_profile(result.get("gateway_profile", {}))
-        lines += gw_profile_lines
-
         await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
         return
 
@@ -15866,7 +15149,7 @@ def _verify_square(token: str) -> dict:
 
 
 def _verify_finding(f: dict) -> dict:
-    """paykeys finding တစ်ခုကို gateway type ပေါ်မူတည်ပြီး verify လုပ်တယ် — v20 expanded"""
+    """paykeys finding တစ်ခုကို gateway type ပေါ်မူတည်ပြီး verify လုပ်တယ်"""
     ftype = f.get("type", "")
     val   = f.get("value", "").strip()
 
@@ -15874,95 +15157,35 @@ def _verify_finding(f: dict) -> dict:
         return {"gateway": ftype, "status": "⚠️ Empty value", "env": "?",
                 "detail": "Value မပါပါ", "key": "—"}
 
-    # ── Stripe Secret ───────────────────────────────────────────────────────
+    # ── Stripe ───────────────────────────────────────────────────────────
     if "Stripe Secret" in ftype or re.match(r'^sk_(live|test)_', val):
         return _verify_stripe(val)
+    if "Stripe Publishable" in ftype or re.match(r'^pk_(live|test)_', val):
+        return _verify_stripe_publishable(val)
 
-    # ── Stripe Restricted ───────────────────────────────────────────────────
-    if "Stripe Restricted" in ftype or re.match(r'^rk_(live|test)_', val):
-        return _verify_stripe_restricted(val)
-
-    # ── Stripe Publishable ──────────────────────────────────────────────────
-    if "Stripe Publishable" in ftype or re.match(r'^pk_(live|test)_[A-Za-z0-9]{20,}$', val):
-        # Disambiguate Paystack pk_ (longer, 40 chars after prefix)
-        if not re.match(r'^pk_(live|test)_[a-zA-Z0-9]{40}$', val):
-            return _verify_stripe_publishable(val)
-
-    # ── Stripe Webhook ──────────────────────────────────────────────────────
-    if "Stripe Webhook" in ftype or re.match(r'^whsec_', val):
-        return _verify_stripe_webhook(val)
-
-    # ── Square ─────────────────────────────────────────────────────────────
+    # ── Square ───────────────────────────────────────────────────────────
     if "Square" in ftype or re.match(r'^(EAAA|sq0atp-|sq0idp-)', val):
         return _verify_square(val)
 
-    # ── Razorpay — needs pair ───────────────────────────────────────────────
+    # ── Razorpay — needs pair; single key ကို flag ပါ ────────────────────
     if "Razorpay Key ID" in ftype or re.match(r'^rzp_(live|test)_', val):
         return {"gateway": "Razorpay", "status": "⚠️ Pair needed",
                 "env": "🔴 LIVE" if "live" in val else "🟡 TEST",
                 "detail": "Razorpay ကို /verifykeys rzp_id rzp_secret နဲ့ manual verify လုပ်ပါ",
-                "key": val[:12] + "..."}
+                "key": val[:12]+"..."}
     if "Razorpay Key Secret" in ftype:
         return {"gateway": "Razorpay Secret", "status": "⚠️ Pair needed",
-                "env": "?", "detail": "ID+Secret pair လိုပါသည်", "key": val[:8] + "..."}
+                "env": "?", "detail": "ID+Secret pair လိုပါသည်", "key": val[:8]+"..."}
 
-    # ── PayPal — needs pair ────────────────────────────────────────────────
+    # ── PayPal — needs pair ───────────────────────────────────────────────
     if "PayPal" in ftype:
         return {"gateway": "PayPal", "status": "⚠️ Pair needed",
                 "env": "?",
                 "detail": "PayPal ကို /verifykeys pp_client_id pp_secret နဲ့ manual verify လုပ်ပါ",
-                "key": val[:10] + "..."}
-
-    # ── Paystack ────────────────────────────────────────────────────────────
-    if "Paystack" in ftype or re.match(r'^(sk|pk)_(live|test)_[a-zA-Z0-9]{40}$', val):
-        if val.startswith("sk_"):
-            return _verify_paystack(val)
-        else:
-            env_l = "🔴 LIVE" if "live" in val else "🟡 TEST"
-            return {"gateway": "Paystack", "status": "ℹ️ PUBLIC KEY",
-                    "env": env_l, "detail": "Public key — frontend only",
-                    "key": val[:14] + "..."}
-
-    # ── Adyen ──────────────────────────────────────────────────────────────
-    if "Adyen" in ftype or re.match(r'^AQE[a-zA-Z0-9+/]{8,}={0,2}$', val):
-        return _verify_adyen(val)
-
-    # ── Flutterwave ────────────────────────────────────────────────────────
-    if "Flutterwave" in ftype or re.match(r'^FLWSECK', val):
-        return _verify_flutterwave(val)
-    if re.match(r'^FLWPUBK', val):
-        env_l = "🟡 TEST" if "_TEST" in val else "🔴 LIVE"
-        return {"gateway": "Flutterwave", "status": "ℹ️ PUBLIC KEY",
-                "env": env_l, "detail": "Public key — frontend only",
-                "key": val[:14] + "..."}
-
-    # ── Mollie ─────────────────────────────────────────────────────────────
-    if "Mollie" in ftype or re.match(r'^(live|test)_[A-Za-z0-9]{30,}$', val):
-        env_l = "🔴 LIVE" if val.startswith("live_") else "🟡 TEST"
-        masked = val[:14] + "..." + val[-4:]
-        try:
-            r = requests.get(
-                "https://api.mollie.com/v2/profiles/me",
-                headers={"Authorization": f"Bearer {val}"},
-                timeout=12,
-            )
-            if r.status_code == 200:
-                name = r.json().get("name", "?")
-                return {"gateway": "Mollie", "status": "✅ VALID",
-                        "env": env_l, "detail": f"Profile: {name}", "key": masked}
-            elif r.status_code == 401:
-                return {"gateway": "Mollie", "status": "❌ INVALID",
-                        "env": env_l, "detail": "Unauthorized", "key": masked}
-            else:
-                return {"gateway": "Mollie", "status": f"⚠️ HTTP {r.status_code}",
-                        "env": env_l, "detail": r.text[:80], "key": masked}
-        except Exception as e:
-            return {"gateway": "Mollie", "status": "❌ Error",
-                    "env": env_l, "detail": str(e)[:60], "key": masked}
+                "key": val[:10]+"..."}
 
     return {"gateway": ftype or "Unknown", "status": "⚠️ Auto-detect မရပါ",
-            "env": "?", "detail": "Format မသိ — manual check လုပ်ပါ",
-            "key": val[:10] + "..."}
+            "env": "?", "detail": "Format မသိ — manual check လုပ်ပါ", "key": val[:10]+"..."}
 
 
 def _run_verify_all(findings: list[dict]) -> list[dict]:
@@ -16077,16 +15300,13 @@ async def cmd_verifykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.effective_message.reply_text(
             "📌 *Usage:* `/verifykeys <key1> [key2] ...`\n\n"
-            "💳 *Supported (read-only):*\n"
-            "  🔵 Stripe — `sk_live_` / `sk_test_` / `rk_live_` / `whsec_`\n"
-            "  🟣 Square — `EAAA...` / `sq0atp-...`\n"
-            "  🟠 Razorpay — `rzp_live_xxx secret` _(pair)_\n"
-            "  🟡 PayPal — `client_id secret` _(pair)_\n"
-            "  🟢 Paystack — `sk_live_...` / `sk_test_...`\n"
-            "  🔷 Adyen — `AQE...`\n"
-            "  🦋 Flutterwave — `FLWSECK_...`\n"
-            "  🌀 Mollie — `live_...` / `test_...`\n\n"
-            "🔒 *Read-only — No charge/transaction performed*\n"
+            "💳 *Supported:*\n"
+            "  🔵 Stripe secret  — `sk_live_...` / `sk_test_...`\n"
+            "  🔵 Stripe public  — `pk_live_...` / `pk_test_...`\n"
+            "  🟣 Square         — `EAAA...` / `sq0atp-...`\n"
+            "  🟠 Razorpay pair  — `rzp_live_xxx secret`\n"
+            "  🟡 PayPal pair    — `client_id secret`\n\n"
+            "🔒 *Read-only — No charge/transaction*\n"
             "⚠️ _Authorized testing only_",
             parse_mode='Markdown'
         )
@@ -16107,7 +15327,7 @@ async def cmd_verifykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
         else:
-            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ")
+            await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
         return
 
     args = list(context.args)
@@ -16155,177 +15375,12 @@ async def cmd_verifykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _guess_key_type(val: str) -> str:
-    """Raw key string ကနေ gateway type ခန့်မှန်းတယ် — v20 expanded (15+ gateways)"""
-    # ── Stripe ───────────────────────────────────────────────────────────────
-    if re.match(r'^sk_(live|test)_',    val): return "Stripe Secret Key"
-    if re.match(r'^pk_(live|test)_',    val): return "Stripe Publishable Key"
-    if re.match(r'^rk_(live|test)_',    val): return "Stripe Restricted Key"
-    if re.match(r'^whsec_[A-Za-z0-9]{32,}$', val): return "Stripe Webhook Secret"
-    # ── Square ───────────────────────────────────────────────────────────────
-    if re.match(r'^(EAAA|sq0atp-|sq0idp-)', val):  return "Square Access Token"
-    # ── Razorpay ─────────────────────────────────────────────────────────────
-    if re.match(r'^rzp_(live|test)_',   val): return "Razorpay Key ID"
-    # ── Braintree ────────────────────────────────────────────────────────────
-    if re.match(r'^[a-z0-9]{16}$', val):      return "Braintree Token (possible)"
-    # ── Paystack ─────────────────────────────────────────────────────────────
-    if re.match(r'^sk_(live|test)_[a-zA-Z0-9]{40}$', val): return "Paystack Secret Key"
-    if re.match(r'^pk_(live|test)_[a-zA-Z0-9]{40}$', val): return "Paystack Public Key"
-    # ── Adyen ────────────────────────────────────────────────────────────────
-    if re.match(r'^AQE[a-zA-Z0-9+/]{8,}={0,2}$', val):    return "Adyen API Key"
-    # ── Flutterwave ──────────────────────────────────────────────────────────
-    if re.match(r'^FLWSECK(_TEST)?-[a-f0-9]{32}-X$', val): return "Flutterwave Secret"
-    if re.match(r'^FLWPUBK(_TEST)?-[a-f0-9]{32}-X$', val): return "Flutterwave Public"
-    # ── Mollie ───────────────────────────────────────────────────────────────
-    if re.match(r'^(live|test)_[A-Za-z0-9]{30,}$', val):   return "Mollie API Key"
-    # ── Paddle ───────────────────────────────────────────────────────────────
-    if re.match(r'^[0-9]{4,6}:[a-f0-9]{128}$', val):       return "Paddle Vendor Auth"
-    # ── AWS ──────────────────────────────────────────────────────────────────
-    if re.match(r'^AKIA[A-Z0-9]{16}$', val):  return "AWS Access Key ID"
-    # ── Google ───────────────────────────────────────────────────────────────
-    if re.match(r'^AIza[A-Za-z0-9_\-]{35}$', val): return "Google API Key"
-    # ── GitHub ───────────────────────────────────────────────────────────────
-    if re.match(r'^ghp_[A-Za-z0-9]{36}$', val):    return "GitHub PAT"
-    if re.match(r'^github_pat_[A-Za-z0-9_]{59}$', val): return "GitHub Fine-grained PAT"
-    # ── Twilio ───────────────────────────────────────────────────────────────
-    if re.match(r'^AC[a-f0-9]{32}$', val):    return "Twilio Account SID"
-    if re.match(r'^SK[a-f0-9]{32}$', val):    return "Twilio API Key SID"
-    # ── SendGrid ─────────────────────────────────────────────────────────────
-    if re.match(r'^SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}$', val): return "SendGrid API Key"
-    # ── OpenAI ───────────────────────────────────────────────────────────────
-    if re.match(r'^sk-[A-Za-z0-9]{48}$', val):           return "OpenAI API Key"
-    if re.match(r'^sk-proj-[A-Za-z0-9_\-]{80,}$', val):  return "OpenAI Project Key"
-    # ── JWT ──────────────────────────────────────────────────────────────────
-    if re.match(r'^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]*$', val): return "JWT Token"
+    """Raw key string ကနေ gateway type ခန့်မှန်းတယ်"""
+    if re.match(r'^sk_(live|test)_', val):   return "Stripe Secret Key"
+    if re.match(r'^pk_(live|test)_', val):   return "Stripe Publishable Key"
+    if re.match(r'^(EAAA|sq0atp-|sq0idp-)', val): return "Square Access Token"
+    if re.match(r'^rzp_(live|test)_', val):  return "Razorpay Key ID"
     return "Unknown"
-
-
-# ── New verify functions for additional gateways ──────────────────────────
-
-def _verify_stripe_webhook(secret: str) -> dict:
-    """Stripe whsec_ — format validation only (webhook secrets can't be API-tested)"""
-    masked = secret[:12] + "..." + secret[-4:]
-    is_valid_fmt = bool(re.match(r'^whsec_[A-Za-z0-9]{32,}$', secret))
-    return {
-        "gateway": "Stripe Webhook Secret",
-        "status":  "✅ VALID FORMAT" if is_valid_fmt else "❌ INVALID FORMAT",
-        "env":     "⚠️ N/A (webhook only)",
-        "detail":  "whsec_ secrets cannot be API-verified — format check only",
-        "key":     masked,
-    }
-
-
-def _verify_stripe_restricted(key: str) -> dict:
-    """Stripe rk_ restricted key — GET /v1/account (read-only probe)"""
-    env_label = "🔴 LIVE" if "live" in key else "🟡 TEST"
-    masked    = key[:12] + "..." + key[-4:]
-    try:
-        r = requests.get(
-            "https://api.stripe.com/v1/account",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=12,
-        )
-        if r.status_code == 200:
-            biz = r.json().get("business_profile", {}).get("name", "")
-            return {"gateway": "Stripe Restricted Key", "status": "✅ VALID",
-                    "env": env_label, "detail": f"Account: {biz or '?'}", "key": masked}
-        elif r.status_code == 401:
-            return {"gateway": "Stripe Restricted Key", "status": "❌ INVALID",
-                    "env": env_label, "detail": "Unauthorized", "key": masked}
-        elif r.status_code == 403:
-            return {"gateway": "Stripe Restricted Key", "status": "⚠️ VALID (no account scope)",
-                    "env": env_label, "detail": "Key valid but restricted permissions", "key": masked}
-        else:
-            return {"gateway": "Stripe Restricted Key", "status": f"⚠️ HTTP {r.status_code}",
-                    "env": env_label, "detail": r.text[:80], "key": masked}
-    except Exception as e:
-        return {"gateway": "Stripe Restricted Key", "status": "❌ Error",
-                "env": env_label, "detail": str(e)[:60], "key": masked}
-
-
-def _verify_paystack(key: str) -> dict:
-    """Paystack sk_live_/sk_test_ → GET /transaction (read-only)"""
-    env_label = "🔴 LIVE" if "live" in key else "🟡 TEST"
-    masked    = key[:14] + "..." + key[-4:]
-    try:
-        r = requests.get(
-            "https://api.paystack.co/transaction?perPage=1",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=12,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return {"gateway": "Paystack", "status": "✅ VALID",
-                    "env": env_label,
-                    "detail": f"Total txns: {data.get('meta', {}).get('total', '?')}",
-                    "key": masked}
-        elif r.status_code == 401:
-            return {"gateway": "Paystack", "status": "❌ INVALID",
-                    "env": env_label, "detail": "Unauthorized", "key": masked}
-        else:
-            return {"gateway": "Paystack", "status": f"⚠️ HTTP {r.status_code}",
-                    "env": env_label, "detail": r.text[:80], "key": masked}
-    except Exception as e:
-        return {"gateway": "Paystack", "status": "❌ Error",
-                "env": env_label, "detail": str(e)[:60], "key": masked}
-
-
-def _verify_adyen(key: str) -> dict:
-    """Adyen AQE... API key — GET /checkout/utility/v1/origins"""
-    masked = key[:12] + "..." + key[-4:]
-    try:
-        r = requests.get(
-            "https://checkout-test.adyen.com/v71/paymentMethods",
-            headers={
-                "X-API-Key":     key,
-                "Content-Type":  "application/json",
-            },
-            json={"merchantAccount": "TEST"},
-            timeout=12,
-        )
-        if r.status_code in (200, 422):
-            # 422 = merchant not found but key is valid
-            return {"gateway": "Adyen", "status": "✅ VALID",
-                    "env": "🟡 TEST", "detail": f"HTTP {r.status_code} — key authenticated",
-                    "key": masked}
-        elif r.status_code == 401:
-            return {"gateway": "Adyen", "status": "❌ INVALID",
-                    "env": "?", "detail": "401 Unauthorized", "key": masked}
-        elif r.status_code == 403:
-            return {"gateway": "Adyen", "status": "⚠️ VALID (no scope)",
-                    "env": "?", "detail": "Key valid, restricted permissions", "key": masked}
-        else:
-            return {"gateway": "Adyen", "status": f"⚠️ HTTP {r.status_code}",
-                    "env": "?", "detail": r.text[:80], "key": masked}
-    except Exception as e:
-        return {"gateway": "Adyen", "status": "❌ Error",
-                "env": "?", "detail": str(e)[:60], "key": masked}
-
-
-def _verify_flutterwave(key: str) -> dict:
-    """Flutterwave FLWSECK_ → GET /v3/transactions (read-only)"""
-    env_label = "🟡 TEST" if "_TEST" in key else "🔴 LIVE"
-    masked    = key[:14] + "..." + key[-4:]
-    try:
-        r = requests.get(
-            "https://api.flutterwave.com/v3/transactions?page=1&per_page=1",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=12,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            return {"gateway": "Flutterwave", "status": "✅ VALID",
-                    "env": env_label,
-                    "detail": f"Txn count: {data.get('meta', {}).get('page_info', {}).get('total', '?')}",
-                    "key": masked}
-        elif r.status_code == 401:
-            return {"gateway": "Flutterwave", "status": "❌ INVALID",
-                    "env": env_label, "detail": "Unauthorized", "key": masked}
-        else:
-            return {"gateway": "Flutterwave", "status": f"⚠️ HTTP {r.status_code}",
-                    "env": env_label, "detail": r.text[:80], "key": masked}
-    except Exception as e:
-        return {"gateway": "Flutterwave", "status": "❌ Error",
-                "env": env_label, "detail": str(e)[:60], "key": masked}
 
 
 # ══════════════════════════════════════════════════
@@ -16475,22 +15530,22 @@ async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"👤 *Social Keys — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"👤 *Social Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _socialkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
+        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"👤 *OAuth Key Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No social/OAuth keys found\n🌐 `{escape_md(page_url)}`")
+            f"📭 No social/OAuth keys found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
         return
     lines = [f"👤 *Social / OAuth Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -16657,22 +15712,22 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"📊 *Analytics — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"📊 *Analytics — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _analytics_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
+        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"📊 *Analytics Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No analytics IDs found\n🌐 `{escape_md(page_url)}`")
+            f"📭 No analytics IDs found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
         return
     lines = [f"📊 *Analytics IDs — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18576,22 +17631,22 @@ async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🔒 *JWT Live — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🔒 *JWT Live — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _jwtlive_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
+        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"🔒 *JWT Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No JWT tokens found (may require login)\n🌐 `{escape_md(page_url)}`")
+            f"📭 No JWT tokens found (may require login)\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
         return
     lines = [f"🔒 *JWT Tokens — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18764,22 +17819,22 @@ async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"📡 *Push Keys — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"📡 *Push Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _pushkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
+        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"📡 *Push Key Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No push/CDN keys found\n🌐 `{escape_md(page_url)}`")
+            f"📭 No push/CDN keys found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
         return
     lines = [f"📡 *Push / CDN Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -18922,22 +17977,22 @@ async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"💬 *Chat Keys — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"💬 *Chat Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _chatkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
-        prog.cancel(); await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`"); return
+        prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`"); return
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown'); return
     findings = result["findings"]; page_url = result["page_url"]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"💬 *Chat Key Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 No chat/monitoring keys found\n🌐 `{escape_md(page_url)}`")
+            f"📭 No chat/monitoring keys found\n🌐 `{escape_md(page_url)}`", parse_mode='Markdown')
         return
     lines = [f"💬 *Chat & Monitoring Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"🌐 `{escape_md(page_url)}`", f"✅ Found: `{len(findings)}`\n"]
@@ -19072,7 +18127,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tg_file = await context.bot.get_file(doc.file_id)
         await tg_file.download_to_drive(save_path)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Download error: `{escape_md(type(e).__name__)}`")
+        await msg.edit_text(f"❌ Download error: `{escape_md(type(e).__name__)}`", parse_mode='Markdown')
         return
 
     # ── Save path for /appassets command ─────────
@@ -19082,7 +18137,7 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         u2["last_uploaded_app"] = save_path
         _save_db_sync(db2)
 
-    await safe_markdown_reply(msg, 
+    await msg.edit_text(
         f"📱 *{file_type} — `{escape_md(fname)}`*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"✅ Downloaded `{fsize_mb:.1f}MB`\n\n"
@@ -19101,7 +18156,10 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if prog_q:
                 txt = prog_q[-1]; prog_q.clear()
                 try:
-                    await safe_markdown_reply(msg, f"📱 *Analyzing `{escape_md(fname)}`*\n\n{escape_md(str(txt))}")
+                    await msg.edit_text(
+                        f"📱 *Analyzing `{escape_md(fname)}`*\n\n{txt}",
+                        parse_mode='Markdown'
+                    )
                 except Exception:
                     pass
 
@@ -19113,7 +18171,8 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         prog_task.cancel()
-        await safe_markdown_reply(msg, f"❌ Analysis error: `{escape_md(type(e).__name__)}`\n`{escape_md(str(e)[:100])}`")
+        await msg.edit_text(f"❌ Analysis error: `{escape_md(type(e).__name__)}`\n`{escape_md(str(e)[:100])}`",
+                            parse_mode='Markdown')
         try: os.remove(save_path)
         except: pass
         return
@@ -19640,7 +18699,7 @@ async def _run_download(
                 return
             if last['t']:
                 try:
-                    await safe_markdown_reply(msg, 
+                    await msg.edit_text(
                         f"⏳ *Download နေဆဲ...*\n🔗 `{escape_md(sanitize_log_url(url))}`\n\n{last['t']}",
                         parse_mode='Markdown'
                     )
@@ -19656,7 +18715,7 @@ async def _run_download(
         if cancel_event.is_set():
             prog.cancel()
             _cancel_flags.pop(uid, None)
-            await safe_markdown_reply(msg, "🛑 Download cancelled")
+            await msg.edit_text("🛑 Download cancelled")
             return
         try:
             async with db_lock:
@@ -19675,11 +18734,13 @@ async def _run_download(
                 "SSLError":         "🔒 SSL certificate ပြဿနာ",
                 "TooManyRedirects": "🔄 Redirect loop ဖြစ်နေတယ်",
             }.get(err_name, f"⚠️ {err_name}")
-            await safe_markdown_reply(msg,
+            await msg.edit_text(
                 f"❌ *Download မအောင်မြင်ဘူး*\n\n"
-                f"{escape_md(str(err_hint))}\n\n"
-                f"▸ ဆက်လုပ်ဖို့: `/resume {escape_md(url)}`\n"
-                f"▸ JS site ဆိုရင်: `/jsdownload {escape_md(url)}`")
+                f"{err_hint}\n\n"
+                f"▸ ဆက်လုပ်ဖို့: `/resume {url}`\n"
+                f"▸ JS site ဆိုရင်: `/jsdownload {url}`",
+                parse_mode='Markdown'
+            )
             async with db_lock:
                 db3 = _load_db_sync()
                 u3  = get_user(db3, uid)
@@ -19693,16 +18754,18 @@ async def _run_download(
 
     # Check if cancelled during download
     if cancel_event.is_set():
-        await safe_markdown_reply(msg, "🛑 Download ကို cancel လုပ်ပြီးပါပြီ")
+        await msg.edit_text("🛑 Download ကို cancel လုပ်ပြီးပါပြီ")
         return
 
     if error:
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(error))}`"); return
+        await msg.edit_text(f"❌ {error}"); return
 
     is_split = len(files) > 1
-    await safe_markdown_reply(msg,
+    await msg.edit_text(
         f"📤 Upload နေပါတယ်...\n💾 {size_mb:.1f} MB"
-        + (f" → {len(files)} parts" if is_split else ""))
+        + (f" → {len(files)} parts" if is_split else ""),
+        parse_mode='Markdown'
+    )
 
     try:
         for i, fpath in enumerate(files):
@@ -19738,7 +18801,7 @@ async def _run_download(
             "\n\n*Combine လုပ်နည်း:*\n```\ncat *.part*.zip > full.zip\n```"
         ) if is_split else ""
 
-        await safe_markdown_reply(msg, f"✅ ပြီးပါပြီ 🎉{join_hint}")
+        await msg.edit_text(f"✅ ပြီးပါပြီ 🎉{join_hint}", parse_mode='Markdown')
 
         async with db_lock:
             db4 = _load_db_sync()
@@ -19747,9 +18810,9 @@ async def _run_download(
             _save_db_sync(db4)
 
     except RetryAfter as e:
-        await safe_markdown_reply(msg, f"❌ Telegram flood limit — `{e.retry_after}s` နောက်မှ ထပ်ကြိုးစားပါ")
+        await msg.edit_text(f"❌ Telegram flood limit — `{e.retry_after}s` နောက်မှ ထပ်ကြိုးစားပါ")
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Upload error: `{escape_md(type(e).__name__)}`")
+        await msg.edit_text(f"❌ Upload error: {type(e).__name__}")
 
 
 # ══════════════════════════════════════════════════
@@ -19812,7 +18875,9 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if stopped:
         await msg.reply_text(
             f"🛑 *Stopped:* {', '.join(stopped)}\n"
-            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ")
+            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ",
+            parse_mode='Markdown'
+        )
     else:
         await msg.reply_text(
             "ℹ️ ရပ်ရမည့် operation မရှိပါ\n"
@@ -19825,7 +18890,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_download(u, c):
     if not await check_force_join(u, c): return
-    if not c.args: return await u.message.reply_text("Usage: `/download <url>`")
+    if not c.args: return await u.message.reply_text("Usage: `/download <url>`", parse_mode='Markdown')
     url = c.args[0] if c.args[0].startswith('http') else 'https://'+c.args[0]
     await enqueue_download(u, c, url, False, False)
 
@@ -22117,7 +21182,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         detected, notable, status = await run_scan(uid, _do_tech_scan)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
 
     domain = urlparse(url).hostname
@@ -22501,7 +21566,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(type(e).__name__)}: {escape_md(str(e)[:80])}`")
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
 
     # ── Sort findings by risk ────────────────────────────
@@ -22580,7 +21645,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }, ensure_ascii=False, indent=2)
 
     # ── Build ZIP in memory ──────────────────────────────
-    await safe_markdown_reply(msg, 
+    await msg.edit_text(
         f"🗜️ Building ZIP for `{escape_md(domain)}`...\n"
         f"📂 `{len(sources)}` source files + reports",
         parse_mode='Markdown'
@@ -22647,7 +21712,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_text = "\n".join(tg_lines)
     try:
         if len(tg_text) > 4000:
-            await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
+            await msg.edit_text(_truncate_safe_md(tg_text), parse_mode='Markdown')
         else:
             await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
     except Exception:
@@ -22905,7 +21970,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
 
     baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
@@ -23176,8 +22241,8 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
-                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}")
+                    await msg.edit_text(
+                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}", parse_mode='Markdown')
                 except Exception:
                     pass
 
@@ -23186,11 +22251,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = await run_scan(uid, _subdomains_sync, raw, progress_q)
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -23606,8 +22671,8 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             if progress_q:
                 txt = progress_q[-1]; progress_q.clear()
                 try:
-                    await safe_markdown_reply(msg, 
-                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}")
+                    await msg.edit_text(
+                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}", parse_mode='Markdown')
                 except Exception:
                     pass
 
@@ -23619,18 +22684,18 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
         )
     except asyncio.CancelledError:
         prog.cancel()
-        await safe_markdown_reply(msg, "🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်")
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
         return
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
 
     if result.get("errors") and result.get("extracted", 0) == 0:
         _err_txt = '\n'.join(result['errors'][:3])
-        await safe_markdown_reply(msg, f"❌ `{escape_md(_err_txt)}`")
+        await msg.edit_text(f"❌ `{escape_md(_err_txt)}`", parse_mode='Markdown')
         return
 
     stats = result["stats"]
@@ -23639,7 +22704,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     if extracted == 0:
         stat_lines = "\n".join(f"  {cat}: `0`" for cat in sorted(wanted_cats))
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"📭 *No files found*\n\nCategory တွေမှာ ဖိုင် မတွေ့ပါ:\n{stat_lines}",
             parse_mode='Markdown'
         )
@@ -23651,11 +22716,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
     zip_buf.seek(0)
     zip_size_mb = zip_buf.getbuffer().nbytes / 1024 / 1024
 
-    await safe_markdown_reply(msg, f"✅ *Extraction ပြီးပါပြီ*\n\n"
+    await msg.edit_text(
+        f"✅ *Extraction ပြီးပါပြီ*\n\n"
         f"📦 Extracted: `{escape_md(extracted)}` files\n"
         f"💾 Size: `{zip_size_mb:.2f}` MB\n\n"
         f"*Per Category:*\n{stat_lines}\n\n"
-        "📤 ZIP upload နေပါသည်...")
+        "📤 ZIP upload နေပါသည်...",
+        parse_mode='Markdown'
+    )
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_fname = re.sub(r'[^\w\-]', '_', os.path.splitext(os.path.basename(filepath))[0])
@@ -23675,7 +22743,7 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
             parse_mode='Markdown'
         )
     except Exception as e:
-        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`")
+        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`", parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -23804,11 +22872,11 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         res = await run_scan(uid, _run_antibot)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ Error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
 
     if not res["success"]:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"❌ *Bypass မအောင်မြင်ဘူး*\n\n"
             f"Error: `{res['error']}`\n\n"
             "_Challenge level မြင့်လွန်းနိုင်သည် သို့မဟုတ် manual CAPTCHA solve လိုနိုင်ပါသည်_",
@@ -23826,11 +22894,14 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     safe_d = re.sub(r'[^\w\-]', '_', domain)
     html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
 
-    await safe_markdown_reply(msg, f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
+    await msg.edit_text(
+        f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
         f"🌐 `{escape_md(domain)}`\n"
         f"⚙️ Method: `{escape_md(method)}`\n"
         f"📄 HTML Size: `{html_size_kb:.1f}` KB\n\n"
-        "📤 HTML file upload နေပါသည်...")
+        "📤 HTML file upload နေပါသည်...",
+        parse_mode='Markdown'
+    )
 
     try:
         await context.bot.send_document(
@@ -23845,7 +22916,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     except Exception as e:
-        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`")
+        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`", parse_mode='Markdown')
 
 
 # ══════════════════════════════════════════════════
@@ -26843,7 +25914,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = await run_scan(uid, _run_keydump_sync, url)
     except Exception as e:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"❌ *KeyDump Error*\n`{type(e).__name__}: {str(e)[:100]}`",
             parse_mode="Markdown")
         return
@@ -27533,7 +26604,7 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  • Telegram bot webhook URLs\n"
             "  • Datadog / Atlassian / Generic webhooks\n"
             "  • GitHub webhook secrets\n\n"
-            "⚠️ _Authorized testing only_")
+            "⚠️ _Authorized testing only_", parse_mode='Markdown')
         return
 
     uid = update.effective_user.id
@@ -27572,8 +26643,8 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, 
-                    f"🪝 *Webhook Extractor — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(
+                    f"🪝 *Webhook Extractor — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
 
@@ -27581,13 +26652,13 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await run_scan(uid, _webhooks_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
 
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
 
     findings = result["findings"]
@@ -27595,10 +26666,11 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reqs     = result.get("requests", 0)
 
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"🪝 *Webhook Extractor — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
             f"📭 No webhook URLs found\n"
-            f"🌐 `{escape_md(page_url)}`\n📡 Requests: `{escape_md(reqs)}`")
+            f"🌐 `{escape_md(page_url)}`\n📡 Requests: `{escape_md(reqs)}`",
+            parse_mode='Markdown')
         return
 
     lines = [
@@ -27810,14 +26882,14 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🛡️ *Vuln Scan — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🛡️ *Vuln Scan — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _vuln_scan_sync, url, progress_q)
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ Scan error: `{escape_md(e)}`")
+        await msg.edit_text(f"❌ Scan error: `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
@@ -27875,19 +26947,19 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🔍 *API Scan — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🔍 *API Scan — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
     findings = result["findings"]
     gql      = result.get("graphql", {})
@@ -27971,21 +27043,21 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🧪 *Fuzzing — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🧪 *Fuzzing — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         found, baseline = await run_scan(uid, _fuzz_sync, url, mode, progress_q)
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if not found:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"🧪 *Fuzzer — `{escape_md(domain)}`*\n\n📭 No interesting paths found.\n"
-            f"_(Baseline: `{escape_md(baseline)}`)_")
+            f"_(Baseline: `{escape_md(baseline)}`)_", parse_mode='Markdown')
         return
     lines = [f"🧪 *Fuzzer — `{escape_md(domain)}`* (`{escape_md(mode)}`)", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(found)}` paths\n"]
@@ -28049,7 +27121,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(3)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
@@ -28065,12 +27137,12 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         found = await run_scan(uid, _run)
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if not found:
-        await safe_markdown_reply(msg, f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n📭 No interesting paths found.")
+        await msg.edit_text(f"🤖 *SmartFuzz — `{escape_md(domain)}`*\n\n📭 No interesting paths found.", parse_mode='Markdown')
         return
     lines = [f"🤖 *SmartFuzz — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(found)}` paths\n"]
@@ -28134,7 +27206,7 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await run_scan(uid, _run)
     except Exception as e:
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     lines = ["🔐 *JWT Attack Report*", "━━━━━━━━━━━━━━━━━━━━"]
     if not decoded.get("error"):
@@ -28207,19 +27279,19 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🔑 *Hidden Keys — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🔑 *Hidden Keys — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _hiddenkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
     raw_findings = result["findings"]
     live_result  = result.get("live_result") or {"live_requests": [], "live_findings": [], "sse_frames": []}
@@ -28238,9 +27310,9 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     high_live   = [f for f in findings if f.get("confidence", "").startswith("HIGH")]
     static_only = [f for f in findings if "STATIC" in f.get("confidence", "")]
     if not findings:
-        await safe_markdown_reply(msg, 
+        await msg.edit_text(
             f"🔑 *Hidden Keys — `{escape_md(domain)}`*\n\n📭 No hidden tokens found.\n"
-            f"📡 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`")
+            f"📡 Static: `{escape_md(reqs)}` | Live: `{escape_md(live_reqs)}`", parse_mode='Markdown')
         return
     lines = [
         f"🔑 *Hidden Keys — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
@@ -28335,23 +27407,23 @@ async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"📡 *Endpoints — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"📡 *Endpoints — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
     findings = result["findings"]
     if not findings:
-        await safe_markdown_reply(msg, f"📡 *Endpoints — `{escape_md(domain)}`*\n\n📭 No endpoints found.")
+        await msg.edit_text(f"📡 *Endpoints — `{escape_md(domain)}`*\n\n📭 No endpoints found.", parse_mode='Markdown')
         return
     lines = [f"📡 *Endpoints — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(findings)}`\n"]
@@ -28418,24 +27490,24 @@ async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
             if progress_q:
                 t = progress_q[-1]; progress_q.clear()
-                try: await safe_markdown_reply(msg, f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n{t}")
+                try: await msg.edit_text(f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n{t}", parse_mode='Markdown')
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
         result = await run_scan(uid, _oauthscan_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
-        await safe_markdown_reply(msg, f"❌ `{escape_md(e)}`")
+        await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
     finally:
         prog.cancel()
     if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(str(result['error'])[:80])}`")
+        await msg.edit_text(f"❌ `{result['error']}`", parse_mode='Markdown')
         return
     findings = result["findings"]
     risks    = result.get("risks", [])
     if not findings and not risks:
-        await safe_markdown_reply(msg, f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n📭 No OAuth artifacts found.")
+        await msg.edit_text(f"🔐 *OAuth Scan — `{escape_md(domain)}`*\n\n📭 No OAuth artifacts found.", parse_mode='Markdown')
         return
     lines = [f"🔐 *OAuth Scan — `{escape_md(domain)}`*", "━━━━━━━━━━━━━━━━━━━━",
              f"✅ Found: `{len(findings)}` | ⚠️ Risks: `{len(risks)}`\n"]
@@ -28591,7 +27663,7 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             fail += 1
         await asyncio.sleep(0.05)
-    await safe_markdown_reply(msg, f"✅ Sent: `{escape_md(ok)}` | ❌ Failed: `{escape_md(fail)}`")
+    await msg.edit_text(f"✅ Sent: `{escape_md(ok)}` | ❌ Failed: `{escape_md(fail)}`", parse_mode='Markdown')
 
 
 @admin_only
@@ -28605,7 +27677,7 @@ async def cmd_allusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 *All Users ({len(users)}):*\n"]
     for uid_str, u in users[:50]:
         icon = "🚫" if u.get("banned") else "✅"
-        lines.append(f"{icon} `{escape_md(uid_str)}` — {u.get('name','?')} | {u.get('total_downloads',0)} DL")
+        lines.append(f"{icon} `{escape_md(uid_str)}` — {escape_md(str(u.get('name','?')))} | {u.get('total_downloads',0)} DL")
     if len(users) > 50:
         lines.append(f"\n_…and {len(users)-50} more_")
     await safe_markdown_reply(update.effective_message, _truncate_safe_md("\n".join(lines)))
