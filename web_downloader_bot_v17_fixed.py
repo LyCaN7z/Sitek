@@ -257,214 +257,6 @@ def escape_md(text: str) -> str:
     return text
 
 
-# ══ PRO OUTPUT FORMATTERS v2.0 ══
-_HEADER_BAR = "━" * 28
-
-_CAPTCHA_TYPE_ICON = {
-    "reCAPTCHA v2":          "🔵",
-    "reCAPTCHA v3":          "🟣",
-    "reCAPTCHA Enterprise":  "🟤",
-    "hCaptcha":              "🟡",
-    "Cloudflare Turnstile":  "🟠",
-    "FunCaptcha":            "🔴",
-    "GeeTest":               "🟢",
-    "AWS WAF Captcha":       "⚪",
-    "DataDome":              "🟤",
-    "PerimeterX/HUMAN":      "🔶",
-    "FriendlyCaptcha":       "🔷",
-    "MTCaptcha":             "🔹",
-    "Akamai Bot Manager":    "🟥",
-    "Kasada Bot Defense":    "🟫",
-    "Altcha":                "🔘",
-    "mCaptcha":              "🔸",
-}
-
-_KEY_CAT_ICON = {
-    "Payment":       "💳",
-    "AI / ML":       "🤖",
-    "Cloud":         "☁️",
-    "Auth / Token":  "🔐",
-    "Communication": "📡",
-    "DevOps":        "⚙️",
-    "Database":      "🗄️",
-    "Analytics":     "📊",
-    "Crypto":        "🪙",
-    "Captcha":       "🛡️",
-    "Other":         "🔑",
-}
-
-_ENV_LABELS = {
-    "PROD":    "🔴 PROD",
-    "TEST":    "🟡 TEST",
-    "DEV":     "🟢 DEV",
-    "SANDBOX": "🟢 SANDBOX",
-    "UNKNOWN": "⚪ UNKNOWN",
-}
-
-_PAY_PROVIDER_ICON = {
-    "Stripe":      "💜",
-    "PayPal":      "💙",
-    "Square":      "🖤",
-    "Razorpay":    "💚",
-    "Braintree":   "🧡",
-    "Adyen":       "💛",
-    "Klarna":      "🩷",
-    "Paddle":      "🩵",
-    "Paystack":    "🩶",
-    "Flutterwave": "🤎",
-}
-
-# ── Key type → Category mapping ──────────────────────────────────
-_KEY_TYPE_CATEGORIES = {
-    "Payment": [
-        "stripe", "paypal", "braintree", "square", "razorpay",
-        "adyen", "klarna", "paddle", "paystack", "flutterwave",
-        "checkout", "billing", "payment",
-    ],
-    "AI / ML": [
-        "openai", "anthropic", "huggingface", "groq", "replicate",
-        "cohere", "google ai", "deepseek", "mistral", "claude",
-    ],
-    "Cloud": [
-        "aws", "google cloud", "azure", "firebase", "supabase",
-        "cloudflare", "vercel", "netlify", "heroku", "railway",
-    ],
-    "Auth / Token": [
-        "jwt", "bearer", "oauth", "auth0", "clerk", "session",
-        "csrf", "token", "authorization", "basic auth",
-    ],
-    "Communication": [
-        "twilio", "sendgrid", "mailgun", "telegram", "slack",
-        "discord", "pusher", "mailchimp",
-    ],
-    "DevOps": [
-        "github", "gitlab", "docker", "sentry", "datadog",
-        "new relic", "jenkins",
-    ],
-    "Database": [
-        "mongodb", "mysql", "postgresql", "redis", "supabase db",
-        "database", "dsn",
-    ],
-    "Analytics": [
-        "google analytics", "mixpanel", "amplitude", "segment",
-        "facebook pixel", "hotjar",
-    ],
-    "Captcha": [
-        "recaptcha", "hcaptcha", "turnstile", "funcaptcha",
-        "geetest", "captcha", "arkose",
-    ],
-}
-
-
-def _conf_emoji(confidence: str) -> str:
-    """Confidence string → single emoji."""
-    c = (confidence or "").upper()
-    if "CONFIRMED" in c: return "✅"
-    if "HIGH" in c:      return "🔴"
-    if "MEDIUM" in c:    return "🟡"
-    if "STATIC" in c:    return "⚪"
-    return "⚫"
-
-
-def _conf_label(confidence: str) -> str:
-    """Confidence string → clean short label."""
-    c = (confidence or "").upper()
-    if "CONFIRMED" in c: return "CONFIRMED"
-    if "HIGH" in c:      return "HIGH"
-    if "MEDIUM" in c:    return "MEDIUM"
-    if "STATIC" in c:    return "STATIC"
-    return "UNKNOWN"
-
-
-def _categorize_key_type(type_str: str) -> str:
-    """Map a finding type to a display category."""
-    tl = (type_str or "").lower()
-    for cat, keywords in _KEY_TYPE_CATEGORIES.items():
-        if any(kw in tl for kw in keywords):
-            return cat
-    return "Other"
-
-
-def _detect_pay_provider(type_str: str) -> str:
-    """Extract payment provider name from finding type."""
-    tl = (type_str or "").lower()
-    providers = [
-        "Stripe", "PayPal", "Square", "Razorpay", "Braintree",
-        "Adyen", "Klarna", "Paddle", "Paystack", "Flutterwave",
-    ]
-    for p in providers:
-        if p.lower() in tl:
-            return p
-    return "Other"
-
-
-def _key_safe(value: str) -> str:
-    """Make key value safe for Telegram code blocks."""
-    if not value:
-        return "N/A"
-    return str(value).replace("`", "'").replace("\\", "/")
-
-
-def _key_masked(value: str) -> str:
-    """Masked key for inline display: first12...last4"""
-    if not value:
-        return "`N/A`"
-    v = str(value).strip()
-    if len(v) <= 20:
-        return f"`{escape_md(v)}`"
-    return f"`{escape_md(v[:12])}···{escape_md(v[-4:])}`"
-
-
-def _url_short(url: str, max_len: int = 58) -> str:
-    """Truncated URL in code format."""
-    if not url:
-        return ""
-    u = str(url).strip()
-    if len(u) <= max_len:
-        return f"`{escape_md(u)}`"
-    return f"`{escape_md(u[:max_len])}…`"
-
-
-def _dedup_by_key(findings: list, key_field: str = "value") -> list:
-    """Deduplicate findings list by key value."""
-    seen = set()
-    out = []
-    for f in findings:
-        k = f.get(key_field) or f.get("site_key") or ""
-        if not k:
-            out.append(f)
-            continue
-        if k not in seen:
-            seen.add(k)
-            out.append(f)
-    return out
-
-
-def _compact_json(obj: dict, max_oneline: int = 95) -> str:
-    """JSON → single line if short, else pretty. Backtick-safe."""
-    s = json.dumps(obj, ensure_ascii=False)
-    if len(s) <= max_oneline:
-        return s.replace("`", "'")
-    pretty = json.dumps(obj, indent=2, ensure_ascii=False)
-    return pretty.replace("`", "'")
-
-
-def _build_solver_json(f: dict) -> dict:
-    """Build compact solver-ready JSON from a finding dict."""
-    sk   = f.get("site_key") or f.get("value") or ""
-    page = f.get("page_url") or ""
-    out = {}
-    if f.get("type"):      out["type"]       = f["type"].split(" (")[0].strip()
-    if sk:                  out["sitekey"]    = sk
-    if page:               out["pageurl"]    = page[:100]
-    if f.get("action"):    out["action"]     = f["action"]
-    if f.get("enterprise"):out["enterprise"] = 1
-    if f.get("min_score"): out["min_score"]  = f["min_score"]
-    if f.get("invisible"): out["invisible"]  = 1
-    if f.get("s_param"):   out["data-s"]     = f["s_param"][:50]
-    return out
-
-
 def _truncate_safe_md(text: str, limit: int = 4000) -> str:
     """
     Truncate *text* to *limit* chars without cutting inside an open Markdown
@@ -7934,7 +7726,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if result.get("error"):
         await msg.edit_text(
-            f"❌ *Fetch error*\n`{escape_md(str(result['error'])[:80])}`",
+            f"❌ *Fetch error*\n`{result['error']}`",
             parse_mode='Markdown'
         )
         return
@@ -7945,11 +7737,12 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     js_count     = result.get("js_fetched", 0)
     live_reqs    = len(live_result.get("live_requests", []))
 
-    # Cross-reference for confidence scoring
+    # Cross-reference: use site_key as the "value" field for confidence scoring
     for f in raw_findings:
         if "value" not in f:
             f["value"] = f.get("site_key", "")
     findings_xref = _confidence_crossref(raw_findings, live_result)
+    # Restore site_key field
     for orig, f in zip(raw_findings, findings_xref[:len(raw_findings)]):
         f["site_key"] = orig.get("site_key", f.get("value", ""))
         for k in ("page_url","action","invisible","min_score","enterprise",
@@ -7957,153 +7750,169 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if k in orig:
                 f[k] = orig[k]
 
-    # Filter to captcha types only
-    _CAPTCHA_WORDS = {
-        "recaptcha", "hcaptcha", "turnstile", "funcaptcha",
-        "geetest", "captcha", "arkose", "datadome", "perimeterx",
-        "friendlycaptcha", "mtcaptcha", "akamai", "kasada", "altcha",
-        "mcaptcha", "aws waf",
-    }
-    findings = [
-        f for f in findings_xref
-        if any(cw in f.get("type", "").lower() for cw in _CAPTCHA_WORDS)
-    ]
+    confirmed   = [f for f in findings_xref if "CONFIRMED" in f.get("confidence","")]
+    high_live   = [f for f in findings_xref if f.get("confidence","").startswith("HIGH")]
+    static_only = [f for f in findings_xref if "STATIC" in f.get("confidence","")]
+    findings    = findings_xref
 
-    # Deduplicate by site_key
-    findings = _dedup_by_key(findings, "site_key")
-
-    # Sort: CONFIRMED → HIGH → STATIC
-    _conf_order = {"CONFIRMED": 0, "HIGH": 1, "MEDIUM": 2, "STATIC": 3}
-    findings.sort(key=lambda x: _conf_order.get(_conf_label(x.get("confidence", "")), 9))
-
-    confirmed = [f for f in findings if "CONFIRMED" in f.get("confidence", "")]
-    high_live = [f for f in findings if f not in confirmed and "HIGH" in f.get("confidence", "")]
-    static_only = [f for f in findings if "STATIC" in f.get("confidence", "")]
-
-    # ═══════════════════════════════════════════════════════════
-    # BUILD TELEGRAM REPORT
-    # ═══════════════════════════════════════════════════════════
-
-    lines = [
-        "🔑 *CAPTCHA Site Keys*",
-        _HEADER_BAR,
-        f"🌐  `{escape_md(domain)}`",
-        f"📄  {_url_short(page_url, 60)}",
-        "",
-        f"📡  JS `{escape_md(str(js_count))}` │ Live `{escape_md(str(live_reqs))}` │ Found `{escape_md(str(len(findings)))}`",
-        f"✅ `{escape_md(str(len(confirmed)))}` confirmed   "
-        f"🔴 `{escape_md(str(len(high_live)))}` live   "
-        f"⚪ `{escape_md(str(len(static_only)))}` static",
-        "",
-    ]
-
-    # ── No captcha found ──────────────────────────────────────
+    # ─── No captcha found ───────────────────────
     if not findings:
-        lines += [
-            "📭 *Captcha မတွေ့ရှိပါ*",
-            "",
-            "_Possible reasons:_",
-            "  • Site မှာ captcha မပါ",
-            "  • Server-side only (no client key)",
-            "  • User interaction ပြီးမှ load",
-            "  • Obfuscated / encrypted JS bundle",
-        ]
-        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+        await msg.edit_text(
+            f"🔑 *Site Key Extractor — `{escape_md(domain)}`*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 *Captcha မတွေ့ပါ*\n\n"
+            f"🌐 Page URL: `{escape_md(page_url)}`\n"
+            f"📡 Static: `{escape_md(js_count)}` | Live: `{escape_md(live_reqs)}`\n\n"
+            "_Network requests, DOM, console logs အကုန် scan ပြီးပါပြီ_\n"
+            "_Site မှာ Captcha မပါ သို့မဟုတ် render ပြီးမှ load ဖြစ်နိုင်သည်_",
+            parse_mode='Markdown'
+        )
         return
 
-    # ── Per-finding cards ─────────────────────────────────────
-    for i, f in enumerate(findings, 1):
-        cap_type   = f.get("type", "Unknown").split(" (")[0].strip()
-        full_type  = f.get("type", "Unknown")
-        sk         = f.get("site_key") or f.get("value") or "N/A"
-        f_page     = f.get("page_url", "")
-        action     = f.get("action", "")
-        min_score  = f.get("min_score", "")
-        invisible  = f.get("invisible", False)
-        enterprise = f.get("enterprise", False)
-        confidence = f.get("confidence", "STATIC")
-        source     = (f.get("source") or "")[:55]
-        s_param    = f.get("s_param", "")
+    # ─── Build report ────────────────────────────
+    _TYPE_ICON = {
+        "reCAPTCHA v2":          "🔵",
+        "reCAPTCHA v3":          "🟣",
+        "reCAPTCHA Enterprise":  "🟤",
+        "hCaptcha":              "🟡",
+        "Cloudflare Turnstile":  "🟠",
+        "FunCaptcha":            "🔴",
+        "GeeTest":               "🟢",
+        "AWS WAF Captcha":       "⚪",
+        "DataDome":              "🟤",
+        "PerimeterX/HUMAN":      "🔶",
+        "FriendlyCaptcha":       "🔷",
+        "MTCaptcha":             "🔹",
+        "Akamai Bot Manager":    "🟥",
+    }
 
-        icon  = _CAPTCHA_TYPE_ICON.get(cap_type, "🔑")
-        badge = _conf_emoji(confidence)
-        clbl  = _conf_label(confidence)
+    # Deduplicated ordering: CONFIRMED → HIGH → STATIC
+    seen_keys = set()
+    ordered   = []
+    for f, badge in (
+        [(f, "✅ CONFIRMED") for f in confirmed] +
+        [(f, "🔴 HIGH-LIVE") for f in high_live if f not in confirmed] +
+        [(f, "⚠️ STATIC")   for f in static_only]
+    ):
+        sk = f.get("site_key", "") or f.get("value", "")
+        if sk and sk in seen_keys:
+            continue
+        seen_keys.add(sk)
+        ordered.append((f, badge))
+    # Include remaining findings not yet categorized
+    for f in findings:
+        sk = f.get("site_key", "") or f.get("value", "")
+        if sk not in seen_keys:
+            seen_keys.add(sk)
+            ordered.append((f, f.get("confidence", "⚠️ STATIC")))
 
-        # Difficulty score
-        diff_score, diff_label, diff_emoji = _sitekey_difficulty(f)
+    lines = [
+        f"🔑 *Site Key Extractor — `{escape_md(domain)}`*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 Page URL: `{escape_md(page_url)}`",
+        f"📡 Static: `{escape_md(js_count)}` JS | Live: `{escape_md(live_reqs)}` requests",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live: `{len(high_live)}` | ⚠️ Static: `{len(static_only)}`",
+        f"🔑 Found: `{len(ordered)}` captcha instance(s)",
+        "",
+    ]
 
-        # Card header
-        lines.append(f"┌{'─' * 32}")
-        lines.append(f"│ {icon}  *#{i}*  {escape_md(full_type)}")
-        lines.append(f"│ {badge} {clbl}   {diff_emoji} Difficulty `{escape_md(str(diff_score))}/10` _{diff_label}_")
-        lines.append(f"│")
+    _CAPTCHA_TYPES = {
+        "reCAPTCHA", "hCaptcha", "Turnstile", "FunCaptcha",
+        "GeeTest", "AWS WAF", "DataDome", "PerimeterX",
+        "FriendlyCaptcha", "MTCaptcha", "Akamai",
+    }
 
-        # Key (full, copyable)
-        lines.append(f"│ 🔑 *Key:*")
-        lines.append(f"│ `{_key_safe(sk)}`")
+    entry_num = 0
+    for f, badge in ordered:
+        cap_type = f.get("type", "")
+        sk       = f.get("site_key", "") or f.get("value", "") or "N/A"
 
-        # Page URL (only if different from main)
-        if f_page and f_page.rstrip("/") != page_url.rstrip("/"):
-            lines.append(f"│ 🌐 {_url_short(f_page, 55)}")
+        # JWT / non-captcha tokens ဖယ်ရှား
+        if not any(ct in cap_type for ct in _CAPTCHA_TYPES):
+            continue
 
-        # Flags (compact row)
-        flags = []
-        if action:     flags.append(f"action=`{escape_md(action)}`")
-        if min_score:  flags.append(f"score=`{escape_md(str(min_score))}`")
-        if invisible:  flags.append("👁 invisible")
-        if enterprise: flags.append("🏢 enterprise")
-        if s_param:    flags.append(f"data-s=`{escape_md(s_param[:16])}…`")
-        if flags:
-            lines.append(f"│ ⚡ {' │ '.join(flags)}")
+        entry_num += 1
+        icon = next((v for k, v in _TYPE_ICON.items() if k in cap_type), "🔑")
 
-        # Source
-        if source:
-            lines.append(f"│ 📂 _{escape_md(source)}_")
+        # Key format validation
+        clean_type = cap_type.replace(" ⚠️ (key not found)", "").strip()
+        validator  = _KEY_VALIDATORS.get(clean_type)
+        fmt_ok     = ""
+        if sk and sk != "N/A" and validator:
+            fmt_ok = " ✔️" if validator(sk) else " ✖️"
 
-        # Solver JSON (compact)
-        solver = _build_solver_json(f)
-        json_out = _compact_json(solver)
-        if "\n" in json_out:
-            lines.append(f"│")
-            lines.append(f"│ 📋 *Solver params:*")
-            lines.append(f"```\n{json_out}\n```")
-        else:
-            lines.append(f"│ 📋 `{json_out}`")
+        lines.append(f"*{icon} [{entry_num}]* {badge}{fmt_ok} *{escape_md(cap_type)}*")
+        _sk_safe = sk.replace("`", "'")
+        lines.append(f"  🔑 `{_sk_safe}`")
+        page = f.get("page_url", "")
+        if page:
+            _pg_safe = page[:80].replace("`", "'")
+            lines.append(f"  🌐 `{_pg_safe}`")
+        if f.get("action"):
+            lines.append(f"  ⚡ `{f['action']}`")
+        if f.get("invisible"):
+            lines.append(f"  👁️ invisible")
+        if f.get("min_score"):
+            lines.append(f"  📊 score: `{f['min_score']}`")
+        if f.get("enterprise"):
+            lines.append(f"  🏢 enterprise")
+        src = f.get("source", "")[:60]
+        if src:
+            lines.append(f"  📂 _{escape_md(src)}_")
 
-        lines.append(f"└{'─' * 32}")
+        # ── Clean JSON-style solver params ──────────────────────
+        sp_fields = {}
+        sp_fields["type"]    = cap_type
+        sp_fields["sitekey"] = sk
+        if page:
+            sp_fields["pageurl"] = page
+        if f.get("action"):
+            sp_fields["action"]    = f["action"]
+        if f.get("enterprise"):
+            sp_fields["enterprise"] = 1
+        if f.get("min_score"):
+            sp_fields["min_score"]  = float(f["min_score"])
+        if f.get("invisible"):
+            sp_fields["invisible"]  = 1
+        if f.get("s_param"):
+            sp_fields["data-s"]     = f["s_param"][:40]
+
+        # Align values like JSON
+        max_klen = max(len(k) for k in sp_fields)
+        json_rows = []
+        keys = list(sp_fields.keys())
+        for idx2, (k, v) in enumerate(sp_fields.items()):
+            pad    = " " * (max_klen - len(k))
+            comma  = "," if idx2 < len(keys) - 1 else ""
+            if isinstance(v, str):
+                v_safe = v.replace("`", "'").replace("\\", "/")
+                json_rows.append(f'  "{k}":{pad} "{v_safe}"{comma}')
+            else:
+                json_rows.append(f'  "{k}":{pad} {v}{comma}')
+        json_block = "\n".join(["{"] + json_rows + ["}"])
+        lines.append(f"```\n{json_block}\n```")
         lines.append("")
 
-    # ── Footer ────────────────────────────────────────────────
-    lines += [
-        _HEADER_BAR,
-        "📦 _JSON export ကို solver service တွေမှာ တိုက်ရိုက် သုံးနိုင်ပါသည်_",
-        "⚠️ _Authorized security testing only_",
-    ]
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Authorized testing only_")
+    lines.append("📄 _Full solver params — JSON export ကိုကြည့်ပါ_")
 
     report = "\n".join(lines)
     await safe_markdown_reply(msg, _truncate_safe_md(report))
 
-    # ═══════════════════════════════════════════════════════════
-    # JSON EXPORT
-    # ═══════════════════════════════════════════════════════════
-
+    # ─── Export JSON ─────────────────────────────
     import io as _io
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-
+    ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d    = re.sub(r'[^\w\-]', '_', domain)
     export = {
-        "command":     "sitekey",
-        "domain":      domain,
-        "page_url":    page_url,
-        "scanned_at":  datetime.now().isoformat(),
-        "js_scanned":  js_count,
-        "live_reqs":   live_reqs,
-        "summary": {
-            "total":     len(findings),
-            "confirmed": len(confirmed),
-            "high":      len(high_live),
-            "static":    len(static_only),
-        },
+        "domain":     domain,
+        "page_url":   page_url,
+        "scanned_at": datetime.now().isoformat(),
+        "js_scanned": js_count,
+        "live_requests_captured": live_reqs,
+        "sse_frames_captured": len(live_result.get("sse_frames", [])),
+        "confirmed": len(confirmed),
+        "static_only": len(static_only),
         "findings": [
             {
                 "type":       f.get("type", ""),
@@ -8111,64 +7920,62 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "pageurl":    f.get("page_url", page_url),
                 "action":     f.get("action", ""),
                 "enterprise": 1 if f.get("enterprise") else 0,
-                "min_score":  f.get("min_score", ""),
+                "min_score":  float(f["min_score"]) if f.get("min_score") else None,
                 "invisible":  1 if f.get("invisible") else 0,
-                "data_s":     f.get("s_param", ""),
-                "confidence": f.get("confidence", ""),
+                "data-s":     f.get("s_param", ""),
+                "hl":         f.get("hl", ""),
+                "co":         f.get("co", ""),
+                "callback":   f.get("callback", ""),
                 "user_agent": f.get("user_agent", ""),
+                # ── Solver-ready format (per-service) ──
                 "solver_params": _get_solver_params(f),
             }
+            # FIX: exclude non-captcha types that bleed in from keydump/live pipeline
             for f in findings
+            if not any(f.get("type", "").startswith(pfx) for pfx in (
+                "Live JWT", "Live API", "Live Bearer", "Live AWS",
+                "Live Stripe", "Live OpenAI", "Live storage",
+                "Authorization", "X-Api-Key", "X-Auth-Token",
+            ))
         ],
     }
-
     json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
-    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
-
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
             document=json_buf,
             filename=f"sitekey_{safe_d}_{ts}.json",
             caption=(
-                f"🔑 *Sitekey Report — `{escape_md(domain)}`*\n"
-                f"Found `{escape_md(str(len(findings)))}` │ "
-                f"Confirmed `{escape_md(str(len(confirmed)))}` │ "
-                f"💾 `{json_mb:.2f}` MB"
+                f"🔑 *Site Key Report — `{escape_md(domain)}`*\n"
+                f"Found: `{len(findings)}` | JS: `{escape_md(js_count)}`"
             ),
             parse_mode='Markdown'
         )
     except Exception as e:
         logger.warning("Sitekey export error: %s", e)
 
-    # ── Deobfuscation layer ───────────────────────────────────
+    # ── Deobfuscation layer — obfuscated JS ထဲ ဖျောက်ထားတဲ့ keys ရှာ ─────────
     try:
         texts_for_deob = {}
         for item in result.get("network_log", []):
-            if isinstance(item, dict):
-                ct = item.get("content_type", "") or ""
-                if ct.startswith(("application/javascript", "text/javascript")):
-                    body = item.get("response_body", "") or ""
-                    if body:
-                        lbl = item.get("url", "?").split("/")[-1][:40]
-                        texts_for_deob[lbl] = body
+            if item.get("content_type","").startswith(("application/javascript","text/javascript")):
+                body = item.get("response_body","") or ""
+                if body:
+                    lbl = item.get("url","?").split("/")[-1][:40]
+                    texts_for_deob[lbl] = body
+        # Also include HTML
         texts_for_deob["[HTML]"] = result.get("html", "")
         deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
         if deob_findings:
-            high_deob = [f for f in deob_findings if f.get("in_secret_context") and f.get("entropy", 0) >= 4.5]
+            high_deob = [f for f in deob_findings if f["in_secret_context"] and f["entropy"] >= 4.5]
             if high_deob:
-                deob_lines = [
-                    f"\n🧩 *Deobfuscated Secrets*",
-                    _HEADER_BAR,
-                    f"🌐  `{escape_md(domain)}`",
-                    f"🔴  High-risk decoded: `{escape_md(str(len(high_deob)))}`",
-                    "",
-                ]
-                for j, df in enumerate(high_deob[:8], 1):
-                    deob_lines.append(f"  *{j}.* `{escape_md(str(df.get('method','')))}` H=`{escape_md(str(df.get('entropy','')))}`")
-                    deob_lines.append(f"     `{escape_md(str(df.get('decoded',''))[:80])}`")
-                    deob_lines.append(f"     📂 _{escape_md(str(df.get('source',''))[:50])}_")
-                    deob_lines.append("")
+                deob_lines = [f"\n🧩 *Deobfuscated Secrets — `{escape_md(domain)}`*",
+                              "━━━━━━━━━━━━━━━━━━━━",
+                              f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
+                for i, f in enumerate(high_deob[:8], 1):
+                    deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
+                    deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
+                    deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
                 deob_lines.append("⚠️ _Authorized testing only_")
                 await update.effective_message.reply_text(
                     _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
@@ -12137,18 +11944,21 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
     ]
 
+    # SDKs
     if result["sdk_scripts"]:
         lines.append("*🏦 Payment SDK Scripts:*")
         for gw in result["sdk_scripts"]:
             lines.append(f"  ✅ {gw}")
         lines.append("")
 
+    # CSP gateways
     if result["csp_gateways"]:
         lines.append("*🔐 CSP-Whitelisted Gateways:*")
         for gw in result["csp_gateways"]:
             lines.append(f"  📋 {gw}")
         lines.append("")
 
+    # Key modes
     if result["key_modes"]["live"] or result["key_modes"]["test"]:
         lines.append("*🔑 Key Mode Fingerprint:*")
         for e in result["key_modes"]["live"][:5]:
@@ -12160,11 +11970,13 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
         lines.append("")
 
+    # Currencies
     if result["currencies"]:
         _cur = escape_md(", ".join(result["currencies"][:15]))
         lines.append(f"*💱 Currencies detected:* `{_cur}`")
         lines.append("")
 
+    # Webhook URLs
     if result["webhooks"]:
         lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
         for wh in result["webhooks"][:6]:
@@ -12172,16 +11984,33 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
         lines.append("")
 
+    # Form fields
+    if result["form_fields"]:
+        lines.append("*📋 Payment Form Fields:*")
+        for ff in result["form_fields"]:
+            lines.append(f"  📄 {ff}")
+        lines.append("")
+
+    # 3DS signals
+    if result["threeds"]:
+        lines.append("*🔒 3DS / SCA Signals:*")
+        for s in result["threeds"][:5]:
+            lines.append(f"  ✅ {escape_md(s)}")
+        lines.append("")
+
+    # PCI risks
     if result["pci_risks"]:
         lines.append("*🚨 PCI Risk Findings:*")
         for r in result["pci_risks"][:6]:
             lines.append(f"  {escape_md(r)}")
         lines.append("")
 
+    # PCI SAQ
     if result["pci_saq"]:
         lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
         lines.append("")
 
+    # Security headers
     if result["security_headers"]:
         lines.append("*🛡️ Security Headers:*")
         for k, v in result["security_headers"].items():
@@ -12189,161 +12018,44 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
         lines.append("")
 
-    lines += ["━━━━━━━━━━━━━━━━━━", "⚠️ _Authorized testing only_"]
-    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
-
-    # ── Build findings for solver config section ───────────────────────
-    findings = []
-    for _km_entry in result["key_modes"]["live"] + result["key_modes"]["test"]:
-        if _km_entry.get("value"):  # unmasked value if available
-            findings.append({
-                "type":  _km_entry.get("label", "Payment Key"),
-                "value": _km_entry["value"],
-                "confidence": "HIGH" if "live" in str(_km_entry).lower() else "STATIC",
-            })
-
-    # Solver config section (PATCH 5)
-    # Deduplicate
-    findings = _dedup_by_key(findings, "value")
-
-    lines = [
-        "⚙️ *Solver Configurations*",
-        _HEADER_BAR,
-        f"🌐  `{escape_md(domain)}`",
-        f"🔧  Configs: `{escape_md(str(len(findings)))}` keys",
-        "",
-    ]
-
-    if not findings:
-        lines += [
-            "📭 *Configure လုပ်မယ့် key မရှိပါ*",
-            "",
-            "_`/paykeys <url>` သို့မဟုတ် `/sitekey <url>` အရင် run ပါ_",
-        ]
-        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
-        return
-
-    # ── Per-key solver configs ────────────────────────────────
-    _svc_labels = [
-        ("🟢 Capsolver",    "capsolver"),
-        ("🔵 2Captcha",     "2captcha"),
-        ("🟣 AntiCaptcha",  "anticaptcha"),
-        ("🟠 EzCaptcha",    "ezcaptcha"),
-    ]
-
-    for i, f in enumerate(findings, 1):
-        ftype  = f.get("type", "Unknown")
-        value  = f.get("value") or f.get("site_key") or ""
-        params = f.get("solver_params") or _get_solver_params(f)
-
-        # Environment
-        env_raw = _classify_api_env(ftype, value)
-        env_str = "⚪"
-        for ek, ev in _ENV_LABELS.items():
-            if ek in env_raw:
-                env_str = ev
-                break
-
-        # Provider icon
-        provider = _detect_pay_provider(ftype)
-        p_icon   = _PAY_PROVIDER_ICON.get(provider, "🔑")
-
-        lines.append(f"┌{'─' * 34}")
-        lines.append(f"│ {p_icon} *{i}.*  {escape_md(ftype)}")
-        lines.append(f"│ {env_str}")
-        lines.append(f"│ 🔑 `{_key_safe(value)[:65]}`")
-        lines.append(f"│")
-
-        # Per-service solver configs
-        has_any = False
-        for svc_label, svc_key in _svc_labels:
-            cfg = params.get(svc_key)
-            if not cfg:
-                continue
-            has_any = True
-
-            cfg_out = _compact_json(cfg)
-            lines.append(f"│ {svc_label}:")
-            if "\n" in cfg_out:
-                lines.append(f"│ ```\n{cfg_out}\n```")
-            else:
-                lines.append(f"│ ```{cfg_out}```")
-            lines.append(f"│")
-
-        if not has_any:
-            lines.append(f"│ ⚠️ _Auto-config unavailable for this key type_")
-            lines.append(f"│")
-
-        lines.append(f"└{'─' * 34}")
-        lines.append("")
-
-    # ── Quick start guide ─────────────────────────────────────
     lines += [
-        _HEADER_BAR,
-        "",
-        "📋 *Quick Start — Capsolver:*",
-        "```",
-        "POST https://api.capsolver.com/createTask",
-        "{",
-        '  "clientKey": "YOUR_CAPSOLVER_KEY",',
-        '  "task": { ... config above ... }',
-        "}",
-        "```",
-        "",
-        "📋 *Quick Start — 2Captcha:*",
-        "```",
-        "POST https://2captcha.com/in.php",
-        "  key=YOUR_2CAPTCHA_KEY",
-        "  method=userrecaptcha",
-        "  googlekey=SITE_KEY",
-        "  pageurl=PAGE_URL",
-        "```",
-        "",
-        "⚠️ _YOUR\\_API\\_KEY ကို solver account key နဲ့ အစားထိုးပါ_",
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
     ]
 
     await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
 
-    # ── JSON Export ───────────────────────────────────────────
     import io as _io
     ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d = re.sub(r'[^\w\-]', '_', domain)
-
-    export = {
-        "command":    "payconfig",
-        "domain":     domain,
-        "scanned_at": datetime.now().isoformat(),
-        "total":      len(findings),
-        "configs": [
-            {
-                "type":          f.get("type", ""),
-                "value":         f.get("value") or f.get("site_key") or "",
-                "provider":      _detect_pay_provider(f.get("type", "")),
-                "environment":   _classify_api_env(f.get("type", ""), f.get("value", "")),
-                "solver_params": f.get("solver_params") or _get_solver_params(f),
-            }
-            for f in findings
-        ],
-    }
-
-    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
-    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
-
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
-            document=json_buf,
+            document=_io.BytesIO(json.dumps({
+                "domain":             domain,
+                "page_url":           result["page_url"],
+                "scanned_at":         datetime.now().isoformat(),
+                "gateways":           result["gateways"],
+                "sdk_scripts":        result["sdk_scripts"],
+                "csp_gateways":       result["csp_gateways"],
+                "key_modes":          result["key_modes"],
+                "currencies":         result["currencies"],
+                "webhooks":           result["webhooks"],
+                "form_fields":        result["form_fields"],
+                "threeds_signals":    result["threeds"],
+                "pci_risks":          result["pci_risks"],
+                "pci_saq_estimate":   result["pci_saq"],
+                "security_headers":   result["security_headers"],
+            }, indent=2, ensure_ascii=False).encode()),
             filename=f"payconfig_{safe_d}_{ts}.json",
             caption=(
-                f"⚙️ *Payconfig — `{escape_md(domain)}`*\n"
-                f"Configs `{escape_md(str(len(findings)))}` │ "
-                f"💾 `{json_mb:.2f}` MB\n"
-                f"_Solver-ready JSON — copy to API call_"
+                f"💳 Payment Config — `{escape_md(domain)}`\n"
+                f"🏦 Gateways: `{len(result['gateways'])}` | Mode: {overall_env} | PCI risks: `{vuln_pci}`"
             ),
             parse_mode='Markdown'
         )
     except Exception as e:
-        logger.warning("Payconfig export error: %s", e)
+        logger.warning("payconfig export error: %s", e)
 
 @user_guard
 async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -14532,169 +14244,137 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_result  = result.get("live_result") or {"live_requests":[],"live_findings":[],"sse_frames":[]}
     findings     = _confidence_crossref(raw_findings, live_result)
     page_url     = result["page_url"]
-    js_count     = result.get("requests", 0)
+    reqs         = result.get("requests", 0)
     live_reqs    = len(live_result.get("live_requests", []))
+    extra        = result.get("extra_scans", {})
 
-    # Ensure findings have required fields
-    for _f in findings:
-        if "value" not in _f:
-            _f["value"] = _f.get("site_key", "")
-
-    # Deduplicate
-    findings = _dedup_by_key(findings, "value")
-
-    # Count environments
-    prod_count = sum(1 for f in findings if "PROD" in _classify_api_env(f.get("type", ""), f.get("value", "")))
-    test_count = sum(1 for f in findings if "TEST" in _classify_api_env(f.get("type", ""), f.get("value", "")))
-
-    # Risk level
-    if prod_count >= 2:   risk_lbl = "🔴 CRITICAL"
-    elif prod_count >= 1: risk_lbl = "🟠 HIGH"
-    elif test_count >= 1: risk_lbl = "🟡 MEDIUM"
-    else:                 risk_lbl = "🟢 LOW"
-
-    lines = [
-        "💳 *Payment Keys*",
-        _HEADER_BAR,
-        f"🌐  `{escape_md(domain)}`",
-        f"📄  {_url_short(page_url, 58)}",
-        f"⚠️  Risk: *{risk_lbl}*",
-        "",
-        f"📡  JS `{escape_md(str(js_count))}` │ Live `{escape_md(str(live_reqs))}` │ Keys `{escape_md(str(len(findings)))}`",
-        f"🔴 `{escape_md(str(prod_count))}` production   🟡 `{escape_md(str(test_count))}` test",
-        "",
-    ]
+    confirmed   = [f for f in findings if "CONFIRMED"   in f.get("confidence","")]
+    high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
+    static_only = [f for f in findings if "STATIC"      in f.get("confidence","")]
+    live_keys   = [f for f in findings if f.get("env") == "🔴 LIVE"]
 
     if not findings:
-        lines += [
-            "📭 *Payment key မတွေ့ရှိပါ*",
-            "",
-            "_Possible reasons:_",
-            "  • Payment integration မပါ",
-            "  • Server-side only (no publishable key)",
-            "  • Keys in inaccessible iframe",
-        ]
-        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+        await safe_markdown_reply(msg,
+            f"💳 *Payment Key Extractor v19 — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📭 No payment keys found\n"
+            f"🌐 `{escape_md(page_url)}`\n"
+            f"📡 Static: `{reqs}` | Live: `{live_reqs}`\n"
+            f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | "
+            f"⚙️ SW: `{extra.get('service_workers',0)}` | "
+            f"🔗 Pages: `{extra.get('subpages',0)}`"
+        )
         return
 
-    # ── Group by provider ─────────────────────────────────────
-    grouped = {}
-    for f in findings:
-        provider = _detect_pay_provider(f.get("type", ""))
-        grouped.setdefault(provider, []).append(f)
-
-    # Sort providers: known first
-    _prov_order = list(_PAY_PROVIDER_ICON.keys()) + ["Other"]
-    sorted_provs = sorted(
-        grouped.keys(),
-        key=lambda p: (_prov_order.index(p) if p in _prov_order else 99)
-    )
-
-    entry_num = 0
-    for provider in sorted_provs:
-        p_findings = grouped[provider]
-        p_icon = _PAY_PROVIDER_ICON.get(provider, "💳")
-
-        lines.append(f"{p_icon} *{escape_md(provider)}*")
-        lines.append("")
-
-        for f in p_findings:
-            entry_num += 1
-            ftype      = f.get("type", "Unknown")
-            value      = f.get("value") or f.get("site_key") or ""
-            confidence = f.get("confidence", "STATIC")
-            source     = (f.get("source") or "")[:48]
-            validated  = f.get("validated")
-
-            # Environment badge
-            env_raw = _classify_api_env(ftype, value)
-            env_str = "⚪ —"
-            for ek, ev in _ENV_LABELS.items():
-                if ek in env_raw:
-                    env_str = ev
-                    break
-
-            # Confidence
-            badge = _conf_emoji(confidence)
-            clbl  = _conf_label(confidence)
-
-            # Validation status
-            if validated is True:    valid_str = "✅ Active"
-            elif validated is False: valid_str = "❌ Invalid"
-            else:                    valid_str = "❓ Unverified"
-
-            lines.append(f"  ┌─ *{entry_num}.*  {escape_md(ftype)}")
-            lines.append(f"  │  {env_str}   {badge} {clbl}   {valid_str}")
-            lines.append(f"  │")
-
-            # Full key (copyable)
-            lines.append(f"  │  🔑 *Key:*")
-            lines.append(f"  │  `{_key_safe(value)}`")
-
-            # Source
-            if source:
-                lines.append(f"  │  📂 _{escape_md(source)}_")
-
-            lines.append(f"  └{'─' * 28}")
-            lines.append("")
-
-    # Footer
-    lines += [
-        _HEADER_BAR,
-        "📦 _Full keys + solver configs → JSON export_",
-        "⚠️ _Production keys ကို ခွင့်ပြုချက်မရှိဘဲ မသုံးပါနဲ့_",
+    # ── Build enhanced report ──────────────────────────────────────────────
+    lines = [
+        f"💳 *Payment Keys — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(page_url[:60])}`",
+        f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
+        f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | ⚙️ SW: `{extra.get('service_workers',0)}` | 🔗 Pages: `{extra.get('subpages',0)}`",
+        f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`",
+        "",
     ]
 
-    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+    # Deduplicated ordering: CONFIRMED → LIVE → STATIC
+    seen_vals = set()
+    ordered   = []
+    for f, badge in (
+        [(f, "✅ CONFIRMED") for f in confirmed] +
+        [(f, "🔴 LIVE")      for f in high_live if f not in confirmed] +
+        [(f, "⚠️ STATIC")   for f in static_only]
+    ):
+        k = f.get("value", "")
+        if k not in seen_vals:
+            seen_vals.add(k)
+            ordered.append((f, badge))
 
-    # ── JSON Export ───────────────────────────────────────────
+    for i, (f, badge) in enumerate(ordered[:50], 1):
+        val     = f.get("value", "")
+        env     = f.get("env", _detect_env(f["type"], val))
+        vfy     = f.get("verified", "")
+        vfy_tag = " ✔️" if vfy == "VALID" else (" ✖️" if vfy == "INVALID" else "")
+        conf    = f.get("confidence", "")
+        src_tag = ""
+        if "SOURCEMAP" in conf: src_tag = " 🗺️"
+        elif "SW"      in conf: src_tag = " ⚙️"
+        elif "SUBPAGE" in conf: src_tag = " 🔗"
+        elif "GRAPHQL" in conf: src_tag = " 📐"
+
+        env_warn = " ⚠️" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
+
+        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
+        lines.append(f"  📌 `{escape_md(f['type'])}`")
+        _val_safe = val[:80].replace("`", "'")
+        lines.append(f"  🔑 `{_val_safe}`")
+        _src_safe = f.get('source', '')[:60]
+        lines.append(f"  📂 _{escape_md(_src_safe)}_")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
+
+    # ── Gateway Profile block (v18 unique) ─────────────────────────────────
+    gw_profile = result.get("gateway_profile")
+    if gw_profile:
+        lines += _format_pay_gateway_profile(gw_profile)
+
+    # ── 3DS / SCA Verification block ────────────────────────────────────────
+    tds_result = result.get("tds_result")
+    if tds_result:
+        lines.append("")
+        lines += _fmt_3ds_result(tds_result)
+
+    report = "\n".join(lines)
+
+    await safe_markdown_reply(msg, _truncate_safe_md(report))
+
+    # ── Cache verifiable keys for inline button ────────────────────────────
+    _verifiable_types = {
+        "Stripe Secret Key", "Stripe Publishable Key",
+        "Razorpay Key ID", "Razorpay Key Secret",
+        "Square Access Token", "Square Application ID",
+        "PayPal Client ID", "PayPal Secret",
+    }
+    verifiable = [
+        f for f in findings
+        if f.get("type","") in _verifiable_types and f.get("value","")
+    ]
+    if verifiable:
+        _paykeys_verify_cache[uid] = {
+            "domain":   domain,
+            "findings": verifiable,
+            "ts":       time.time(),
+        }
+
+    # ── Export JSON ────────────────────────────────────────────────────────
     import io as _io
     ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_d = re.sub(r'[^\w\-]', '_', domain)
-
-    export = {
-        "command":    "paykeys",
-        "domain":     domain,
-        "page_url":   page_url,
-        "scanned_at": datetime.now().isoformat(),
-        "summary": {
-            "total":      len(findings),
-            "production": prod_count,
-            "test":       test_count,
-        },
-        "findings": [
-            {
-                "type":        f.get("type", ""),
-                "value":       f.get("value") or f.get("site_key") or "",
-                "provider":    _detect_pay_provider(f.get("type", "")),
-                "environment": _classify_api_env(f.get("type", ""), f.get("value", "")),
-                "confidence":  f.get("confidence", ""),
-                "validated":   f.get("validated"),
-                "source":      f.get("source", ""),
-                "solver_params": _get_solver_params(f),
-            }
-            for f in findings
-        ],
-    }
-
-    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
-    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
-
     try:
         await context.bot.send_document(
             chat_id=update.effective_chat.id,
-            document=json_buf,
+            document=_io.BytesIO(json.dumps({
+                "domain":                  domain,
+                "page_url":                page_url,
+                "scanned_at":             datetime.now().isoformat(),
+                "bot_version":            "v19",
+                "findings":               findings,
+                "live_requests_captured": live_reqs,
+                "sse_frames_captured":    len(live_result.get("sse_frames",[])),
+                "confirmed":              len(confirmed),
+                "live_keys":              len(live_keys),
+                "static_only":            len(static_only),
+                "extra_scans":            extra,
+            }, indent=2, ensure_ascii=False).encode()),
             filename=f"paykeys_{safe_d}_{ts}.json",
             caption=(
-                f"💳 *Paykeys — `{escape_md(domain)}`*\n"
-                f"Keys `{escape_md(str(len(findings)))}` │ "
-                f"Prod `{escape_md(str(prod_count))}` │ "
-                f"💾 `{json_mb:.2f}` MB"
+                f"💳 Payment Keys v19 — `{escape_md(domain)}`\n"
+                f"✅ Confirmed: `{len(confirmed)}` | 🔴 Live: `{len(live_keys)}` | Total: `{len(findings)}`"
             ),
             parse_mode='Markdown'
         )
     except Exception as e:
-        logger.warning("Paykeys export error: %s", e)
+        logger.warning("paykeys export error: %s", e)
 
     # ── Inline verify button (only if verifiable keys exist) ───────────────
     if verifiable:
@@ -25370,181 +25050,29 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
-    # ── Build flat findings list from raw_hits ────────────────────────
+    # ENH K5: Cache key = uid+timestamp to prevent concurrent-run overwrite
     import time as _time
     cache_key = f"{uid}_{int(_time.time())}"
-    _kd_cache[uid] = result
-    _kd_cache[cache_key] = result
+    _kd_cache[uid] = result          # still keep uid lookup for callbacks
+    _kd_cache[cache_key] = result    # timestamped key for concurrent safety
 
-    js_count  = result.get("js_count", 0)
-    page_url  = result.get("url", "")
-    live_result_kd = result.get("live_result") or {}
-    live_reqs = len(live_result_kd.get("live_requests", []))
+    report, _ = _format_keydump_report(result)
 
-    findings = []
-    for _lbl, _vals in result.get("raw_hits", {}).items():
-        for _val in _vals:
-            _badge, _lvl = _kd_confidence(_lbl, _val)
-            findings.append({
-                "type":       _lbl,
-                "value":      _val,
-                "confidence": _lvl,
-                "risk":       "🔴" if _lvl == "HIGH" else "🟡" if _lvl == "MED" else "⚪",
-                "source":     "",
-            })
-
-    # Deduplicate
-    findings = _dedup_by_key(findings, "value")
-
-    # Counts
-    cnt_confirmed = sum(1 for f in findings if "CONFIRMED" in f.get("confidence", ""))
-    cnt_high      = sum(1 for f in findings if "HIGH" in f.get("confidence", ""))
-    cnt_medium    = sum(1 for f in findings if "MEDIUM" in f.get("confidence", "") or f.get("risk") == "🟡")
-    cnt_critical  = sum(1 for f in findings if f.get("risk") == "🔴")
-
-    # Overall risk
-    if cnt_critical >= 3 or cnt_confirmed >= 3:
-        risk_lbl = "🔴 CRITICAL"
-    elif cnt_critical >= 1 or cnt_confirmed >= 1:
-        risk_lbl = "🟠 HIGH"
-    elif cnt_high >= 2 or cnt_medium >= 2:
-        risk_lbl = "🟡 MEDIUM"
-    else:
-        risk_lbl = "🟢 LOW"
-
-    lines = [
-        "🗝️ *API Key Dump*",
-        _HEADER_BAR,
-        f"🌐  `{escape_md(domain)}`",
-        f"⚠️  Risk: *{risk_lbl}*",
-        "",
-        f"📡  JS `{escape_md(str(js_count))}` │ Live `{escape_md(str(live_reqs))}` │ Keys `{escape_md(str(len(findings)))}`",
-        f"🔴 `{escape_md(str(cnt_critical))}` critical   "
-        f"🟠 `{escape_md(str(cnt_high))}` high   "
-        f"🟡 `{escape_md(str(cnt_medium))}` medium",
-        "",
-    ]
-
-    if not findings:
-        lines += [
-            "📭 *API key / secret မတွေ့ရှိပါ*",
-            "",
-            "_Scanned: HTML source + all JS bundles + network traffic_",
-            "_Site may not expose client-side keys._",
-        ]
-        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
-        return
-
-    # ── Group by category ─────────────────────────────────────
-    grouped = {}
-    for f in findings:
-        cat = _categorize_key_type(f.get("type", ""))
-        grouped.setdefault(cat, []).append(f)
-
-    # Sort categories
-    _cat_priority = [
-        "Payment", "AI / ML", "Cloud", "Auth / Token",
-        "Communication", "DevOps", "Database", "Analytics",
-        "Captcha", "Other",
-    ]
-    sorted_cats = sorted(
-        grouped.keys(),
-        key=lambda c: (_cat_priority.index(c) if c in _cat_priority else 99)
-    )
-
-    entry_num = 0
-    for cat in sorted_cats:
-        cat_findings = grouped[cat]
-        cat_icon = _KEY_CAT_ICON.get(cat, "🔑")
-
-        lines.append(f"{cat_icon} *{cat}*  (`{escape_md(str(len(cat_findings)))}`)")
-        lines.append("")
-
-        for f in cat_findings:
-            entry_num += 1
-            ftype      = f.get("type", "Unknown")
-            value      = f.get("value") or f.get("site_key") or ""
-            confidence = f.get("confidence", "")
-            source     = (f.get("source") or "")[:48]
-            risk_icon  = f.get("risk", "")
-
-            # Env detection
-            env_raw = _classify_api_env(ftype, value)
-            env_str = ""
-            for ek, ev in _ENV_LABELS.items():
-                if ek in env_raw:
-                    env_str = f"  {ev}"
-                    break
-
-            badge = _conf_emoji(confidence)
-
-            # Value display (masked for Telegram)
-            val_display = _key_masked(value)
-
-            lines.append(f"  {badge} *{entry_num}.*  {escape_md(ftype)}{env_str}")
-            lines.append(f"       {val_display}")
-            if source:
-                lines.append(f"       📂 _{escape_md(source)}_")
-            lines.append("")
-
-    # Footer
-    lines += [
-        _HEADER_BAR,
-        "📦 _Full unmasked values → JSON export file_",
-        "⚠️ _Authorized security research only_",
-    ]
-
-    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
-
-    # ── JSON Export ───────────────────────────────────────────
-    import io as _io
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-
-    export = {
-        "command":    "keydump",
-        "domain":     domain,
-        "page_url":   page_url,
-        "scanned_at": datetime.now().isoformat(),
-        "summary": {
-            "total":     len(findings),
-            "confirmed": cnt_confirmed,
-            "high":      cnt_high,
-            "critical":  cnt_critical,
-        },
-        "findings": [
-            {
-                "type":        f.get("type", ""),
-                "value":       f.get("value") or f.get("site_key") or "",
-                "confidence":  f.get("confidence", ""),
-                "category":    _categorize_key_type(f.get("type", "")),
-                "environment": _classify_api_env(f.get("type", ""), f.get("value", "")),
-                "source":      f.get("source", ""),
-                "risk":        f.get("risk", ""),
-            }
-            for f in findings
-        ],
-    }
-
-    json_buf = _io.BytesIO(json.dumps(export, indent=2, ensure_ascii=False).encode())
-    json_mb  = json_buf.getbuffer().nbytes / 1024 / 1024
+    total = sum(len(v) for cat in result["by_category"].values() for v in cat.values())
+    kb = _keydump_keyboard(uid) if total > 0 or result["high_entropy"] else None
 
     try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=json_buf,
-            filename=f"keydump_{safe_d}_{ts}.json",
-            caption=(
-                f"🗝️ *Keydump — `{escape_md(domain)}`*\n"
-                f"Keys `{escape_md(str(len(findings)))}` │ "
-                f"Critical `{escape_md(str(cnt_critical))}` │ "
-                f"💾 `{json_mb:.2f}` MB"
-            ),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("Keydump export error: %s", e)
-
+        if len(report) <= 4000:
+            await msg.edit_text(report, parse_mode="Markdown",
+                                reply_markup=kb)
+        else:
+            await msg.edit_text(_truncate_safe_md(report),
+                                parse_mode="Markdown", reply_markup=kb)
+            await update.effective_message.reply_text(
+                report[4000:8000], parse_mode="Markdown")
+    except Exception:
+        await update.effective_message.reply_text(
+            _truncate_safe_md(report), parse_mode="Markdown")
 
 
 async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
