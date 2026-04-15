@@ -25788,16 +25788,36 @@ def _format_keydump_report(result: dict) -> tuple:
     return "\n".join(lines), result
 
 
-def _keydump_keyboard(uid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _keydump_keyboard(uid: int, has_sitekeys: bool = False,
+                      has_stripe: bool = False) -> InlineKeyboardMarkup:
+    rows = [
         [
-            InlineKeyboardButton("📋 Show Raw", callback_data=f"kd_raw_{uid}"),
-            InlineKeyboardButton("🔬 Entropy", callback_data=f"kd_entropy_{uid}"),
+            InlineKeyboardButton("📋 Show Raw",    callback_data=f"kd_raw_{uid}"),
+            InlineKeyboardButton("🔬 Entropy",     callback_data=f"kd_entropy_{uid}"),
         ],
         [
             InlineKeyboardButton("💾 Export JSON", callback_data=f"kd_json_{uid}"),
         ],
-    ])
+    ]
+    # ── Verify row — only shown if verifiable keys found ─────────────────────
+    verify_row = []
+    if has_sitekeys:
+        verify_row.append(
+            InlineKeyboardButton("🔵 Verify Sitekey (2captcha)",
+                                 callback_data=f"kd_verify_2captcha_{uid}")
+        )
+        verify_row.append(
+            InlineKeyboardButton("🟢 CapSolver",
+                                 callback_data=f"kd_verify_capsolver_{uid}")
+        )
+    if has_stripe:
+        verify_row.append(
+            InlineKeyboardButton("💳 Verify Stripe",
+                                 callback_data=f"kd_verify_stripe_{uid}")
+        )
+    if verify_row:
+        rows.append(verify_row)
+    return InlineKeyboardMarkup(rows)
 
 # Global keydump result cache (per uid)
 _kd_cache: dict = {}   # {uid: result_dict}
@@ -25874,7 +25894,38 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report, _ = _format_keydump_report(result)
 
     total = sum(len(v) for cat in result["by_category"].values() for v in cat.values())
-    kb = _keydump_keyboard(uid) if total > 0 or result["high_entropy"] else None
+
+    # ── Detect verifiable keys for smart keyboard ─────────────────────────────
+    sitekeys    = result.get("sitekeys", [])
+    has_sitekeys = bool(sitekeys)
+
+    # Stripe keys in raw_hits
+    stripe_vals = []
+    for label, vals in result.get("raw_hits", {}).items():
+        if "Stripe" in label or "stripe" in label.lower():
+            for v in vals:
+                if re.match(r'^(sk|pk)_(live|test)_', v):
+                    stripe_vals.append({"type": label, "value": v})
+    has_stripe = bool(stripe_vals)
+
+    # Cache stripe findings for verify callback
+    if stripe_vals:
+        result["_stripe_findings"] = stripe_vals
+        _kd_cache[uid] = result
+
+    # Cache sitekeys for sv_ callback (reuse _sitekey_verify_cache)
+    if sitekeys:
+        _sitekey_verify_cache[uid] = {
+            "findings": sitekeys,
+            "domain":   url,
+            "ts":       time.time(),
+        }
+
+    kb = None
+    if total > 0 or result["high_entropy"]:
+        kb = _keydump_keyboard(uid,
+                               has_sitekeys=has_sitekeys,
+                               has_stripe=has_stripe)
 
     try:
         if len(report) <= 4000:
@@ -26002,6 +26053,155 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("✅ JSON exported!", show_alert=False)
         except Exception as e:
             await query.answer(f"Export error: {e}", show_alert=True)
+
+    elif action == "verify":
+        # kd_verify_<service>_<uid>  e.g. kd_verify_2captcha_123 / kd_verify_stripe_123
+        try:
+            service = parts[2]   # 2captcha | capsolver | stripe
+            uid2    = int(parts[3])
+        except Exception:
+            await query.answer("❌ Invalid verify data", show_alert=True)
+            return
+
+        if query.from_user.id != uid2:
+            await query.answer("🚫 သင်မဟုတ်ပါ", show_alert=True)
+            return
+
+        kd_result = _kd_cache.get(uid2)
+        if not kd_result:
+            await query.answer("⚠️ Cache expired — /keydump ထပ်လုပ်ပါ", show_alert=True)
+            return
+
+        # ── Stripe verify ─────────────────────────────────────────────────────
+        if service == "stripe":
+            stripe_findings = kd_result.get("_stripe_findings", [])
+            if not stripe_findings:
+                await query.answer("💳 Stripe keys မတွေ့ပါ", show_alert=True)
+                return
+
+            prog = await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=(
+                    f"💳 *KeyDump — Stripe Verify*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔑 {len(stripe_findings)} key(s) verify လုပ်နေသည်...\n"
+                    f"⏳ Read-only API calls..."
+                ),
+                parse_mode="Markdown"
+            )
+            results = await asyncio.to_thread(_run_verify_all, stripe_findings)
+            domain  = urlparse(kd_result["url"]).netloc
+            report  = _build_verify_report(results, domain)
+            try:
+                await prog.edit_text(_truncate_safe_md(report), parse_mode="Markdown")
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=query.from_user.id,
+                    text=_truncate_safe_md(report),
+                    parse_mode="Markdown"
+                )
+
+        # ── Sitekey verify via 2captcha / capsolver ───────────────────────────
+        elif service in ("2captcha", "capsolver"):
+            sitekeys = kd_result.get("sitekeys", [])
+            if not sitekeys:
+                await query.answer("🔑 Sitekeys မတွေ့ပါ", show_alert=True)
+                return
+
+            apikey = await _get_user_apikey(uid2, service)
+            if not apikey:
+                await query.answer(
+                    f"❌ {service} API key မရှိပါ\n/setapikey {service} YOUR_KEY",
+                    show_alert=True
+                )
+                return
+
+            # Pick first verifiable captcha sitekey
+            f = sitekeys[0]
+            sk       = f.get("site_key") or f.get("value") or ""
+            pageurl  = f.get("page_url") or kd_result.get("url", "")
+            cap_type = f.get("type", "")
+            action_v = f.get("action", "")
+            enterprise = 1 if f.get("enterprise") else 0
+            min_score  = float(f["min_score"]) if f.get("min_score") else 0.0
+            invisible  = 1 if f.get("invisible") else 0
+
+            svc_icon = "🔵" if service == "2captcha" else "🟢"
+            prog = await context.bot.send_message(
+                chat_id=query.from_user.id,
+                text=(
+                    f"{svc_icon} *KeyDump — {service} Verify*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🏷️ `{escape_md(cap_type)}`\n"
+                    f"🔑 `{sk[:30]}...`\n"
+                    f"🌐 `{pageurl[:60]}`\n"
+                    f"⏳ Polling... (max 120s)"
+                ),
+                parse_mode="Markdown"
+            )
+
+            try:
+                if service == "2captcha":
+                    res = await asyncio.to_thread(
+                        _2captcha_solve_sync,
+                        apikey, cap_type, sk, pageurl,
+                        action_v, enterprise, min_score, invisible, ""
+                    )
+                else:
+                    res = await asyncio.to_thread(
+                        _capsolver_solve_sync,
+                        apikey, cap_type, sk, pageurl,
+                        action_v, enterprise, min_score, invisible
+                    )
+            except Exception as e:
+                await prog.edit_text(
+                    f"❌ Exception: `{escape_md(str(e))}`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            token = res.get("token", "")
+            error = res.get("error")
+            cost  = res.get("cost", "")
+
+            if error or not token:
+                await prog.edit_text(
+                    f"{svc_icon} *{service} — ❌ FAILED*\n"
+                    f"🔑 `{sk[:40]}`\n"
+                    f"❌ `{escape_md(str(error or 'No token'))}`",
+                    parse_mode="Markdown"
+                )
+                return
+
+            token_preview = token[:80] + ("..." if len(token) > 80 else "")
+            sp_parts = [
+                f'  "type":    "{cap_type}"',
+                f'  "sitekey": "{sk}"',
+                f'  "pageurl": "{pageurl}"',
+            ]
+            if action_v:   sp_parts.append(f'  "action":  "{action_v}"')
+            if enterprise: sp_parts.append(f'  "enterprise": 1')
+            if min_score:  sp_parts.append(f'  "min_score": {min_score}')
+
+            await prog.edit_text(
+                f"{svc_icon} *{service} — ✅ VERIFIED LIVE*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏷️ `{escape_md(cap_type)}`\n"
+                f"🔑 `{sk}`\n"
+                f"🌐 `{pageurl[:70]}`\n"
+                + (f"⚡ action: `{escape_md(action_v)}`\n" if action_v else "")
+                + (f"🏢 enterprise: `1`\n" if enterprise else "")
+                + (f"📊 min_score: `{min_score}`\n" if min_score else "")
+                + f"\n✅ *Token:*\n"
+                f"```\n{token_preview}\n```\n"
+                + (f"💰 Cost: `{cost}`\n" if cost else "")
+                + f"\n📌 *Solver Params:*\n"
+                f"```json\n{{\n"
+                + "\n".join(sp_parts)
+                + f"\n}}\n```\n"
+                f"⚠️ _Authorized testing only_",
+                parse_mode="Markdown"
+            )
 
 
 # ── /kdexport shortcut ────────────────────────────────────────
