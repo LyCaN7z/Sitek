@@ -7135,7 +7135,7 @@ def _discover_subpage_links(html: str, base_origin: str) -> list:
         path_lower = urlparse(full).path.lower()
         if any(kw in path_lower for kw in keywords):
             found.add(full.split("?")[0])  # strip query params
-    return list(found)[:40]  # cap at 40 discovered links
+    return list(found)[:20]  # cap at 20 discovered links
 
 
 def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
@@ -7160,16 +7160,6 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
         "/auth/login", "/auth/register", "/auth/signup",
         "/contact-us", "/reach-us", "/get-in-touch",
         "/book", "/booking", "/appointment", "/schedule",
-        # ── Payment / checkout deep paths ──
-        "/checkout/payment", "/checkout/step2", "/checkout/confirm",
-        "/store/checkout", "/shop/checkout", "/buy", "/purchase",
-        "/payments/new", "/orders/new", "/subscription/new",
-        "/donate/form", "/donate/now", "/donate/monthly",
-        "/members/signup", "/members/register", "/members/login",
-        "/users/sign_in", "/users/sign_up", "/users/password/new",
-        "/wp-login.php", "/wp-admin/",
-        "/account", "/account/register", "/account/signup",
-        "/profile", "/dashboard",
     ]
 
     all_findings  = []
@@ -7242,11 +7232,6 @@ def _sitekey_with_subpages(url: str, progress_cb=None) -> dict:
                     sub_results[sub_url] = fut.result(timeout=12)
                 except Exception:
                     sub_results[sub_url] = ([], {}, 0)
-                    # ── Count timed-out / failed pages in progress too ──
-                    if progress_cb:
-                        scanned[0] += 1
-                        label = urlparse(sub_url).path or sub_url
-                        progress_cb(f"🔍 Scanning {scanned[0]}/{total} pages... ({label} ⚠️ timeout)")
         except concurrent.futures.TimeoutError:
             for fut in futures:
                 fut.cancel()
@@ -7801,60 +7786,25 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Akamai Bot Manager":    "🟥",
     }
 
-    # Deduplicated ordering:
-    #   Priority 1: CONFIRMED non-CF  (reCAPTCHA/hCaptcha/etc.)
-    #   Priority 2: HIGH-LIVE non-CF
-    #   Priority 3: STATIC non-CF
-    #   Priority 4: CF Turnstile (last — appears on almost every page)
-    def _is_cf(f):
-        return "Turnstile" in f.get("type", "") or "Cloudflare" in f.get("type", "")
-
+    # Deduplicated ordering: CONFIRMED → HIGH → STATIC
     seen_keys = set()
     ordered   = []
-
-    # Non-CF passes first
     for f, badge in (
-        [(f, "✅ CONFIRMED") for f in confirmed  if not _is_cf(f)] +
-        [(f, "🔴 HIGH-LIVE") for f in high_live  if not _is_cf(f) and f not in confirmed] +
-        [(f, "⚠️ STATIC")   for f in static_only if not _is_cf(f)]
+        [(f, "✅ CONFIRMED") for f in confirmed] +
+        [(f, "🔴 HIGH-LIVE") for f in high_live if f not in confirmed] +
+        [(f, "⚠️ STATIC")   for f in static_only]
     ):
         sk = f.get("site_key", "") or f.get("value", "")
         if sk and sk in seen_keys:
             continue
         seen_keys.add(sk)
         ordered.append((f, badge))
-
-    # Remaining non-CF (uncategorised)
+    # Include remaining findings not yet categorized
     for f in findings:
-        if _is_cf(f):
-            continue
         sk = f.get("site_key", "") or f.get("value", "")
         if sk not in seen_keys:
             seen_keys.add(sk)
             ordered.append((f, f.get("confidence", "⚠️ STATIC")))
-
-    # CF Turnstile entries — appended last
-    for f, badge in (
-        [(f, "✅ CONFIRMED") for f in confirmed  if _is_cf(f)] +
-        [(f, "🔴 HIGH-LIVE") for f in high_live  if _is_cf(f)] +
-        [(f, "⚠️ STATIC")   for f in static_only if _is_cf(f)]
-    ):
-        sk = f.get("site_key", "") or f.get("value", "")
-        if sk and sk in seen_keys:
-            continue
-        seen_keys.add(sk)
-        ordered.append((f, badge + " ☁️ CF"))
-
-    for f in findings:
-        if not _is_cf(f):
-            continue
-        sk = f.get("site_key", "") or f.get("value", "")
-        if sk not in seen_keys:
-            seen_keys.add(sk)
-            ordered.append((f, f.get("confidence", "⚠️ STATIC") + " ☁️ CF"))
-
-    cf_count    = sum(1 for f, _ in ordered if _is_cf(f))
-    nonCF_count = len(ordered) - cf_count
 
     lines = [
         f"🔑 *Site Key Extractor — `{escape_md(domain)}`*",
@@ -7862,8 +7812,7 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🌐 Page URL: `{escape_md(page_url)}`",
         f"📡 Static: `{escape_md(js_count)}` JS | Live: `{escape_md(live_reqs)}` requests",
         f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 Live: `{len(high_live)}` | ⚠️ Static: `{len(static_only)}`",
-        f"🔑 Found: `{len(ordered)}` total"
-        + (f" — 🎯 Non-CF: `{nonCF_count}` | ☁️ CF Turnstile: `{cf_count}`" if cf_count else ""),
+        f"🔑 Found: `{len(ordered)}` captcha instance(s)",
         "",
     ]
 
@@ -7897,19 +7846,21 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  🔑 `{_sk_safe}`")
         page = f.get("page_url", "")
         if page:
-            _pg_safe = page[:80].replace("`", "'")
+            _pg_safe = page[:100].replace("`", "'")
             lines.append(f"  🌐 `{_pg_safe}`")
         if f.get("action"):
-            lines.append(f"  ⚡ `{f['action']}`")
+            lines.append(f"  ⚡ action: `{f['action']}`")
         if f.get("invisible"):
             lines.append(f"  👁️ invisible")
         if f.get("min_score"):
             lines.append(f"  📊 score: `{f['min_score']}`")
         if f.get("enterprise"):
             lines.append(f"  🏢 enterprise")
-        src = f.get("source", "")[:60]
+
+        # ── Source info — full URL + extract method ───────────────────────────
+        src = f.get("source", "")
         if src:
-            lines.append(f"  📂 _{escape_md(src)}_")
+            lines.append(f"  📂 *Source:* _{escape_md(src[:150])}_")
 
         # ── Clean JSON-style solver params ──────────────────────
         sp_fields = {}
@@ -7981,9 +7932,9 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
         if kb_rows:
             await update.effective_message.reply_text(
-                f"🔍 *Verify Sitekeys* — `{len(verifiable_findings)}` found\n"
+                f"🔍 *Verify Sitekeys — {len(verifiable_findings)} found*\n"
                 f"_2captcha / CapSolver API key လိုအပ်သည်_\n"
-                f"မရှိသေးလျှင်: `/setapikey 2captcha YOUR_KEY`",
+                f"_မရှိသေးလျှင်: /setapikey 2captcha YOUR\\_KEY_",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb_rows)
             )
@@ -14429,14 +14380,21 @@ def _paykeys_sync(url: str, progress_cb=None) -> dict:
             _add("Stripe PaymentIntent client_secret 🔴", v, cs.get("source","Playwright XHR hook"),
                  confidence="CONFIRMED")
 
-    # ── 10. v19: Optional live Stripe key verification ──────────────────────
-    stripe_findings = [f for f in findings if "Stripe" in f["type"] and "pk_" in f["value"]]
+    # ── 10. v19: Full Stripe key verification with account info ────────────────
+    stripe_findings = [f for f in findings if "Stripe" in f["type"] and
+                       re.match(r'^(pk|sk)_(live|test)_', f.get("value",""))]
     if stripe_findings and progress_cb:
-        progress_cb(f"✅ v19: Verifying {len(stripe_findings)} Stripe key(s) via API...")
-    for f in stripe_findings[:3]:   # cap at 3 to avoid rate-limit
+        progress_cb(f"✅ v19: Verifying {len(stripe_findings)} Stripe key(s) — fetching account info...")
+    for f in stripe_findings[:3]:
+        val = f.get("value", "")
         try:
-            status = _verify_stripe_key_live(f["value"])
-            f["verified"] = status
+            if val.startswith("sk_"):
+                vr = _verify_stripe(val)
+            else:
+                vr = _verify_stripe_publishable(val)
+            f["verified"]      = "VALID" if "✅" in vr.get("status","") else "INVALID"
+            f["verify_status"] = vr.get("status", "")
+            f["account_info"]  = vr.get("account_info", {})
         except Exception:
             pass
 
@@ -14647,8 +14605,39 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"  📌 `{escape_md(f['type'])}`")
         _val_safe = val[:80].replace("`", "'")
         lines.append(f"  🔑 `{_val_safe}`")
-        _src_safe = f.get('source', '')[:60]
-        lines.append(f"  📂 _{escape_md(_src_safe)}_")
+
+        # ── Source info — full URL + extract method ───────────────────────────
+        src_full = f.get("source", "")
+        if src_full:
+            lines.append(f"  📂 _{escape_md(src_full[:120])}_")
+
+        # ── Stripe account_info block (auto-verified) ─────────────────────────
+        ai = f.get("account_info") or {}
+        vs = f.get("verify_status", "")
+        if ai and "Stripe" in f.get("type", ""):
+            lines.append(f"  ┌ *Stripe Account Info* {vs}")
+            if ai.get("business_name"):
+                lines.append(f"  │ 🏢 `{escape_md(str(ai['business_name']))}`")
+            if ai.get("country"):
+                lines.append(f"  │ 🌏 Country: `{ai['country'].upper()}`")
+            if ai.get("default_currency"):
+                lines.append(f"  │ 💱 Currency: `{ai['default_currency'].upper()}`")
+            if ai.get("account_type"):
+                lines.append(f"  │ 📋 Type: `{escape_md(str(ai['account_type']))}`")
+            if ai.get("charges_enabled") is not None:
+                lines.append(f"  │ 💳 Charges: {'✅' if ai['charges_enabled'] else '❌'}")
+            if ai.get("payouts_enabled") is not None:
+                lines.append(f"  │ 💸 Payouts: {'✅' if ai['payouts_enabled'] else '❌'}")
+            if ai.get("email"):
+                lines.append(f"  │ 📧 `{escape_md(str(ai['email']))}`")
+            if ai.get("account_id"):
+                lines.append(f"  │ 🆔 `{escape_md(str(ai['account_id'])[:24])}`")
+            lm = ai.get("livemode")
+            if lm is not None:
+                lines.append(f"  └ 📡 livemode: `{lm}`")
+        elif vs:
+            lines.append(f"  ✅ `{escape_md(vs)}`")
+
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━\n⚠️ _Authorized testing only_")
@@ -26004,13 +25993,14 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parts  = data.split("_")
         action = parts[1]                    # raw / entropy / json / verify
-        # kd_verify_2captcha_UID  → parts = ["kd","verify","2captcha","UID"]
-        # kd_raw_UID              → parts = ["kd","raw","UID"]
+        # kd_verify_2captcha_123 → parts[2]="2captcha", parts[3]="123"
+        # kd_raw_123            → parts[2]="123"
         if action == "verify":
             uid = int(parts[3])
         else:
             uid = int(parts[2])
     except Exception:
+        await query.answer("❌ Parse error", show_alert=True)
         return
 
     # Only the requesting user can use the buttons
@@ -26114,7 +26104,7 @@ async def keydump_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # kd_verify_<service>_<uid>  e.g. kd_verify_2captcha_123 / kd_verify_stripe_123
         try:
             service = parts[2]   # 2captcha | capsolver | stripe
-            uid2    = uid        # already parsed above
+            uid2    = int(parts[3])
         except Exception:
             await query.answer("❌ Invalid verify data", show_alert=True)
             return
