@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║       Website Downloader Bot  v17.0  (Secure+Full Edition)  ║
+# ║       Website Downloader Bot  v18.0  (Enhanced Edition)     ║
 # ║  ✅ SSRF Protection       ✅ Path Traversal Fix             ║
 # ║  ✅ DB Race Condition Fix  ✅ Rate Limiting                  ║
 # ║  ✅ Subprocess Injection   ✅ Log Sanitization              ║
@@ -12,6 +12,8 @@
 # ║  ✅ /tech Fingerprint       ✅ /extract Secret Scanner      ║
 # ║  ✅ /monitor Alerts         ✅ /bypass403 Bypass Tester     ║
 # ║  ✅ /subdomains Enum        ✅ /fuzz Path+Param Fuzzer      ║
+# ║  ✅ v18: +20 captcha types  ✅ v18: +30 payment gateways   ║
+# ║  ✅ v18: +25 KD patterns    ✅ v18: Region/BNPL tagging    ║
 # ╚══════════════════════════════════════════════════════════════╝
 #
 # Server Setup:
@@ -5103,6 +5105,42 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'altcha-widget|<altcha-widget', re.I),
         re.compile(r'altcha\.org/api/v1/challenge', re.I),
     ],
+    # ★ NEW: Tencent Captcha (TCaptcha) — widely used in Asia
+    "Tencent Captcha": [
+        re.compile(r'TencentCaptcha\s*\(\s*["\'](\d{10})["\']', re.I),
+        re.compile(r'data-appid=["\'](\d{10})["\']', re.I),
+        re.compile(r'captcha\.qq\.com[^\'"]*appid=(\d{10})', re.I),
+        re.compile(r'TCaptcha\.init\s*\(\s*["\'](\d{10})["\']', re.I),
+    ],
+    # ★ NEW: Yandex SmartCaptcha
+    "Yandex SmartCaptcha": [
+        re.compile(r'smartcaptcha\.yandex\.ru/captcha\.js\?sitekey=([A-Za-z0-9_\-]{20,80})', re.I),
+        re.compile(r'data-sitekey=["\']([A-Za-z0-9_\-]{20,80})["\'](?=[^>]*yandex)', re.I),
+        re.compile(r'SmartCaptcha\.render[^)]*sitekey\s*:\s*["\']([A-Za-z0-9_\-]{20,80})["\']', re.I),
+    ],
+    # ★ NEW: BotPoison
+    "BotPoison": [
+        re.compile(r'botpoison\.com/static/[^\'"]+\.js', re.I),
+        re.compile(r'(?:BOTPOISON_PUBLIC_KEY|botpoison[_\-]?key)\s*[=:]\s*["\']?(pk_[A-Za-z0-9_\-]{20,60})', re.I),
+        re.compile(r'Botpoison\(\s*["\']?(pk_[A-Za-z0-9_\-]{20,60})["\']?', re.I),
+    ],
+    # ★ NEW: Lemin Cropped Captcha
+    "Lemin Captcha": [
+        re.compile(r'lemin-cropped-captcha[^>]*captchaId=["\']([A-Za-z0-9_\-]{10,40})["\']', re.I),
+        re.compile(r'leminCropped\.load\(["\']([A-Za-z0-9_\-]{10,40})["\']', re.I),
+        re.compile(r'lemin\.smart-lemon\.com[^\'"]*captcha_id=([A-Za-z0-9_\-]{10,40})', re.I),
+    ],
+    # ★ NEW: GeeTest v4 (separate from v3)
+    "GeeTest v4": [
+        re.compile(r'initGeetest4\s*\([^)]*["\']captchaId["\']\s*:\s*["\']([a-f0-9]{32})["\']', re.I),
+        re.compile(r'gt4\s*:\s*["\']([a-f0-9]{32})["\']', re.I),
+        re.compile(r'captchaId\s*:\s*["\']([a-f0-9]{32})["\'](?=[^}]*geetest)', re.I),
+    ],
+    # ★ NEW: Capy Puzzle Captcha
+    "Capy Puzzle": [
+        re.compile(r'capy\.com/puzzle/[^\'"]*api_key=([A-Za-z0-9_]{20,60})', re.I),
+        re.compile(r'Capy\.setup\s*\(["\']([A-Za-z0-9_]{20,60})["\']', re.I),
+    ],
 }
 
 # ── Key format validators ──────────────────────────────────────────────────────
@@ -5150,6 +5188,20 @@ _KEY_VALIDATORS = {
     "mCaptcha":             lambda k: (
         20 <= len(k) <= 60 and bool(re.match(r'^[A-Za-z0-9_]+$', k))
     ),
+    # ── Tencent Captcha (10-digit numeric appId) ─────────────────────────────
+    "Tencent Captcha":      lambda k: bool(re.match(r'^\d{10}$', k)),
+    # ── Yandex SmartCaptcha (20-80 alphanum) ─────────────────────────────────
+    "Yandex SmartCaptcha":  lambda k: (
+        20 <= len(k) <= 80 and bool(re.match(r'^[A-Za-z0-9_\-]+$', k))
+    ),
+    # ── BotPoison (pk_ prefix) ───────────────────────────────────────────────
+    "BotPoison":            lambda k: bool(re.match(r'^pk_[A-Za-z0-9_\-]{20,60}$', k)),
+    # ── Lemin Captcha (10-40 alphanum) ───────────────────────────────────────
+    "Lemin Captcha":        lambda k: (
+        10 <= len(k) <= 40 and bool(re.match(r'^[A-Za-z0-9_\-]+$', k))
+    ),
+    # ── GeeTest v4 (32-char hex, same as v3) ─────────────────────────────────
+    "GeeTest v4":           lambda k: bool(re.match(r'^[0-9a-f]{32}$', k, re.I)),
 }
 
 # ENH15: API live validators dict used by _validate_api_key
@@ -5271,12 +5323,18 @@ _CAPTCHA_SCAN_ORDER = [
     "hCaptcha",
     "Cloudflare Turnstile",
     "FunCaptcha",
+    "GeeTest v4",
     "GeeTest",
     "reCAPTCHA v3",
     "reCAPTCHA v2",
     "FriendlyCaptcha",
     "mCaptcha",
     "MTCaptcha",
+    "Tencent Captcha",
+    "Yandex SmartCaptcha",
+    "BotPoison",
+    "Lemin Captcha",
+    "Capy Puzzle",
     "Kasada Bot Defense",
     "Akamai Bot Manager",
     "DataDome",
@@ -5302,6 +5360,12 @@ _CAPTCHA_SCRIPT_SIGS = {
     "PerimeterX/HUMAN":     ["px-cloud.net", "perimeterx.net"],
     "AWS WAF Captcha":      ["captcha.us-east-1.amazonaws.com"],
     "Altcha":               ["altcha.org", "altcha-widget"],
+    "Tencent Captcha":      ["captcha.qq.com", "t.captcha.qq.com"],
+    "Yandex SmartCaptcha":  ["smartcaptcha.yandex.ru"],
+    "BotPoison":            ["botpoison.com/static"],
+    "Lemin Captcha":        ["lemin.smart-lemon.com"],
+    "GeeTest v4":           ["static.geetest.com/v4", "gcaptcha4.geetest.com"],
+    "Capy Puzzle":          ["capy.com/puzzle"],
 }
 
 
@@ -7898,6 +7962,22 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append("⚠️ _Authorized testing only_")
     lines.append("📄 _Full solver params — JSON export ကိုကြည့်ပါ_")
+
+    # ── Copy-Ready Quick Summary ──────────────────────────────────────────────
+    if ordered:
+        lines.append("")
+        lines.append("*📋 Quick Copy — Solver-Ready Keys:*")
+        for f, badge in ordered[:5]:
+            cap_type = f.get("type", "")
+            if not any(ct in cap_type for ct in _CAPTCHA_TYPES):
+                continue
+            sk = f.get("site_key", "") or f.get("value", "") or "N/A"
+            pg = f.get("page_url", page_url) or page_url
+            _sk_s = sk.replace("`", "'")
+            _pg_s = pg[:80].replace("`", "'")
+            env_badge = "🔴 LIVE" if "CONFIRMED" in badge or "HIGH" in badge else "⚠️ STATIC"
+            lines.append(f"  `{_sk_s}` — {env_badge}")
+            lines.append(f"  🌐 `{_pg_s}`")
 
     report = "\n".join(lines)
     await safe_markdown_reply(msg, _truncate_safe_md(report))
@@ -11709,6 +11789,38 @@ _PAY_CSP_DOMAINS = {
     "affirm.com":            "Affirm",
     "afterpay.com":          "Afterpay",
     "clearpay.co.uk":        "Clearpay",
+    # ── SEA / APAC ─────────────────────────────────────────────────────────
+    "xendit.co":             "Xendit",
+    "midtrans.com":          "Midtrans",
+    "snap.midtrans.com":     "Midtrans Snap",
+    "hit-pay.com":           "HitPay",
+    "billplz.com":           "Billplz",
+    "toyyibpay.com":         "ToyyibPay",
+    "paidy.com":             "Paidy",
+    # ── MENA ───────────────────────────────────────────────────────────────
+    "tap.company":           "Tap Payments",
+    "b.tap.company":         "Tap Payments CDN",
+    # ── LatAm ──────────────────────────────────────────────────────────────
+    "mercadopago.com":       "Mercado Pago",
+    "sdk.mercadopago.com":   "Mercado Pago SDK",
+    "pagseguro.uol.com.br":  "PagSeguro",
+    "dlocal.com":            "Dlocal",
+    # ── Europe extras ──────────────────────────────────────────────────────
+    "vivapayments.com":      "Viva Wallet",
+    "nuvei.com":             "Nuvei",
+    "buckaroo.nl":           "Buckaroo",
+    # ── Africa ─────────────────────────────────────────────────────────────
+    "payfast.co.za":         "PayFast",
+    # ── BNPL extras ────────────────────────────────────────────────────────
+    "sezzle.com":            "Sezzle",
+    "zip.co":                "Zip",
+    "splitit.com":           "Splitit",
+    "scalapay.com":          "Scalapay",
+    "atome.sg":              "Atome",
+    # ── Crypto ─────────────────────────────────────────────────────────────
+    "commerce.coinbase.com": "Coinbase Commerce",
+    "nowpayments.io":        "NOWPayments",
+    "cryptomus.com":         "Cryptomus",
 }
 
 # ── Webhook URL patterns ───────────────────────────────────────────────────
@@ -11843,26 +11955,66 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
     # ── 4. SDK <script> tag fingerprint ──────────────────────────────────────
     if progress_cb: progress_cb("🏦 Fingerprinting payment SDK scripts...")
     _SDK_PATTERNS = [
-        (re.compile(r'js\.stripe\.com'),        "Stripe JS SDK"),
-        (re.compile(r'checkout\.stripe\.com'),   "Stripe Checkout"),
-        (re.compile(r'braintreegateway\.com'),    "Braintree JS"),
-        (re.compile(r'paypal\.com/sdk/js'),       "PayPal SDK"),
-        (re.compile(r'www\.paypalobjects\.com'), "PayPal Legacy"),
-        (re.compile(r'js\.razorpay\.com'),       "Razorpay JS"),
-        (re.compile(r'js\.squareup\.com'),       "Square Web SDK"),
-        (re.compile(r'checkout\.adyen\.com'),    "Adyen Web"),
-        (re.compile(r'x\.klarnacdn\.net'),       "Klarna JS"),
-        (re.compile(r'buy\.paddle\.com'),        "Paddle.js"),
-        (re.compile(r'mollie\.com'),              "Mollie JS"),
-        (re.compile(r'paystack\.com/popup'),      "Paystack Popup"),
-        (re.compile(r'flutterwave\.com'),         "Flutterwave JS"),
-        (re.compile(r'checkout\.com'),            "Checkout.com"),
-        (re.compile(r'pay\.google\.com'),        "Google Pay API"),
-        (re.compile(r'apple(?:pay)?\.com'),       "Apple Pay"),
-        (re.compile(r'shop\.app/pay'),            "Shop Pay"),
-        (re.compile(r'cashfree\.com'),            "Cashfree"),
-        (re.compile(r'payu\.in|payu\.com'),      "PayU"),
-        (re.compile(r'coinbase\.com/commerce'),   "Coinbase Commerce"),
+        # ── Global ───────────────────────────────────────────────────────────
+        (re.compile(r'js\.stripe\.com'),                "Stripe JS SDK"),
+        (re.compile(r'checkout\.stripe\.com'),          "Stripe Checkout"),
+        (re.compile(r'braintreegateway\.com'),          "Braintree JS"),
+        (re.compile(r'paypal\.com/sdk/js'),             "PayPal SDK"),
+        (re.compile(r'www\.paypalobjects\.com'),        "PayPal Legacy"),
+        (re.compile(r'js\.razorpay\.com'),              "Razorpay JS"),
+        (re.compile(r'js\.squareup\.com'),              "Square Web SDK"),
+        (re.compile(r'checkout\.adyen\.com'),           "Adyen Web"),
+        (re.compile(r'x\.klarnacdn\.net'),              "Klarna JS"),
+        (re.compile(r'buy\.paddle\.com'),               "Paddle.js"),
+        (re.compile(r'mollie\.com'),                    "Mollie JS"),
+        (re.compile(r'paystack\.com/popup'),            "Paystack Popup"),
+        (re.compile(r'flutterwave\.com'),               "Flutterwave JS"),
+        (re.compile(r'checkout\.com'),                  "Checkout.com"),
+        (re.compile(r'pay\.google\.com'),               "Google Pay API"),
+        (re.compile(r'apple(?:pay)?\.com'),             "Apple Pay"),
+        (re.compile(r'shop\.app/pay'),                  "Shop Pay"),
+        (re.compile(r'cashfree\.com'),                  "Cashfree"),
+        (re.compile(r'payu\.in|payu\.com'),             "PayU"),
+        (re.compile(r'coinbase\.com/commerce'),         "Coinbase Commerce"),
+        # ── SEA / APAC ───────────────────────────────────────────────────────
+        (re.compile(r'app\.xendit\.co|js\.xendit\.co'), "Xendit JS"),
+        (re.compile(r'snap\.midtrans\.com'),            "Midtrans Snap"),
+        (re.compile(r'api\.midtrans\.com'),             "Midtrans API"),
+        (re.compile(r'hit-pay\.com'),                   "HitPay"),
+        (re.compile(r'billplz\.com'),                   "Billplz"),
+        (re.compile(r'toyyibpay\.com'),                 "ToyyibPay"),
+        (re.compile(r'paidy\.com'),                     "Paidy"),
+        (re.compile(r'ipay88\.com'),                    "iPay88"),
+        (re.compile(r'2c2p\.com'),                      "2C2P"),
+        (re.compile(r'omise\.co'),                      "Omise"),
+        # ── MENA ─────────────────────────────────────────────────────────────
+        (re.compile(r'tap\.company|b\.tap\.company'),   "Tap Payments"),
+        (re.compile(r'hesabe\.com'),                    "Hesabe"),
+        (re.compile(r'paymob\.com'),                    "Paymob"),
+        (re.compile(r'fawry\.com'),                     "Fawry"),
+        # ── LatAm ────────────────────────────────────────────────────────────
+        (re.compile(r'sdk\.mercadopago\.com'),          "Mercado Pago SDK"),
+        (re.compile(r'pagseguro\.uol\.com\.br'),        "PagSeguro"),
+        (re.compile(r'dlocal\.com'),                    "Dlocal"),
+        (re.compile(r'culqi\.com'),                     "Culqi"),
+        (re.compile(r'wompi\.co'),                      "Wompi"),
+        # ── Europe extras ────────────────────────────────────────────────────
+        (re.compile(r'vivapayments\.com'),              "Viva Wallet"),
+        (re.compile(r'nuvei\.com'),                     "Nuvei"),
+        (re.compile(r'buckaroo\.nl'),                   "Buckaroo"),
+        # ── Africa ───────────────────────────────────────────────────────────
+        (re.compile(r'payfast\.co\.za'),                "PayFast"),
+        (re.compile(r'peachpayments\.com'),             "Peach Payments"),
+        # ── BNPL ─────────────────────────────────────────────────────────────
+        (re.compile(r'sezzle\.com'),                    "Sezzle"),
+        (re.compile(r'zip\.co|quadpay\.com'),           "Zip/QuadPay"),
+        (re.compile(r'splitit\.com'),                   "Splitit"),
+        (re.compile(r'scalapay\.com'),                  "Scalapay"),
+        (re.compile(r'atome\.sg'),                      "Atome"),
+        # ── Crypto ───────────────────────────────────────────────────────────
+        (re.compile(r'nowpayments\.io'),                "NOWPayments"),
+        (re.compile(r'cryptomus\.com'),                 "Cryptomus"),
+        (re.compile(r'bitpay\.com'),                    "BitPay"),
     ]
     sdk_seen = set()
     for pat, sdk_name in _SDK_PATTERNS:
@@ -11874,17 +12026,29 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
     # ── 5. Key mode detection (live vs test) ──────────────────────────────────
     if progress_cb: progress_cb("🔑 Detecting payment key modes (live/test)...")
     _KEY_MODE_PATS = [
-        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live PK", True),
-        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test PK", False),
-        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live SK ⚠️", True),
-        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test SK", False),
-        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'), "Razorpay Live", True),
-        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'), "Razorpay Test", False),
-        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),      "Flutterwave Live PK", True),
-        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'), "Flutterwave Test PK", False),
+        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),   "Stripe Live PK",        True),
+        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),   "Stripe Test PK",        False),
+        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),   "Stripe Live SK ⚠️",     True),
+        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),   "Stripe Test SK",        False),
+        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'),  "Razorpay Live",         True),
+        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'),  "Razorpay Test",         False),
+        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),       "Flutterwave Live PK",   True),
+        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'),  "Flutterwave Test PK",   False),
         (re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b'), "Checkout.com Key", None),
-        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live", True),
-        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox", False),
+        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live",           True),
+        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox",        False),
+        # ── SEA ──────────────────────────────────────────────────────────────
+        (re.compile(r'\b(xnd_public_production_[A-Za-z0-9]{30,80})\b'), "Xendit Live PK", True),
+        (re.compile(r'\b(xnd_public_development_[A-Za-z0-9]{30,80})\b'),"Xendit Dev PK",  False),
+        (re.compile(r'\b(Mid-client-[A-Za-z0-9_\-]{20,50})\b'),         "Midtrans Live",  True),
+        (re.compile(r'\b(SB-Mid-client-[A-Za-z0-9_\-]{20,50})\b'),      "Midtrans Sandbox",False),
+        # ── LatAm ────────────────────────────────────────────────────────────
+        (re.compile(r'\b(APP_USR-[A-Za-z0-9\-]{20,80})\b'),  "Mercado Pago Live PK", True),
+        (re.compile(r'\b(TEST-[A-Za-z0-9\-]{20,80})\b'),      "Mercado Pago Test",   False),
+        # ── Stripe extras ────────────────────────────────────────────────────
+        (re.compile(r'\b(ek_live_[A-Za-z0-9]{24,80})\b'),     "Stripe Ephemeral Live",True),
+        (re.compile(r'\b(ek_test_[A-Za-z0-9]{24,80})\b'),     "Stripe Ephemeral Test",False),
+        (re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b'),        "Stripe Webhook Secret ⚠️", True),
     ]
     mode_seen = set()
     for pat, label, is_live in _KEY_MODE_PATS:
@@ -11932,13 +12096,22 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
     # ── 9. 3DS / SCA signal detection ────────────────────────────────────────
     _3DS_QUICK = [
         (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction|authenticateSource'), "Stripe 3DS confirmPayment"),
-        (re.compile(r'(?i)stripe\.confirmCardPayment'),        "Stripe confirmCardPayment"),
+        (re.compile(r'(?i)stripe\.confirmCardPayment'),          "Stripe confirmCardPayment"),
         (re.compile(r'(?i)paymentIntent\.status.*requires_action'), "PaymentIntent requires_action"),
         (re.compile(r'(?i)threeDS(?:Method|Result|Fingerprint)'), "Adyen/Generic 3DS fingerprint"),
-        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),         "3D Secure reference"),
-        (re.compile(r'(?i)\.redirect(?:To)?3ds'),               "redirect3DS call"),
-        (re.compile(r'(?i)authentication_required'),             "authentication_required status"),
+        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),          "3D Secure reference"),
+        (re.compile(r'(?i)\.redirect(?:To)?3ds'),                 "redirect3DS call"),
+        (re.compile(r'(?i)authentication_required'),              "authentication_required status"),
         (re.compile(r'(?i)sca[_\-]?(?:required|enforcement|challenge)'), "SCA enforcement"),
+        # ── NEW ────────────────────────────────────────────────────────────────
+        (re.compile(r'(?i)payer_auth|payerAuth|payerAuthentication'), "Cybersource Payer Auth"),
+        (re.compile(r'(?i)challengeWindowSize|challengeCompletion'),  "3DS2 Challenge Window"),
+        (re.compile(r'(?i)threeDSecureUsage|three_d_secure_usage'),   "Stripe 3DS usage field"),
+        (re.compile(r'(?i)verifyEnrolled|enrollmentCheck|eci='),       "3DS Enrollment check"),
+        (re.compile(r'(?i)deviceFingerprint.*payment|paymentDeviceFP'),"Device fingerprint (3DS2)"),
+        (re.compile(r'(?i)authenticationValue|cavv=|xid='),            "CAVV/XID 3DS value"),
+        (re.compile(r'(?i)stripe\.createPaymentMethod.*3d'),           "Stripe 3DS PaymentMethod"),
+        (re.compile(r'(?i)adyen.*action.*threeDS|handleAction.*threeD'),"Adyen 3DS handleAction"),
     ]
     for pat, label in _3DS_QUICK:
         if pat.search(combined) and label not in result["threeds"]:
@@ -12056,30 +12229,55 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vuln_pci    = len(result["pci_risks"])
     overall_env = ("🔴 LIVE" if live_count else "🟢 TEST" if test_count else "⚪ UNKNOWN")
 
+    # ── Region / category tagging ───────────────────────────────────────────
+    _BNPL_GWS   = {"Klarna","Afterpay","Clearpay","Affirm","Sezzle","Zip","QuadPay",
+                   "Splitit","Scalapay","Paidy","Atome","Laybuy"}
+    _SEA_GWS    = {"Xendit","Midtrans","HitPay","Billplz","ToyyibPay","iPay88","2C2P","Omise"}
+    _MENA_GWS   = {"Tap Payments","Hesabe","Paymob","Fawry"}
+    _LATAM_GWS  = {"Mercado Pago","PagSeguro","Dlocal","Culqi","Wompi"}
+    _CRYPTO_GWS = {"Coinbase Commerce","NOWPayments","Cryptomus","BitPay"}
+
+    all_gws = set(result["gateways"])
+    region_tags = []
+    if all_gws & _SEA_GWS:    region_tags.append("🌏 SEA")
+    if all_gws & _MENA_GWS:   region_tags.append("🌍 MENA")
+    if all_gws & _LATAM_GWS:  region_tags.append("🌎 LatAm")
+    if all_gws & _BNPL_GWS:   region_tags.append("🏦 BNPL")
+    if all_gws & _CRYPTO_GWS: region_tags.append("₿ Crypto")
+    region_str = "  ".join(region_tags)
+
     lines = [
         f"💳 *Payment Config Audit — `{escape_md(domain)}`*",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🌐 `{escape_md(result['page_url'][:80])}`",
         f"🏦 Gateways: `{len(result['gateways'])}` detected | Mode: *{overall_env}*",
-        f"⚠️ PCI Risks: `{vuln_pci}` | 3DS signals: `{len(result['threeds'])}`",
+        f"⚠️ PCI Risks: `{vuln_pci}` | 🔒 3DS signals: `{len(result['threeds'])}`",
+        *(([f"🌐 Region: {region_str}"]) if region_str else []),
         "",
     ]
 
-    # SDKs
+    # ── SDKs (grouped by region) ─────────────────────────────────────────────
     if result["sdk_scripts"]:
         lines.append("*🏦 Payment SDK Scripts:*")
-        for gw in result["sdk_scripts"]:
-            lines.append(f"  ✅ {gw}")
+        sdk_set = set(result["sdk_scripts"])
+        # BNPL group
+        bnpl_found = [g for g in result["sdk_scripts"] if any(b in g for b in _BNPL_GWS)]
+        sea_found  = [g for g in result["sdk_scripts"] if any(s in g for s in _SEA_GWS)]
+        other      = [g for g in result["sdk_scripts"]
+                      if g not in bnpl_found and g not in sea_found]
+        for gw in other:     lines.append(f"  ✅ {gw}")
+        for gw in sea_found: lines.append(f"  🌏 {gw}")
+        for gw in bnpl_found:lines.append(f"  🏦 {gw} _(BNPL)_")
         lines.append("")
 
-    # CSP gateways
+    # ── CSP gateways ─────────────────────────────────────────────────────────
     if result["csp_gateways"]:
         lines.append("*🔐 CSP-Whitelisted Gateways:*")
         for gw in result["csp_gateways"]:
             lines.append(f"  📋 {gw}")
         lines.append("")
 
-    # Key modes
+    # ── Key modes ────────────────────────────────────────────────────────────
     if result["key_modes"]["live"] or result["key_modes"]["test"]:
         lines.append("*🔑 Key Mode Fingerprint:*")
         for e in result["key_modes"]["live"][:5]:
@@ -12091,13 +12289,13 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
         lines.append("")
 
-    # Currencies
+    # ── Currencies ───────────────────────────────────────────────────────────
     if result["currencies"]:
         _cur = escape_md(", ".join(result["currencies"][:15]))
         lines.append(f"*💱 Currencies detected:* `{_cur}`")
         lines.append("")
 
-    # Webhook URLs
+    # ── Webhook URLs ─────────────────────────────────────────────────────────
     if result["webhooks"]:
         lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
         for wh in result["webhooks"][:6]:
@@ -12105,38 +12303,40 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
         lines.append("")
 
-    # Form fields
+    # ── Form fields ──────────────────────────────────────────────────────────
     if result["form_fields"]:
         lines.append("*📋 Payment Form Fields:*")
         for ff in result["form_fields"]:
-            lines.append(f"  📄 {ff}")
+            icon = "🚨" if any(x in ff for x in ("Card Number","CVV","CVC")) else "📄"
+            lines.append(f"  {icon} {ff}")
         lines.append("")
 
-    # 3DS signals
+    # ── 3DS signals ──────────────────────────────────────────────────────────
     if result["threeds"]:
-        lines.append("*🔒 3DS / SCA Signals:*")
-        for s in result["threeds"][:5]:
+        lines.append(f"*🔒 3DS / SCA Signals ({len(result['threeds'])}):*")
+        for s in result["threeds"][:8]:
             lines.append(f"  ✅ {escape_md(s)}")
         lines.append("")
 
-    # PCI risks
+    # ── PCI risks ────────────────────────────────────────────────────────────
     if result["pci_risks"]:
         lines.append("*🚨 PCI Risk Findings:*")
         for r in result["pci_risks"][:6]:
             lines.append(f"  {escape_md(r)}")
         lines.append("")
 
-    # PCI SAQ
+    # ── PCI SAQ ──────────────────────────────────────────────────────────────
     if result["pci_saq"]:
         lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
         lines.append("")
 
-    # Security headers
+    # ── Security headers ─────────────────────────────────────────────────────
     if result["security_headers"]:
         lines.append("*🛡️ Security Headers:*")
         for k, v in result["security_headers"].items():
             _v = v[:60].replace("`", "'")
             lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
+
         lines.append("")
 
     lines += [
@@ -12715,6 +12915,45 @@ _PAY_PATTERNS = [
     ("Midtrans Client Key",          re.compile(r'\b((?:Mid-client|SB-Mid-client)-[A-Za-z0-9_\-]{20,50})\b')),
     # ══ Payhere (Sri Lanka) ═══════════════════════════════════════════════════
     ("Payhere Merchant ID",          re.compile(r'(?i)payhere[_-]?merchant[_-]?(?:id|secret)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
+    # ══ NEW: Tap Payments (MENA) ══════════════════════════════════════════════
+    ("Tap Payments Public Key",      re.compile(r'(?i)tap[_-]?(?:public|publishable)[_-]?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,80})["\']')),
+    ("Tap Payments Secret Key",      re.compile(r'(?i)tap[_-]?secret[_-]?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,80})["\']')),
+    # ══ NEW: HitPay (Singapore / SEA) ════════════════════════════════════════
+    ("HitPay API Key",               re.compile(r'(?i)hitpay[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{30,80})["\']')),
+    ("HitPay Salt",                  re.compile(r'(?i)hitpay[_-]?salt\s*[=:]\s*["\']([A-Za-z0-9_-]{30,80})["\']')),
+    # ══ NEW: Iyzico (Turkey) ══════════════════════════════════════════════════
+    ("Iyzico API Key",               re.compile(r'(?i)iyzico[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    ("Iyzico Secret Key",            re.compile(r'(?i)iyzico[_-]?secret[_-]?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    # ══ NEW: Mercado Pago (LatAm) ═════════════════════════════════════════════
+    ("Mercado Pago Public Key",      re.compile(r'\b(APP_USR-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b')),
+    ("Mercado Pago Access Token",    re.compile(r'\b(APP_USR-\d{12,18}-\d{6}-[a-f0-9]{32}-\d{9,12})\b')),
+    ("Mercado Pago Test Token",      re.compile(r'\b(TEST-\d{12,18}-\d{6}-[a-f0-9]{32}-\d{9,12})\b')),
+    # ══ NEW: PagSeguro (Brazil) ═══════════════════════════════════════════════
+    ("PagSeguro Token",              re.compile(r'(?i)pagseguro[_-]?(?:token|key)\s*[=:]\s*["\']([A-Za-z0-9]{32,64})["\']')),
+    # ══ NEW: Billplz (Malaysia) ═══════════════════════════════════════════════
+    ("Billplz API Key",              re.compile(r'(?i)billplz[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    ("Billplz Collection ID",        re.compile(r'(?i)billplz[_-]?collection[_-]?id\s*[=:]\s*["\']([A-Za-z0-9_-]{8,30})["\']')),
+    # ══ NEW: ToyyibPay (Malaysia) ═════════════════════════════════════════════
+    ("ToyyibPay Secret Key",         re.compile(r'(?i)toyyibpay[_-]?(?:secret[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    # ══ NEW: Dlocal (LatAm / Africa / Asia) ══════════════════════════════════
+    ("Dlocal API Key",               re.compile(r'(?i)dlocal[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    ("Dlocal Secret Key",            re.compile(r'(?i)dlocal[_-]?secret\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    # ══ NEW: Viva Wallet (EU / Greece) ════════════════════════════════════════
+    ("Viva Wallet Merchant ID",      re.compile(r'(?i)viva[_-]?wallet[_-]?merchant[_-]?id\s*[=:]\s*["\']?(\d{6,20})["\']?')),
+    ("Viva Wallet API Key",          re.compile(r'(?i)viva[_-]?wallet[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    # ══ NEW: PayFast (South Africa) ═══════════════════════════════════════════
+    ("PayFast Merchant ID",          re.compile(r'(?i)payfast[_-]?merchant[_-]?id\s*[=:]\s*["\']?(\d{5,12})["\']?')),
+    ("PayFast Merchant Key",         re.compile(r'(?i)payfast[_-]?merchant[_-]?key\s*[=:]\s*["\']([A-Za-z0-9]{16,32})["\']')),
+    # ══ NEW: Paidy (Japan BNPL) ═══════════════════════════════════════════════
+    ("Paidy API Key",                re.compile(r'(?i)paidy[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_.-]{20,80})["\']')),
+    # ══ NEW: Nuvei / SafeCharge ═══════════════════════════════════════════════
+    ("Nuvei Merchant ID",            re.compile(r'(?i)nuvei[_-]?merchant[_-]?(?:id|site)\s*[=:]\s*["\']?(\d{6,20})["\']?')),
+    ("Nuvei Merchant Secret",        re.compile(r'(?i)nuvei[_-]?(?:merchant[_-]?)?secret\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
+    # ══ NEW: Stripe extras ════════════════════════════════════════════════════
+    ("Stripe Ephemeral Key",         re.compile(r'\b(ek_(?:live|test)_[A-Za-z0-9]{24,80})\b')),
+    ("Stripe Financial Session",     re.compile(r'\b(fcsess_[A-Za-z0-9]{24,60})\b')),
+    # ══ NEW: Payoneer ═════════════════════════════════════════════════════════
+    ("Payoneer Program ID",          re.compile(r'(?i)payoneer[_-]?program[_-]?id\s*[=:]\s*["\']?([A-Za-z0-9_-]{8,30})["\']?')),
 ]
 
 # ── Gateway prefix lookup for live/test detection ─────────────────────────
@@ -12724,6 +12963,8 @@ _LIVE_PREFIXES = {
     "sq0atp-",          # Square access tokens — always live
     "pdl_live_",        # Paddle Billing live
     "xnd_public_production_",  # Xendit production
+    "APP_USR-",         # Mercado Pago public key
+    "ek_live_",         # Stripe Ephemeral Key live
 }
 _TEST_PREFIXES = {
     "pk_test_", "sk_test_", "rk_test_", "rzp_test_",
@@ -12731,6 +12972,8 @@ _TEST_PREFIXES = {
     "pdl_sbox_",        # Paddle Billing sandbox
     "xnd_public_development_",  # Xendit dev
     "SB-Mid-client-",   # Midtrans sandbox
+    "TEST-",            # Mercado Pago test token
+    "ek_test_",         # Stripe Ephemeral Key test
 }
 
 def _detect_env(key_type: str, key_value: str) -> str:
@@ -14564,6 +14807,22 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Build enhanced report ──────────────────────────────────────────────
+    _BNPL_TYPES = {"Afterpay", "Sezzle", "Klarna", "Affirm", "Paidy", "Atome", "Zip"}
+    _SEA_TYPES  = {"Xendit", "Midtrans", "Payhere", "HitPay", "Billplz", "ToyyibPay", "Dlocal"}
+    _MENA_TYPES = {"Tap Payments"}
+    _LATAM_TYPES= {"Mercado Pago", "PagSeguro", "Dlocal"}
+
+    has_bnpl  = any(any(b in f.get("type","") for b in _BNPL_TYPES) for f in findings)
+    has_sea   = any(any(s in f.get("type","") for s in _SEA_TYPES)  for f in findings)
+    has_live  = bool(live_keys)
+
+    region_tags = []
+    if has_sea:   region_tags.append("🌏 SEA")
+    if has_bnpl:  region_tags.append("🏦 BNPL")
+    if any(any(m in f.get("type","") for m in _MENA_TYPES) for f in findings): region_tags.append("🌍 MENA")
+    if any(any(l in f.get("type","") for l in _LATAM_TYPES) for f in findings): region_tags.append("🌎 LatAm")
+    region_str = "  ".join(region_tags) if region_tags else ""
+
     lines = [
         f"💳 *Payment Keys — `{escape_md(domain)}`*",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -14571,6 +14830,7 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
         f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | ⚙️ SW: `{extra.get('service_workers',0)}` | 🔗 Pages: `{extra.get('subpages',0)}`",
         f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`",
+        *(([region_str]) if region_str else []),
         "",
     ]
 
@@ -24269,15 +24529,52 @@ _KD_PATTERNS = {
     "IPInfo Token":             (r"ipinfo\.io[^'\"]*[?/]([a-f0-9]{14})", "🌐"),
     "Abstract API Key":         (r"(?:abstract.{0,20}key)\s*[=:]\s*['\"]([a-f0-9]{32})['\"]", "🌐"),
     "API Key (generic env)":    (r"(?:API_KEY|APIKEY)\s*[=:]\s*['\"]([A-Za-z0-9_\-]{20,80})['\"]", "🌐"),
+
+    # ── NEW: Vector DB / AI Infra ─────────────────────────────────────────────
+    "Pinecone API Key":         (r"\b(pcsk_[A-Za-z0-9]{60,}|pc-[A-Za-z0-9_\-]{30,})\b|(?:PINECONE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🤖"),
+    "LangSmith API Key":        (r"(?:LANGCHAIN_API_KEY|LANGSMITH_API_KEY)\s*[=:]\s*['\"]?(ls__[A-Za-z0-9_]{30,}|[A-Za-z0-9_\-]{40,})", "🤖"),
+    "Weaviate API Key":         (r"(?:WEAVIATE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🤖"),
+    "Voyage AI Key":            (r"\b(pa-[A-Za-z0-9_\-]{40,})\b|(?:VOYAGE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🤖"),
+
+    # ── NEW: Productivity / PM ─────────────────────────────────────────────────
+    "Airtable Personal Token":  (r"\b(pat[A-Za-z0-9]{14,18}\.[a-f0-9]{64})\b", "📦"),
+    "Airtable API Key (legacy)":(r"(?:AIRTABLE_API_KEY)\s*[=:]\s*['\"]?(key[A-Za-z0-9]{14,18})['\"]?", "📦"),
+    "Linear API Key":           (r"\b(lin_api_[A-Za-z0-9]{40,})\b|(?:LINEAR_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{40,})", "📦"),
+    "Atlassian API Token":      (r"(?:ATLASSIAN_TOKEN|JIRA_API_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9+/=]{40,})", "📦"),
+    "Notion Integration Token":  (r"\b(secret_[A-Za-z0-9]{43})\b|(?:NOTION_TOKEN)\s*[=:]\s*['\"]?(ntn_[A-Za-z0-9]{40,}|secret_[A-Za-z0-9]{40,})", "📦"),
+    "Trello API Key":           (r"(?:TRELLO_API_KEY|trello.{0,10}key)\s*[=:]\s*['\"]?([a-f0-9]{32})", "📦"),
+
+    # ── NEW: Secrets Mgmt / DevOps ────────────────────────────────────────────
+    "Doppler Service Token":    (r"\b(dp\.st\.[a-z0-9_\-]+\.[A-Za-z0-9]{30,})\b|(?:DOPPLER_TOKEN)\s*[=:]\s*['\"]?(dp\.[A-Za-z0-9_.\-]{30,})", "📦"),
+    "Pulumi Access Token":      (r"\b(pul-[A-Za-z0-9]{40,})\b|(?:PULUMI_ACCESS_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{40,})", "📦"),
+    "Terraform Cloud Token":    (r"(?:TFE_TOKEN|TERRAFORM_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-\.]{30,})", "📦"),
+    "Infisical Token":          (r"\b(inf\.[A-Za-z0-9_\-\.]{40,})\b|(?:INFISICAL_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "📦"),
+    "Vault Token":              (r"\b(hvs\.[A-Za-z0-9_\-]{24,}|s\.[A-Za-z0-9]{24,})\b|(?:VAULT_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_.\-]{20,})", "🔒"),
+
+    # ── NEW: CDN / Edge ───────────────────────────────────────────────────────
+    "Fastly API Token":         (r"(?:FASTLY_API_TOKEN|FASTLY_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "☁️"),
+    "Bunny CDN API Key":        (r"(?:BUNNY_API_KEY|bunnycdn.{0,10}key)\s*[=:]\s*['\"]?([A-Za-z0-9\-]{30,80})", "☁️"),
+
+    # ── NEW: Media / Storage ──────────────────────────────────────────────────
+    "Cloudinary API Key":       (r"(?:CLOUDINARY_API_KEY)\s*[=:]\s*['\"]?(\d{15,20})", "☁️"),
+    "Cloudinary API Secret":    (r"(?:CLOUDINARY_API_SECRET)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{27,})", "🔒"),
+    "Cloudinary URL":           (r"\b(cloudinary://\d+:[A-Za-z0-9_\-]{20,}@[a-z0-9_\-]+)\b", "☁️"),
+    "ImageKit Private Key":     (r"(?:IMAGEKIT_PRIVATE_KEY)\s*[=:]\s*['\"]?(private_[A-Za-z0-9_+/=]{20,})", "☁️"),
+    "Uploadthing Secret":       (r"\b(sk_live_[A-Za-z0-9]{48,64})\b(?=.*uploadthing)|(?:UPLOADTHING_SECRET)\s*[=:]\s*['\"]?(sk_live_[A-Za-z0-9]{48,64})", "☁️"),
+
+    # ── NEW: Automation / Scraping ─────────────────────────────────────────────
+    "Apify API Token":          (r"\b(apify_api_[A-Za-z0-9_]{30,})\b|(?:APIFY_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🌐"),
+    "ScrapingBee API Key":      (r"(?:SCRAPINGBEE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_]{30,})", "🌐"),
+    "Browserless Token":        (r"(?:BROWSERLESS_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🌐"),
 }
 
 # ── Category map (same as before + new ones) ─────────────────────────────────
 _KD_CATEGORIES = {
     "☁️": "Cloud & Infra",
-    "🤖": "AI / ML",
+    "🤖": "AI / ML & Vector DB",
     "🗄️": "Database",
     "🔐": "Auth & Identity",
-    "📦": "Version Control / DevOps",
+    "📦": "Version Control / DevOps / PM",
     "📨": "Email & Messaging",
     "📡": "Observability",
     "🔥": "Firebase / Google",
