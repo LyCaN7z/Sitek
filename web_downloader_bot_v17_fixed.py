@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # ╔══════════════════════════════════════════════════════════════╗
-# ║       Website Downloader Bot  v18.0  (Enhanced Edition)     ║
+# ║       Website Downloader Bot  v17.0  (Secure+Full Edition)  ║
 # ║  ✅ SSRF Protection       ✅ Path Traversal Fix             ║
 # ║  ✅ DB Race Condition Fix  ✅ Rate Limiting                  ║
 # ║  ✅ Subprocess Injection   ✅ Log Sanitization              ║
@@ -12,8 +12,6 @@
 # ║  ✅ /tech Fingerprint       ✅ /extract Secret Scanner      ║
 # ║  ✅ /monitor Alerts         ✅ /bypass403 Bypass Tester     ║
 # ║  ✅ /subdomains Enum        ✅ /fuzz Path+Param Fuzzer      ║
-# ║  ✅ v18: +20 captcha types  ✅ v18: +30 payment gateways   ║
-# ║  ✅ v18: +25 KD patterns    ✅ v18: Region/BNPL tagging    ║
 # ╚══════════════════════════════════════════════════════════════╝
 #
 # Server Setup:
@@ -5105,42 +5103,6 @@ _CAPTCHA_PATTERNS = {
         re.compile(r'altcha-widget|<altcha-widget', re.I),
         re.compile(r'altcha\.org/api/v1/challenge', re.I),
     ],
-    # ★ NEW: Tencent Captcha (TCaptcha) — widely used in Asia
-    "Tencent Captcha": [
-        re.compile(r'TencentCaptcha\s*\(\s*["\'](\d{10})["\']', re.I),
-        re.compile(r'data-appid=["\'](\d{10})["\']', re.I),
-        re.compile(r'captcha\.qq\.com[^\'"]*appid=(\d{10})', re.I),
-        re.compile(r'TCaptcha\.init\s*\(\s*["\'](\d{10})["\']', re.I),
-    ],
-    # ★ NEW: Yandex SmartCaptcha
-    "Yandex SmartCaptcha": [
-        re.compile(r'smartcaptcha\.yandex\.ru/captcha\.js\?sitekey=([A-Za-z0-9_\-]{20,80})', re.I),
-        re.compile(r'data-sitekey=["\']([A-Za-z0-9_\-]{20,80})["\'](?=[^>]*yandex)', re.I),
-        re.compile(r'SmartCaptcha\.render[^)]*sitekey\s*:\s*["\']([A-Za-z0-9_\-]{20,80})["\']', re.I),
-    ],
-    # ★ NEW: BotPoison
-    "BotPoison": [
-        re.compile(r'botpoison\.com/static/[^\'"]+\.js', re.I),
-        re.compile(r'(?:BOTPOISON_PUBLIC_KEY|botpoison[_\-]?key)\s*[=:]\s*["\']?(pk_[A-Za-z0-9_\-]{20,60})', re.I),
-        re.compile(r'Botpoison\(\s*["\']?(pk_[A-Za-z0-9_\-]{20,60})["\']?', re.I),
-    ],
-    # ★ NEW: Lemin Cropped Captcha
-    "Lemin Captcha": [
-        re.compile(r'lemin-cropped-captcha[^>]*captchaId=["\']([A-Za-z0-9_\-]{10,40})["\']', re.I),
-        re.compile(r'leminCropped\.load\(["\']([A-Za-z0-9_\-]{10,40})["\']', re.I),
-        re.compile(r'lemin\.smart-lemon\.com[^\'"]*captcha_id=([A-Za-z0-9_\-]{10,40})', re.I),
-    ],
-    # ★ NEW: GeeTest v4 (separate from v3)
-    "GeeTest v4": [
-        re.compile(r'initGeetest4\s*\([^)]*["\']captchaId["\']\s*:\s*["\']([a-f0-9]{32})["\']', re.I),
-        re.compile(r'gt4\s*:\s*["\']([a-f0-9]{32})["\']', re.I),
-        re.compile(r'captchaId\s*:\s*["\']([a-f0-9]{32})["\'](?=[^}]*geetest)', re.I),
-    ],
-    # ★ NEW: Capy Puzzle Captcha
-    "Capy Puzzle": [
-        re.compile(r'capy\.com/puzzle/[^\'"]*api_key=([A-Za-z0-9_]{20,60})', re.I),
-        re.compile(r'Capy\.setup\s*\(["\']([A-Za-z0-9_]{20,60})["\']', re.I),
-    ],
 }
 
 # ── Key format validators ──────────────────────────────────────────────────────
@@ -5188,20 +5150,6 @@ _KEY_VALIDATORS = {
     "mCaptcha":             lambda k: (
         20 <= len(k) <= 60 and bool(re.match(r'^[A-Za-z0-9_]+$', k))
     ),
-    # ── Tencent Captcha (10-digit numeric appId) ─────────────────────────────
-    "Tencent Captcha":      lambda k: bool(re.match(r'^\d{10}$', k)),
-    # ── Yandex SmartCaptcha (20-80 alphanum) ─────────────────────────────────
-    "Yandex SmartCaptcha":  lambda k: (
-        20 <= len(k) <= 80 and bool(re.match(r'^[A-Za-z0-9_\-]+$', k))
-    ),
-    # ── BotPoison (pk_ prefix) ───────────────────────────────────────────────
-    "BotPoison":            lambda k: bool(re.match(r'^pk_[A-Za-z0-9_\-]{20,60}$', k)),
-    # ── Lemin Captcha (10-40 alphanum) ───────────────────────────────────────
-    "Lemin Captcha":        lambda k: (
-        10 <= len(k) <= 40 and bool(re.match(r'^[A-Za-z0-9_\-]+$', k))
-    ),
-    # ── GeeTest v4 (32-char hex, same as v3) ─────────────────────────────────
-    "GeeTest v4":           lambda k: bool(re.match(r'^[0-9a-f]{32}$', k, re.I)),
 }
 
 # ENH15: API live validators dict used by _validate_api_key
@@ -5323,18 +5271,12 @@ _CAPTCHA_SCAN_ORDER = [
     "hCaptcha",
     "Cloudflare Turnstile",
     "FunCaptcha",
-    "GeeTest v4",
     "GeeTest",
     "reCAPTCHA v3",
     "reCAPTCHA v2",
     "FriendlyCaptcha",
     "mCaptcha",
     "MTCaptcha",
-    "Tencent Captcha",
-    "Yandex SmartCaptcha",
-    "BotPoison",
-    "Lemin Captcha",
-    "Capy Puzzle",
     "Kasada Bot Defense",
     "Akamai Bot Manager",
     "DataDome",
@@ -5360,12 +5302,6 @@ _CAPTCHA_SCRIPT_SIGS = {
     "PerimeterX/HUMAN":     ["px-cloud.net", "perimeterx.net"],
     "AWS WAF Captcha":      ["captcha.us-east-1.amazonaws.com"],
     "Altcha":               ["altcha.org", "altcha-widget"],
-    "Tencent Captcha":      ["captcha.qq.com", "t.captcha.qq.com"],
-    "Yandex SmartCaptcha":  ["smartcaptcha.yandex.ru"],
-    "BotPoison":            ["botpoison.com/static"],
-    "Lemin Captcha":        ["lemin.smart-lemon.com"],
-    "GeeTest v4":           ["static.geetest.com/v4", "gcaptcha4.geetest.com"],
-    "Capy Puzzle":          ["capy.com/puzzle"],
 }
 
 
@@ -5974,6 +5910,363 @@ def _sitekey_playwright(url: str, progress_cb=None) -> dict:
                 page.wait_for_load_state("networkidle", timeout=8_000)
             except Exception:
                 pass
+
+        except Exception:
+            pass
+
+        # ══════════════════════════════════════════════
+        # SPA ENHANCEMENT — React/Vue/Next.js support
+        # ══════════════════════════════════════════════
+        if progress_cb: progress_cb("⚛️ SPA scan: React/Vue/Next.js route navigation...")
+
+        try:
+            # ── 1. Detect framework ───────────────────────────────────────────
+            framework = page.evaluate("""() => {
+                if (window.__NEXT_DATA__)          return 'nextjs';
+                if (window.__nuxt__ || window.$nuxt) return 'nuxt';
+                if (window.__vue_app__ || document.querySelector('[data-v-app]')) return 'vue3';
+                if (document.querySelector('[data-reactroot],[data-react-helmet]')) return 'react';
+                if (window.angular || document.querySelector('[ng-version]')) return 'angular';
+                return 'unknown';
+            }""")
+
+            # ── 2. Next.js — extract sitekeys from __NEXT_DATA__ JSON blob ───
+            if framework == "nextjs":
+                try:
+                    next_data = page.evaluate("() => JSON.stringify(window.__NEXT_DATA__ || {})")
+                    if next_data and len(next_data) > 10:
+                        _ND_PATTERNS = [
+                            (re.compile(r'"siteKey"\s*:\s*"([6L][A-Za-z0-9_\-]{38})"', re.I), "reCAPTCHA (Next.js __NEXT_DATA__)"),
+                            (re.compile(r'"sitekey"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"', re.I), "hCaptcha (Next.js __NEXT_DATA__)"),
+                            (re.compile(r'"siteKey"\s*:\s*"([01]x[A-Za-z0-9_\-]{20,60})"', re.I), "Turnstile (Next.js __NEXT_DATA__)"),
+                            (re.compile(r'"captchaKey"\s*:\s*"([A-Za-z0-9_\-]{20,80})"', re.I), "Captcha key (Next.js __NEXT_DATA__)"),
+                            (re.compile(r'"recaptchaSiteKey"\s*:\s*"([A-Za-z0-9_\-]{20,60})"', re.I), "reCAPTCHA (Next.js config)"),
+                            (re.compile(r'"hcaptchaSiteKey"\s*:\s*"([0-9a-f\-]{36})"', re.I), "hCaptcha (Next.js config)"),
+                        ]
+                        for pat, ktype in _ND_PATTERNS:
+                            for m in pat.finditer(next_data):
+                                _add(ktype, m.group(1), "Next.js __NEXT_DATA__")
+                except Exception:
+                    pass
+
+            # ── 3. Nuxt — window.__nuxt__ config scan ────────────────────────
+            if framework in ("nuxt", "vue3"):
+                try:
+                    nuxt_str = page.evaluate("""() => {
+                        const d = window.__nuxt__ || window.__NUXT__ || {};
+                        return JSON.stringify(d).slice(0, 200000);
+                    }""")
+                    if nuxt_str:
+                        for pat, ktype in [
+                            (re.compile(r'"siteKey"\s*:\s*"([6L][A-Za-z0-9_\-]{38})"', re.I), "reCAPTCHA (Nuxt)"),
+                            (re.compile(r'"sitekey"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"', re.I), "hCaptcha (Nuxt)"),
+                            (re.compile(r'"siteKey"\s*:\s*"([01]x[A-Za-z0-9_\-]{20,60})"', re.I), "Turnstile (Nuxt)"),
+                        ]:
+                            for m in pat.finditer(nuxt_str):
+                                _add(ktype, m.group(1), "Nuxt __nuxt__ global")
+                except Exception:
+                    pass
+
+            # ── 4. SPA route navigation — trigger lazy-loaded captchas ────────
+            # Navigate to common auth/checkout routes via client-side router
+            spa_routes = [
+                "/login", "/signin", "/register", "/signup",
+                "/checkout", "/cart", "/payment", "/donate",
+                "/contact", "/auth/login", "/account/login",
+            ]
+            parsed_base = urlparse(url)
+            current_path = parsed_base.path.rstrip("/")
+
+            for route in spa_routes:
+                full_route = f"{parsed_base.scheme}://{parsed_base.netloc}{route}"
+                if route == current_path:
+                    continue
+                try:
+                    # Use pushState to navigate without full reload (SPA-style)
+                    page.evaluate(f"""() => {{
+                        if (window.__router) {{
+                            try {{ window.__router.push('{route}'); }} catch(e) {{}}
+                        }} else if (window.history) {{
+                            window.history.pushState(null, '', '{full_route}');
+                            window.dispatchEvent(new PopStateEvent('popstate'));
+                        }}
+                    }}""")
+                    page.wait_for_timeout(1500)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5_000)
+                    except Exception:
+                        pass
+
+                    # Re-scan DOM after navigation
+                    try:
+                        new_srcs = page.evaluate("""() =>
+                            Array.from(document.querySelectorAll('[data-sitekey]'))
+                                 .map(el => el.getAttribute('data-sitekey'))
+                                 .filter(Boolean)
+                        """)
+                        for sk in (new_srcs or []):
+                            _add(_classify_key(sk), sk,
+                                 f"SPA route {route} [data-sitekey]")
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+            # Restore original URL
+            try:
+                page.evaluate(f"() => window.history.replaceState(null,'','{url}')")
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+        # ══════════════════════════════════════════════
+        # CHECKOUT FLOW — Multi-step cart simulation
+        # ══════════════════════════════════════════════
+        if progress_cb: progress_cb("🛒 Checkout flow scan: add-to-cart + multi-step form...")
+
+        try:
+            # ── Step 1: Add to cart / select product ─────────────────────────
+            add_to_cart_selectors = [
+                # Generic add-to-cart buttons
+                'button[name="add"]', 'button[name="add-to-cart"]',
+                'input[name="add-to-cart"]', 'button.add_to_cart_button',
+                '[class*="add-to-cart"]', '[class*="addToCart"]',
+                '[id*="add-to-cart"]', '[id*="addToCart"]',
+                'button[data-product_id]',
+                # Shopify
+                'button[name="add"]', '.product-form__submit',
+                # WooCommerce
+                '.single_add_to_cart_button', '.wc-block-cart-item__remove-link',
+                # Select first product / plan option
+                '.plan-option:first-child', '.pricing-option:first-child',
+                'input[type="radio"]:first-of-type',
+                '[class*="plan"]:first-child', '[class*="tier"]:first-child',
+                # Quantity fields
+                'input[name="quantity"]', 'input.qty',
+            ]
+            for sel in add_to_cart_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        page.wait_for_timeout(400)
+                        try:
+                            el.click(timeout=2000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(800)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5_000)
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    pass
+
+            # ── Step 2: Proceed to checkout ───────────────────────────────────
+            checkout_selectors = [
+                'a[href*="checkout"]', 'button[name="checkout"]',
+                '.checkout-button', '#proceed-to-checkout',
+                'a.checkout', '.btn-checkout', '[class*="proceed"]',
+                '[class*="checkout"]', 'a[href*="/cart"]',
+                'button[class*="checkout"]', 'input[name="proceed"]',
+            ]
+            for sel in checkout_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        page.wait_for_timeout(400)
+                        try:
+                            el.click(timeout=2000)
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(1500)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8_000)
+                        except Exception:
+                            pass
+                        # Scan for captcha after reaching checkout
+                        try:
+                            new_keys = page.evaluate("""() =>
+                                Array.from(document.querySelectorAll('[data-sitekey]'))
+                                     .map(el => el.getAttribute('data-sitekey'))
+                                     .filter(Boolean)
+                            """)
+                            for sk in (new_keys or []):
+                                _add(_classify_key(sk), sk,
+                                     f"Checkout flow [data-sitekey] after cart→checkout")
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    pass
+
+            # ── Step 3: Fill minimal checkout form fields to reveal captcha ───
+            checkout_fields = [
+                ('input[name="email"]',     "test@example.com"),
+                ('input[name="firstname"]', "Test"),
+                ('input[name="lastname"]',  "User"),
+                ('input[name="first_name"]',"Test"),
+                ('input[name="last_name"]', "User"),
+                ('input[type="email"]',     "test@example.com"),
+                ('input[name="billing_email"]', "test@example.com"),
+                ('input[name="phone"]',     "+10000000000"),
+            ]
+            for sel, val in checkout_fields:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.fill(val)
+                        page.wait_for_timeout(300)
+                except Exception:
+                    pass
+
+            # Wait for captcha to appear after form fill
+            page.wait_for_timeout(2000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=6_000)
+            except Exception:
+                pass
+
+            # Final scan after checkout flow
+            try:
+                post_checkout_keys = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('[data-sitekey]'))
+                         .map(el => ({
+                             key:  el.getAttribute('data-sitekey'),
+                             tag:  el.tagName + '.' + (el.className || '').split(' ')[0],
+                             type: el.className && el.className.includes('cf-turnstile') ? 'turnstile'
+                                 : el.className && el.className.includes('h-captcha') ? 'hcaptcha'
+                                 : 'recaptcha'
+                         }))
+                         .filter(x => x.key && x.key.length > 8)
+                """)
+                for item in (post_checkout_keys or []):
+                    sk   = item.get("key", "")
+                    hint = item.get("type", "")
+                    tag  = item.get("tag", "")
+                    if sk:
+                        ktype = ("Cloudflare Turnstile" if hint == "turnstile"
+                                 else "hCaptcha" if hint == "hcaptcha"
+                                 else _classify_key(sk))
+                        _add(ktype, sk, f"Checkout form [data-sitekey] ({tag})")
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+        # ══════════════════════════════════════════════
+        # OBFUSCATED JS — Runtime deobfuscation scan
+        # ══════════════════════════════════════════════
+        if progress_cb: progress_cb("🧩 Obfuscated JS: runtime eval + atob/hex decode scan...")
+
+        try:
+            # Intercept eval / Function calls that may reveal sitekeys at runtime
+            deob_results = page.evaluate("""() => {
+                const found = [];
+                const seen  = new Set();
+                const SK_PATS = [
+                    /["']([6L][A-Za-z0-9_\\-]{38})["']/,
+                    /["']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["']/i,
+                    /["']([01]x[A-Za-z0-9_\\-]{20,60})["']/,
+                ];
+
+                // ── 1. Scan all inline script textContent ─────────────────
+                document.querySelectorAll('script:not([src])').forEach(s => {
+                    const txt = s.textContent || '';
+                    if (txt.length < 20) return;
+
+                    // atob decode attempt
+                    const b64Matches = txt.match(/atob\\(["']([A-Za-z0-9+/=]{20,})["']\\)/g) || [];
+                    b64Matches.forEach(m => {
+                        try {
+                            const inner = m.match(/atob\\(["']([^"']+)["']\\)/)[1];
+                            const decoded = atob(inner);
+                            SK_PATS.forEach(pat => {
+                                const hit = decoded.match(pat);
+                                if (hit && !seen.has(hit[1])) {
+                                    seen.add(hit[1]);
+                                    found.push({ key: hit[1], method: 'atob', src: 'inline script' });
+                                }
+                            });
+                        } catch(e) {}
+                    });
+
+                    // hex decode attempt
+                    const hexMatches = txt.match(/\\\\x[0-9a-fA-F]{2}(?:\\\\x[0-9a-fA-F]{2})+/g) || [];
+                    hexMatches.forEach(hx => {
+                        try {
+                            const decoded = hx.replace(/\\\\x([0-9a-fA-F]{2})/g, (_, h) =>
+                                String.fromCharCode(parseInt(h, 16)));
+                            SK_PATS.forEach(pat => {
+                                const hit = decoded.match(pat);
+                                if (hit && !seen.has(hit[1])) {
+                                    seen.add(hit[1]);
+                                    found.push({ key: hit[1], method: 'hex_escape', src: 'inline script' });
+                                }
+                            });
+                        } catch(e) {}
+                    });
+                });
+
+                // ── 2. Scan window object for known captcha config keys ────
+                const WIN_KEYS = [
+                    'recaptchaOptions','___grecaptcha_cfg','hcaptcha','turnstile',
+                    'recaptchaSiteKey','hcaptchaSiteKey','cfTurnstileSiteKey',
+                    '__recaptcha_api','grecaptcha','Turnstile',
+                ];
+                WIN_KEYS.forEach(wk => {
+                    try {
+                        const obj = window[wk];
+                        if (!obj) return;
+                        const str = JSON.stringify(obj).slice(0, 50000);
+                        SK_PATS.forEach(pat => {
+                            let m;
+                            const g = new RegExp(pat.source, 'gi');
+                            while ((m = g.exec(str)) !== null) {
+                                const k = m[1];
+                                if (k && !seen.has(k)) {
+                                    seen.add(k);
+                                    found.push({ key: k, method: 'window.' + wk, src: 'window global' });
+                                }
+                            }
+                        });
+                    } catch(e) {}
+                });
+
+                // ── 3. localStorage / sessionStorage captcha configs ───────
+                try {
+                    [localStorage, sessionStorage].forEach((store, si) => {
+                        const sname = si === 0 ? 'localStorage' : 'sessionStorage';
+                        for (let i = 0; i < Math.min(store.length, 100); i++) {
+                            const k = store.key(i);
+                            if (!k) continue;
+                            const v = store.getItem(k) || '';
+                            SK_PATS.forEach(pat => {
+                                const hit = v.match(pat);
+                                if (hit && !seen.has(hit[1])) {
+                                    seen.add(hit[1]);
+                                    found.push({ key: hit[1], method: sname, src: k });
+                                }
+                            });
+                        }
+                    });
+                } catch(e) {}
+
+                return found;
+            }""")
+
+            for item in (deob_results or []):
+                sk     = item.get("key", "")
+                method = item.get("method", "JS deobfuscation")
+                src    = item.get("src", "")
+                if sk and len(sk) >= 10:
+                    _add(_classify_key(sk), sk,
+                         f"[Deobfuscated/{method}] {src}")
 
         except Exception:
             pass
@@ -7962,22 +8255,6 @@ async def cmd_sitekey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append("⚠️ _Authorized testing only_")
     lines.append("📄 _Full solver params — JSON export ကိုကြည့်ပါ_")
-
-    # ── Copy-Ready Quick Summary ──────────────────────────────────────────────
-    if ordered:
-        lines.append("")
-        lines.append("*📋 Quick Copy — Solver-Ready Keys:*")
-        for f, badge in ordered[:5]:
-            cap_type = f.get("type", "")
-            if not any(ct in cap_type for ct in _CAPTCHA_TYPES):
-                continue
-            sk = f.get("site_key", "") or f.get("value", "") or "N/A"
-            pg = f.get("page_url", page_url) or page_url
-            _sk_s = sk.replace("`", "'")
-            _pg_s = pg[:80].replace("`", "'")
-            env_badge = "🔴 LIVE" if "CONFIRMED" in badge or "HIGH" in badge else "⚠️ STATIC"
-            lines.append(f"  `{_sk_s}` — {env_badge}")
-            lines.append(f"  🌐 `{_pg_s}`")
 
     report = "\n".join(lines)
     await safe_markdown_reply(msg, _truncate_safe_md(report))
@@ -11789,38 +12066,6 @@ _PAY_CSP_DOMAINS = {
     "affirm.com":            "Affirm",
     "afterpay.com":          "Afterpay",
     "clearpay.co.uk":        "Clearpay",
-    # ── SEA / APAC ─────────────────────────────────────────────────────────
-    "xendit.co":             "Xendit",
-    "midtrans.com":          "Midtrans",
-    "snap.midtrans.com":     "Midtrans Snap",
-    "hit-pay.com":           "HitPay",
-    "billplz.com":           "Billplz",
-    "toyyibpay.com":         "ToyyibPay",
-    "paidy.com":             "Paidy",
-    # ── MENA ───────────────────────────────────────────────────────────────
-    "tap.company":           "Tap Payments",
-    "b.tap.company":         "Tap Payments CDN",
-    # ── LatAm ──────────────────────────────────────────────────────────────
-    "mercadopago.com":       "Mercado Pago",
-    "sdk.mercadopago.com":   "Mercado Pago SDK",
-    "pagseguro.uol.com.br":  "PagSeguro",
-    "dlocal.com":            "Dlocal",
-    # ── Europe extras ──────────────────────────────────────────────────────
-    "vivapayments.com":      "Viva Wallet",
-    "nuvei.com":             "Nuvei",
-    "buckaroo.nl":           "Buckaroo",
-    # ── Africa ─────────────────────────────────────────────────────────────
-    "payfast.co.za":         "PayFast",
-    # ── BNPL extras ────────────────────────────────────────────────────────
-    "sezzle.com":            "Sezzle",
-    "zip.co":                "Zip",
-    "splitit.com":           "Splitit",
-    "scalapay.com":          "Scalapay",
-    "atome.sg":              "Atome",
-    # ── Crypto ─────────────────────────────────────────────────────────────
-    "commerce.coinbase.com": "Coinbase Commerce",
-    "nowpayments.io":        "NOWPayments",
-    "cryptomus.com":         "Cryptomus",
 }
 
 # ── Webhook URL patterns ───────────────────────────────────────────────────
@@ -11955,66 +12200,26 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
     # ── 4. SDK <script> tag fingerprint ──────────────────────────────────────
     if progress_cb: progress_cb("🏦 Fingerprinting payment SDK scripts...")
     _SDK_PATTERNS = [
-        # ── Global ───────────────────────────────────────────────────────────
-        (re.compile(r'js\.stripe\.com'),                "Stripe JS SDK"),
-        (re.compile(r'checkout\.stripe\.com'),          "Stripe Checkout"),
-        (re.compile(r'braintreegateway\.com'),          "Braintree JS"),
-        (re.compile(r'paypal\.com/sdk/js'),             "PayPal SDK"),
-        (re.compile(r'www\.paypalobjects\.com'),        "PayPal Legacy"),
-        (re.compile(r'js\.razorpay\.com'),              "Razorpay JS"),
-        (re.compile(r'js\.squareup\.com'),              "Square Web SDK"),
-        (re.compile(r'checkout\.adyen\.com'),           "Adyen Web"),
-        (re.compile(r'x\.klarnacdn\.net'),              "Klarna JS"),
-        (re.compile(r'buy\.paddle\.com'),               "Paddle.js"),
-        (re.compile(r'mollie\.com'),                    "Mollie JS"),
-        (re.compile(r'paystack\.com/popup'),            "Paystack Popup"),
-        (re.compile(r'flutterwave\.com'),               "Flutterwave JS"),
-        (re.compile(r'checkout\.com'),                  "Checkout.com"),
-        (re.compile(r'pay\.google\.com'),               "Google Pay API"),
-        (re.compile(r'apple(?:pay)?\.com'),             "Apple Pay"),
-        (re.compile(r'shop\.app/pay'),                  "Shop Pay"),
-        (re.compile(r'cashfree\.com'),                  "Cashfree"),
-        (re.compile(r'payu\.in|payu\.com'),             "PayU"),
-        (re.compile(r'coinbase\.com/commerce'),         "Coinbase Commerce"),
-        # ── SEA / APAC ───────────────────────────────────────────────────────
-        (re.compile(r'app\.xendit\.co|js\.xendit\.co'), "Xendit JS"),
-        (re.compile(r'snap\.midtrans\.com'),            "Midtrans Snap"),
-        (re.compile(r'api\.midtrans\.com'),             "Midtrans API"),
-        (re.compile(r'hit-pay\.com'),                   "HitPay"),
-        (re.compile(r'billplz\.com'),                   "Billplz"),
-        (re.compile(r'toyyibpay\.com'),                 "ToyyibPay"),
-        (re.compile(r'paidy\.com'),                     "Paidy"),
-        (re.compile(r'ipay88\.com'),                    "iPay88"),
-        (re.compile(r'2c2p\.com'),                      "2C2P"),
-        (re.compile(r'omise\.co'),                      "Omise"),
-        # ── MENA ─────────────────────────────────────────────────────────────
-        (re.compile(r'tap\.company|b\.tap\.company'),   "Tap Payments"),
-        (re.compile(r'hesabe\.com'),                    "Hesabe"),
-        (re.compile(r'paymob\.com'),                    "Paymob"),
-        (re.compile(r'fawry\.com'),                     "Fawry"),
-        # ── LatAm ────────────────────────────────────────────────────────────
-        (re.compile(r'sdk\.mercadopago\.com'),          "Mercado Pago SDK"),
-        (re.compile(r'pagseguro\.uol\.com\.br'),        "PagSeguro"),
-        (re.compile(r'dlocal\.com'),                    "Dlocal"),
-        (re.compile(r'culqi\.com'),                     "Culqi"),
-        (re.compile(r'wompi\.co'),                      "Wompi"),
-        # ── Europe extras ────────────────────────────────────────────────────
-        (re.compile(r'vivapayments\.com'),              "Viva Wallet"),
-        (re.compile(r'nuvei\.com'),                     "Nuvei"),
-        (re.compile(r'buckaroo\.nl'),                   "Buckaroo"),
-        # ── Africa ───────────────────────────────────────────────────────────
-        (re.compile(r'payfast\.co\.za'),                "PayFast"),
-        (re.compile(r'peachpayments\.com'),             "Peach Payments"),
-        # ── BNPL ─────────────────────────────────────────────────────────────
-        (re.compile(r'sezzle\.com'),                    "Sezzle"),
-        (re.compile(r'zip\.co|quadpay\.com'),           "Zip/QuadPay"),
-        (re.compile(r'splitit\.com'),                   "Splitit"),
-        (re.compile(r'scalapay\.com'),                  "Scalapay"),
-        (re.compile(r'atome\.sg'),                      "Atome"),
-        # ── Crypto ───────────────────────────────────────────────────────────
-        (re.compile(r'nowpayments\.io'),                "NOWPayments"),
-        (re.compile(r'cryptomus\.com'),                 "Cryptomus"),
-        (re.compile(r'bitpay\.com'),                    "BitPay"),
+        (re.compile(r'js\.stripe\.com'),        "Stripe JS SDK"),
+        (re.compile(r'checkout\.stripe\.com'),   "Stripe Checkout"),
+        (re.compile(r'braintreegateway\.com'),    "Braintree JS"),
+        (re.compile(r'paypal\.com/sdk/js'),       "PayPal SDK"),
+        (re.compile(r'www\.paypalobjects\.com'), "PayPal Legacy"),
+        (re.compile(r'js\.razorpay\.com'),       "Razorpay JS"),
+        (re.compile(r'js\.squareup\.com'),       "Square Web SDK"),
+        (re.compile(r'checkout\.adyen\.com'),    "Adyen Web"),
+        (re.compile(r'x\.klarnacdn\.net'),       "Klarna JS"),
+        (re.compile(r'buy\.paddle\.com'),        "Paddle.js"),
+        (re.compile(r'mollie\.com'),              "Mollie JS"),
+        (re.compile(r'paystack\.com/popup'),      "Paystack Popup"),
+        (re.compile(r'flutterwave\.com'),         "Flutterwave JS"),
+        (re.compile(r'checkout\.com'),            "Checkout.com"),
+        (re.compile(r'pay\.google\.com'),        "Google Pay API"),
+        (re.compile(r'apple(?:pay)?\.com'),       "Apple Pay"),
+        (re.compile(r'shop\.app/pay'),            "Shop Pay"),
+        (re.compile(r'cashfree\.com'),            "Cashfree"),
+        (re.compile(r'payu\.in|payu\.com'),      "PayU"),
+        (re.compile(r'coinbase\.com/commerce'),   "Coinbase Commerce"),
     ]
     sdk_seen = set()
     for pat, sdk_name in _SDK_PATTERNS:
@@ -12026,29 +12231,17 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
     # ── 5. Key mode detection (live vs test) ──────────────────────────────────
     if progress_cb: progress_cb("🔑 Detecting payment key modes (live/test)...")
     _KEY_MODE_PATS = [
-        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),   "Stripe Live PK",        True),
-        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),   "Stripe Test PK",        False),
-        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),   "Stripe Live SK ⚠️",     True),
-        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),   "Stripe Test SK",        False),
-        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'),  "Razorpay Live",         True),
-        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'),  "Razorpay Test",         False),
-        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),       "Flutterwave Live PK",   True),
-        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'),  "Flutterwave Test PK",   False),
+        (re.compile(r'\b(pk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live PK", True),
+        (re.compile(r'\b(pk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test PK", False),
+        (re.compile(r'\b(sk_live_[A-Za-z0-9]{20,60})\b'),  "Stripe Live SK ⚠️", True),
+        (re.compile(r'\b(sk_test_[A-Za-z0-9]{20,60})\b'),  "Stripe Test SK", False),
+        (re.compile(r'\b(rzp_live_[A-Za-z0-9]{14,20})\b'), "Razorpay Live", True),
+        (re.compile(r'\b(rzp_test_[A-Za-z0-9]{14,20})\b'), "Razorpay Test", False),
+        (re.compile(r'\b(FLWPUBK-[A-Za-z0-9]+-X)\b'),      "Flutterwave Live PK", True),
+        (re.compile(r'\b(FLWPUBK_TEST-[A-Za-z0-9]+-X)\b'), "Flutterwave Test PK", False),
         (re.compile(r'\b(pk_(?:sbox|prod)_[A-Za-z0-9]{20,80})\b'), "Checkout.com Key", None),
-        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live",           True),
-        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox",        False),
-        # ── SEA ──────────────────────────────────────────────────────────────
-        (re.compile(r'\b(xnd_public_production_[A-Za-z0-9]{30,80})\b'), "Xendit Live PK", True),
-        (re.compile(r'\b(xnd_public_development_[A-Za-z0-9]{30,80})\b'),"Xendit Dev PK",  False),
-        (re.compile(r'\b(Mid-client-[A-Za-z0-9_\-]{20,50})\b'),         "Midtrans Live",  True),
-        (re.compile(r'\b(SB-Mid-client-[A-Za-z0-9_\-]{20,50})\b'),      "Midtrans Sandbox",False),
-        # ── LatAm ────────────────────────────────────────────────────────────
-        (re.compile(r'\b(APP_USR-[A-Za-z0-9\-]{20,80})\b'),  "Mercado Pago Live PK", True),
-        (re.compile(r'\b(TEST-[A-Za-z0-9\-]{20,80})\b'),      "Mercado Pago Test",   False),
-        # ── Stripe extras ────────────────────────────────────────────────────
-        (re.compile(r'\b(ek_live_[A-Za-z0-9]{24,80})\b'),     "Stripe Ephemeral Live",True),
-        (re.compile(r'\b(ek_test_[A-Za-z0-9]{24,80})\b'),     "Stripe Ephemeral Test",False),
-        (re.compile(r'\b(whsec_[A-Za-z0-9]{20,60})\b'),        "Stripe Webhook Secret ⚠️", True),
+        (re.compile(r'\b(pdl_live_[A-Za-z0-9_]{20,80})\b'), "Paddle Live", True),
+        (re.compile(r'\b(pdl_sbox_[A-Za-z0-9_]{20,80})\b'), "Paddle Sandbox", False),
     ]
     mode_seen = set()
     for pat, label, is_live in _KEY_MODE_PATS:
@@ -12096,22 +12289,13 @@ def _payconfig_sync(url: str, progress_cb=None) -> dict:
     # ── 9. 3DS / SCA signal detection ────────────────────────────────────────
     _3DS_QUICK = [
         (re.compile(r'(?i)stripe\.confirmPayment|stripe\.handleNextAction|authenticateSource'), "Stripe 3DS confirmPayment"),
-        (re.compile(r'(?i)stripe\.confirmCardPayment'),          "Stripe confirmCardPayment"),
+        (re.compile(r'(?i)stripe\.confirmCardPayment'),        "Stripe confirmCardPayment"),
         (re.compile(r'(?i)paymentIntent\.status.*requires_action'), "PaymentIntent requires_action"),
         (re.compile(r'(?i)threeDS(?:Method|Result|Fingerprint)'), "Adyen/Generic 3DS fingerprint"),
-        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),          "3D Secure reference"),
-        (re.compile(r'(?i)\.redirect(?:To)?3ds'),                 "redirect3DS call"),
-        (re.compile(r'(?i)authentication_required'),              "authentication_required status"),
+        (re.compile(r'(?i)3d.?secure|three.?d.?secure'),         "3D Secure reference"),
+        (re.compile(r'(?i)\.redirect(?:To)?3ds'),               "redirect3DS call"),
+        (re.compile(r'(?i)authentication_required'),             "authentication_required status"),
         (re.compile(r'(?i)sca[_\-]?(?:required|enforcement|challenge)'), "SCA enforcement"),
-        # ── NEW ────────────────────────────────────────────────────────────────
-        (re.compile(r'(?i)payer_auth|payerAuth|payerAuthentication'), "Cybersource Payer Auth"),
-        (re.compile(r'(?i)challengeWindowSize|challengeCompletion'),  "3DS2 Challenge Window"),
-        (re.compile(r'(?i)threeDSecureUsage|three_d_secure_usage'),   "Stripe 3DS usage field"),
-        (re.compile(r'(?i)verifyEnrolled|enrollmentCheck|eci='),       "3DS Enrollment check"),
-        (re.compile(r'(?i)deviceFingerprint.*payment|paymentDeviceFP'),"Device fingerprint (3DS2)"),
-        (re.compile(r'(?i)authenticationValue|cavv=|xid='),            "CAVV/XID 3DS value"),
-        (re.compile(r'(?i)stripe\.createPaymentMethod.*3d'),           "Stripe 3DS PaymentMethod"),
-        (re.compile(r'(?i)adyen.*action.*threeDS|handleAction.*threeD'),"Adyen 3DS handleAction"),
     ]
     for pat, label in _3DS_QUICK:
         if pat.search(combined) and label not in result["threeds"]:
@@ -12229,55 +12413,30 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vuln_pci    = len(result["pci_risks"])
     overall_env = ("🔴 LIVE" if live_count else "🟢 TEST" if test_count else "⚪ UNKNOWN")
 
-    # ── Region / category tagging ───────────────────────────────────────────
-    _BNPL_GWS   = {"Klarna","Afterpay","Clearpay","Affirm","Sezzle","Zip","QuadPay",
-                   "Splitit","Scalapay","Paidy","Atome","Laybuy"}
-    _SEA_GWS    = {"Xendit","Midtrans","HitPay","Billplz","ToyyibPay","iPay88","2C2P","Omise"}
-    _MENA_GWS   = {"Tap Payments","Hesabe","Paymob","Fawry"}
-    _LATAM_GWS  = {"Mercado Pago","PagSeguro","Dlocal","Culqi","Wompi"}
-    _CRYPTO_GWS = {"Coinbase Commerce","NOWPayments","Cryptomus","BitPay"}
-
-    all_gws = set(result["gateways"])
-    region_tags = []
-    if all_gws & _SEA_GWS:    region_tags.append("🌏 SEA")
-    if all_gws & _MENA_GWS:   region_tags.append("🌍 MENA")
-    if all_gws & _LATAM_GWS:  region_tags.append("🌎 LatAm")
-    if all_gws & _BNPL_GWS:   region_tags.append("🏦 BNPL")
-    if all_gws & _CRYPTO_GWS: region_tags.append("₿ Crypto")
-    region_str = "  ".join(region_tags)
-
     lines = [
         f"💳 *Payment Config Audit — `{escape_md(domain)}`*",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🌐 `{escape_md(result['page_url'][:80])}`",
         f"🏦 Gateways: `{len(result['gateways'])}` detected | Mode: *{overall_env}*",
-        f"⚠️ PCI Risks: `{vuln_pci}` | 🔒 3DS signals: `{len(result['threeds'])}`",
-        *(([f"🌐 Region: {region_str}"]) if region_str else []),
+        f"⚠️ PCI Risks: `{vuln_pci}` | 3DS signals: `{len(result['threeds'])}`",
         "",
     ]
 
-    # ── SDKs (grouped by region) ─────────────────────────────────────────────
+    # SDKs
     if result["sdk_scripts"]:
         lines.append("*🏦 Payment SDK Scripts:*")
-        sdk_set = set(result["sdk_scripts"])
-        # BNPL group
-        bnpl_found = [g for g in result["sdk_scripts"] if any(b in g for b in _BNPL_GWS)]
-        sea_found  = [g for g in result["sdk_scripts"] if any(s in g for s in _SEA_GWS)]
-        other      = [g for g in result["sdk_scripts"]
-                      if g not in bnpl_found and g not in sea_found]
-        for gw in other:     lines.append(f"  ✅ {gw}")
-        for gw in sea_found: lines.append(f"  🌏 {gw}")
-        for gw in bnpl_found:lines.append(f"  🏦 {gw} _(BNPL)_")
+        for gw in result["sdk_scripts"]:
+            lines.append(f"  ✅ {gw}")
         lines.append("")
 
-    # ── CSP gateways ─────────────────────────────────────────────────────────
+    # CSP gateways
     if result["csp_gateways"]:
         lines.append("*🔐 CSP-Whitelisted Gateways:*")
         for gw in result["csp_gateways"]:
             lines.append(f"  📋 {gw}")
         lines.append("")
 
-    # ── Key modes ────────────────────────────────────────────────────────────
+    # Key modes
     if result["key_modes"]["live"] or result["key_modes"]["test"]:
         lines.append("*🔑 Key Mode Fingerprint:*")
         for e in result["key_modes"]["live"][:5]:
@@ -12289,13 +12448,13 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  ⚪ UNKN — {escape_md(e['label'])}")
         lines.append("")
 
-    # ── Currencies ───────────────────────────────────────────────────────────
+    # Currencies
     if result["currencies"]:
         _cur = escape_md(", ".join(result["currencies"][:15]))
         lines.append(f"*💱 Currencies detected:* `{_cur}`")
         lines.append("")
 
-    # ── Webhook URLs ─────────────────────────────────────────────────────────
+    # Webhook URLs
     if result["webhooks"]:
         lines.append(f"*🔗 Webhook / Callback URLs ({len(result['webhooks'])}):*")
         for wh in result["webhooks"][:6]:
@@ -12303,40 +12462,38 @@ async def cmd_payconfig(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"  {escape_md(wh['type'])}: `{_wu}`")
         lines.append("")
 
-    # ── Form fields ──────────────────────────────────────────────────────────
+    # Form fields
     if result["form_fields"]:
         lines.append("*📋 Payment Form Fields:*")
         for ff in result["form_fields"]:
-            icon = "🚨" if any(x in ff for x in ("Card Number","CVV","CVC")) else "📄"
-            lines.append(f"  {icon} {ff}")
+            lines.append(f"  📄 {ff}")
         lines.append("")
 
-    # ── 3DS signals ──────────────────────────────────────────────────────────
+    # 3DS signals
     if result["threeds"]:
-        lines.append(f"*🔒 3DS / SCA Signals ({len(result['threeds'])}):*")
-        for s in result["threeds"][:8]:
+        lines.append("*🔒 3DS / SCA Signals:*")
+        for s in result["threeds"][:5]:
             lines.append(f"  ✅ {escape_md(s)}")
         lines.append("")
 
-    # ── PCI risks ────────────────────────────────────────────────────────────
+    # PCI risks
     if result["pci_risks"]:
         lines.append("*🚨 PCI Risk Findings:*")
         for r in result["pci_risks"][:6]:
             lines.append(f"  {escape_md(r)}")
         lines.append("")
 
-    # ── PCI SAQ ──────────────────────────────────────────────────────────────
+    # PCI SAQ
     if result["pci_saq"]:
         lines.append(f"*🏷️ PCI SAQ Estimate:*\n  {escape_md(result['pci_saq'])}")
         lines.append("")
 
-    # ── Security headers ─────────────────────────────────────────────────────
+    # Security headers
     if result["security_headers"]:
         lines.append("*🛡️ Security Headers:*")
         for k, v in result["security_headers"].items():
             _v = v[:60].replace("`", "'")
             lines.append(f"  `{escape_md(k)}`: _{escape_md(_v)}_")
-
         lines.append("")
 
     lines += [
@@ -12915,45 +13072,6 @@ _PAY_PATTERNS = [
     ("Midtrans Client Key",          re.compile(r'\b((?:Mid-client|SB-Mid-client)-[A-Za-z0-9_\-]{20,50})\b')),
     # ══ Payhere (Sri Lanka) ═══════════════════════════════════════════════════
     ("Payhere Merchant ID",          re.compile(r'(?i)payhere[_-]?merchant[_-]?(?:id|secret)\s*[=:]\s*["\']?(\d{6,12})["\']?')),
-    # ══ NEW: Tap Payments (MENA) ══════════════════════════════════════════════
-    ("Tap Payments Public Key",      re.compile(r'(?i)tap[_-]?(?:public|publishable)[_-]?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,80})["\']')),
-    ("Tap Payments Secret Key",      re.compile(r'(?i)tap[_-]?secret[_-]?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,80})["\']')),
-    # ══ NEW: HitPay (Singapore / SEA) ════════════════════════════════════════
-    ("HitPay API Key",               re.compile(r'(?i)hitpay[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{30,80})["\']')),
-    ("HitPay Salt",                  re.compile(r'(?i)hitpay[_-]?salt\s*[=:]\s*["\']([A-Za-z0-9_-]{30,80})["\']')),
-    # ══ NEW: Iyzico (Turkey) ══════════════════════════════════════════════════
-    ("Iyzico API Key",               re.compile(r'(?i)iyzico[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    ("Iyzico Secret Key",            re.compile(r'(?i)iyzico[_-]?secret[_-]?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    # ══ NEW: Mercado Pago (LatAm) ═════════════════════════════════════════════
-    ("Mercado Pago Public Key",      re.compile(r'\b(APP_USR-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b')),
-    ("Mercado Pago Access Token",    re.compile(r'\b(APP_USR-\d{12,18}-\d{6}-[a-f0-9]{32}-\d{9,12})\b')),
-    ("Mercado Pago Test Token",      re.compile(r'\b(TEST-\d{12,18}-\d{6}-[a-f0-9]{32}-\d{9,12})\b')),
-    # ══ NEW: PagSeguro (Brazil) ═══════════════════════════════════════════════
-    ("PagSeguro Token",              re.compile(r'(?i)pagseguro[_-]?(?:token|key)\s*[=:]\s*["\']([A-Za-z0-9]{32,64})["\']')),
-    # ══ NEW: Billplz (Malaysia) ═══════════════════════════════════════════════
-    ("Billplz API Key",              re.compile(r'(?i)billplz[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    ("Billplz Collection ID",        re.compile(r'(?i)billplz[_-]?collection[_-]?id\s*[=:]\s*["\']([A-Za-z0-9_-]{8,30})["\']')),
-    # ══ NEW: ToyyibPay (Malaysia) ═════════════════════════════════════════════
-    ("ToyyibPay Secret Key",         re.compile(r'(?i)toyyibpay[_-]?(?:secret[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    # ══ NEW: Dlocal (LatAm / Africa / Asia) ══════════════════════════════════
-    ("Dlocal API Key",               re.compile(r'(?i)dlocal[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    ("Dlocal Secret Key",            re.compile(r'(?i)dlocal[_-]?secret\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    # ══ NEW: Viva Wallet (EU / Greece) ════════════════════════════════════════
-    ("Viva Wallet Merchant ID",      re.compile(r'(?i)viva[_-]?wallet[_-]?merchant[_-]?id\s*[=:]\s*["\']?(\d{6,20})["\']?')),
-    ("Viva Wallet API Key",          re.compile(r'(?i)viva[_-]?wallet[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    # ══ NEW: PayFast (South Africa) ═══════════════════════════════════════════
-    ("PayFast Merchant ID",          re.compile(r'(?i)payfast[_-]?merchant[_-]?id\s*[=:]\s*["\']?(\d{5,12})["\']?')),
-    ("PayFast Merchant Key",         re.compile(r'(?i)payfast[_-]?merchant[_-]?key\s*[=:]\s*["\']([A-Za-z0-9]{16,32})["\']')),
-    # ══ NEW: Paidy (Japan BNPL) ═══════════════════════════════════════════════
-    ("Paidy API Key",                re.compile(r'(?i)paidy[_-]?(?:api[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9_.-]{20,80})["\']')),
-    # ══ NEW: Nuvei / SafeCharge ═══════════════════════════════════════════════
-    ("Nuvei Merchant ID",            re.compile(r'(?i)nuvei[_-]?merchant[_-]?(?:id|site)\s*[=:]\s*["\']?(\d{6,20})["\']?')),
-    ("Nuvei Merchant Secret",        re.compile(r'(?i)nuvei[_-]?(?:merchant[_-]?)?secret\s*[=:]\s*["\']([A-Za-z0-9_-]{20,60})["\']')),
-    # ══ NEW: Stripe extras ════════════════════════════════════════════════════
-    ("Stripe Ephemeral Key",         re.compile(r'\b(ek_(?:live|test)_[A-Za-z0-9]{24,80})\b')),
-    ("Stripe Financial Session",     re.compile(r'\b(fcsess_[A-Za-z0-9]{24,60})\b')),
-    # ══ NEW: Payoneer ═════════════════════════════════════════════════════════
-    ("Payoneer Program ID",          re.compile(r'(?i)payoneer[_-]?program[_-]?id\s*[=:]\s*["\']?([A-Za-z0-9_-]{8,30})["\']?')),
 ]
 
 # ── Gateway prefix lookup for live/test detection ─────────────────────────
@@ -12963,8 +13081,6 @@ _LIVE_PREFIXES = {
     "sq0atp-",          # Square access tokens — always live
     "pdl_live_",        # Paddle Billing live
     "xnd_public_production_",  # Xendit production
-    "APP_USR-",         # Mercado Pago public key
-    "ek_live_",         # Stripe Ephemeral Key live
 }
 _TEST_PREFIXES = {
     "pk_test_", "sk_test_", "rk_test_", "rzp_test_",
@@ -12972,8 +13088,6 @@ _TEST_PREFIXES = {
     "pdl_sbox_",        # Paddle Billing sandbox
     "xnd_public_development_",  # Xendit dev
     "SB-Mid-client-",   # Midtrans sandbox
-    "TEST-",            # Mercado Pago test token
-    "ek_test_",         # Stripe Ephemeral Key test
 }
 
 def _detect_env(key_type: str, key_value: str) -> str:
@@ -14807,22 +14921,6 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Build enhanced report ──────────────────────────────────────────────
-    _BNPL_TYPES = {"Afterpay", "Sezzle", "Klarna", "Affirm", "Paidy", "Atome", "Zip"}
-    _SEA_TYPES  = {"Xendit", "Midtrans", "Payhere", "HitPay", "Billplz", "ToyyibPay", "Dlocal"}
-    _MENA_TYPES = {"Tap Payments"}
-    _LATAM_TYPES= {"Mercado Pago", "PagSeguro", "Dlocal"}
-
-    has_bnpl  = any(any(b in f.get("type","") for b in _BNPL_TYPES) for f in findings)
-    has_sea   = any(any(s in f.get("type","") for s in _SEA_TYPES)  for f in findings)
-    has_live  = bool(live_keys)
-
-    region_tags = []
-    if has_sea:   region_tags.append("🌏 SEA")
-    if has_bnpl:  region_tags.append("🏦 BNPL")
-    if any(any(m in f.get("type","") for m in _MENA_TYPES) for f in findings): region_tags.append("🌍 MENA")
-    if any(any(l in f.get("type","") for l in _LATAM_TYPES) for f in findings): region_tags.append("🌎 LatAm")
-    region_str = "  ".join(region_tags) if region_tags else ""
-
     lines = [
         f"💳 *Payment Keys — `{escape_md(domain)}`*",
         "━━━━━━━━━━━━━━━━━━━━",
@@ -14830,7 +14928,6 @@ async def cmd_paykeys(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📡 Static: `{reqs}` | Live: `{live_reqs}` requests",
         f"🗺️ Maps: `{extra.get('sourcemaps',0)}` | ⚙️ SW: `{extra.get('service_workers',0)}` | 🔗 Pages: `{extra.get('subpages',0)}`",
         f"✅ CONFIRMED: `{len(confirmed)}` | 🔴 LIVE keys: `{len(live_keys)}` | 📊 Total: `{len(findings)}`",
-        *(([region_str]) if region_str else []),
         "",
     ]
 
@@ -15327,7 +15424,908 @@ async def sitekey_verify_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-# ── Per-gateway verify functions ──────────────────────────────────────────
+# ══════════════════════════════════════════════════
+# 🤖  /autosolve — Direct sitekey solve via 2captcha / CapSolver
+# ══════════════════════════════════════════════════
+
+# Captcha type aliases — user-friendly → internal
+_AUTOSOLVE_TYPE_MAP = {
+    # reCAPTCHA v2
+    "recaptchav2":   "reCAPTCHA v2",
+    "recaptcha2":    "reCAPTCHA v2",
+    "rv2":           "reCAPTCHA v2",
+    "v2":            "reCAPTCHA v2",
+    # reCAPTCHA v3
+    "recaptchav3":   "reCAPTCHA v3",
+    "recaptcha3":    "reCAPTCHA v3",
+    "rv3":           "reCAPTCHA v3",
+    "v3":            "reCAPTCHA v3",
+    # reCAPTCHA Enterprise
+    "enterprise":    "reCAPTCHA Enterprise",
+    "recaptchaent":  "reCAPTCHA Enterprise",
+    # hCaptcha
+    "hcaptcha":      "hCaptcha",
+    "hcap":          "hCaptcha",
+    "h":             "hCaptcha",
+    # Cloudflare Turnstile
+    "turnstile":     "Cloudflare Turnstile",
+    "cf":            "Cloudflare Turnstile",
+    "cfts":          "Cloudflare Turnstile",
+}
+
+
+def _parse_autosolve_args(args: list) -> list:
+    """
+    Parse /autosolve args into list of tasks.
+    Format: type sitekey pageurl [type sitekey pageurl ...]
+    Returns: [{"type": str, "sitekey": str, "pageurl": str}, ...]
+    """
+    tasks  = []
+    tokens = list(args)
+    i      = 0
+    while i + 2 < len(tokens):
+        raw_type = tokens[i].lower().strip()
+        sitekey  = tokens[i + 1].strip()
+        pageurl  = tokens[i + 2].strip()
+        cap_type = _AUTOSOLVE_TYPE_MAP.get(raw_type)
+        if not cap_type:
+            i += 1
+            continue
+        if not pageurl.startswith("http"):
+            pageurl = "https://" + pageurl
+        tasks.append({
+            "type":    cap_type,
+            "sitekey": sitekey,
+            "pageurl": pageurl,
+        })
+        i += 3
+    return tasks
+
+
+@user_guard
+async def cmd_autosolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/autosolve <type> <sitekey> <pageurl> [type sitekey pageurl ...] — Solve captcha and return token"""
+    uid = update.effective_user.id
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🤖 *AutoSolve — Direct Captcha Token Solver*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:*\n"
+            "`/autosolve <type> <sitekey> <pageurl>`\n\n"
+            "*Multiple at once:*\n"
+            "`/autosolve v2 6Lc4... https://a.com v3 6Le9... https://b.com`\n\n"
+            "*Supported types:*\n"
+            "  `v2` / `recaptchav2` — reCAPTCHA v2\n"
+            "  `v3` / `recaptchav3` — reCAPTCHA v3\n"
+            "  `enterprise`         — reCAPTCHA Enterprise\n"
+            "  `hcaptcha` / `hcap`  — hCaptcha\n"
+            "  `turnstile` / `cf`   — Cloudflare Turnstile\n\n"
+            "*API key required:*\n"
+            "  `/setapikey 2captcha YOUR_KEY`\n"
+            "  `/setapikey capsolver YOUR_KEY`\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── Rate limit ────────────────────────────────────────────────────────────
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode="Markdown")
+        return
+
+    # ── Parse tasks ───────────────────────────────────────────────────────────
+    tasks = _parse_autosolve_args(context.args)
+    if not tasks:
+        await update.effective_message.reply_text(
+            "❌ Format မမှန်ပါ\n"
+            "Example: `/autosolve v2 6Lc4xxx https://example.com`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── Check API keys ────────────────────────────────────────────────────────
+    key_2cap  = await _get_user_apikey(uid, "2captcha")
+    key_caps  = await _get_user_apikey(uid, "capsolver")
+
+    if not key_2cap and not key_caps:
+        await update.effective_message.reply_text(
+            "❌ API key မရှိပါ\n"
+            "`/setapikey 2captcha YOUR_KEY`\n"
+            "`/setapikey capsolver YOUR_KEY`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # Prefer capsolver if both exist, else whichever is set
+    if key_caps:
+        service, apikey, svc_icon = "capsolver",  key_caps,  "🟢"
+    else:
+        service, apikey, svc_icon = "2captcha",   key_2cap,  "🔵"
+
+    # ── Progress message ──────────────────────────────────────────────────────
+    task_lines = "\n".join(
+        f"  [{i+1}] `{t['type']}` — `{t['sitekey'][:20]}...`"
+        for i, t in enumerate(tasks)
+    )
+    msg = await update.effective_message.reply_text(
+        f"🤖 *AutoSolve* {svc_icon} `{service}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 Tasks: `{len(tasks)}`\n{task_lines}\n\n"
+        f"⏳ Solving... (max 120s each)",
+        parse_mode="Markdown"
+    )
+
+    # ── Solve each task ───────────────────────────────────────────────────────
+    results = []
+    for i, task in enumerate(tasks):
+        cap_type = task["type"]
+        sitekey  = task["sitekey"]
+        pageurl  = task["pageurl"]
+
+        try:
+            await msg.edit_text(
+                f"🤖 *AutoSolve* {svc_icon} `{service}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏳ Solving `[{i+1}/{len(tasks)}]`\n"
+                f"🏷️ `{escape_md(cap_type)}`\n"
+                f"🔑 `{sitekey[:30]}...`\n"
+                f"🌐 `{pageurl[:60]}`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        try:
+            if service == "2captcha":
+                res = await asyncio.to_thread(
+                    _2captcha_solve_sync,
+                    apikey, cap_type, sitekey, pageurl,
+                    "", 0, 0.0, 0, ""
+                )
+            else:
+                res = await asyncio.to_thread(
+                    _capsolver_solve_sync,
+                    apikey, cap_type, sitekey, pageurl,
+                    "", 0, 0.0, 0
+                )
+        except Exception as e:
+            res = {"token": "", "cost": "", "error": str(e)}
+
+        results.append({
+            "idx":      i + 1,
+            "type":     cap_type,
+            "sitekey":  sitekey,
+            "pageurl":  pageurl,
+            "token":    res.get("token", ""),
+            "cost":     res.get("cost", ""),
+            "error":    res.get("error"),
+        })
+
+    # ── Build final report ────────────────────────────────────────────────────
+    solved  = [r for r in results if r["token"]]
+    failed  = [r for r in results if not r["token"]]
+
+    lines = [
+        f"🤖 *AutoSolve Result* {svc_icon} `{service}`",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"✅ Solved: `{len(solved)}` | ❌ Failed: `{len(failed)}` | Total: `{len(results)}`",
+        "",
+    ]
+
+    for r in results:
+        token   = r["token"]
+        error   = r["error"]
+        sitekey = r["sitekey"]
+        pageurl = r["pageurl"]
+        cap_type = r["type"]
+        cost    = r["cost"]
+
+        if token:
+            token_preview = token[:80] + ("..." if len(token) > 80 else "")
+            lines.append(f"*[{r['idx']}] ✅ SOLVED*")
+            lines.append(f"  🏷️ `{escape_md(cap_type)}`")
+            lines.append(f"  🔑 `{sitekey}`")
+            lines.append(f"  🌐 `{pageurl[:80]}`")
+            if cost:
+                lines.append(f"  💰 Cost: `{cost}`")
+            lines.append(f"  📋 *Token:*")
+            lines.append(f"```\n{token_preview}\n```")
+        else:
+            lines.append(f"*[{r['idx']}] ❌ FAILED*")
+            lines.append(f"  🏷️ `{escape_md(cap_type)}`")
+            lines.append(f"  🔑 `{sitekey[:40]}`")
+            lines.append(f"  🌐 `{pageurl[:60]}`")
+            lines.append(f"  ❌ `{escape_md(str(error or 'No token returned'))}`")
+
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Authorized testing only_")
+
+    try:
+        await msg.edit_text(
+            _truncate_safe_md("\n".join(lines)),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await update.effective_message.reply_text(
+            _truncate_safe_md("\n".join(lines)),
+            parse_mode="Markdown"
+        )
+
+
+        await update.effective_message.reply_text(
+            _truncate_safe_md("\n".join(lines)),
+            parse_mode="Markdown"
+        )
+
+
+# ══════════════════════════════════════════════════
+# 🛒  /cartscan — Product picker + checkout scan
+# ══════════════════════════════════════════════════
+
+# Cache: {uid: {"url": str, "products": [...], "ts": float}}
+_cartscan_cache: dict = {}
+_CARTSCAN_TTL = 600   # 10 min
+
+
+def _discover_products_playwright(url: str, progress_cb=None) -> list:
+    """
+    Use Playwright to discover products/items on a shop/product page.
+    Returns list of {"name": str, "price": str, "url": str, "add_selector": str}
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return []
+
+    products = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-blink-features=AutomationControlled"
+        ])
+        ctx  = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ))
+        page = ctx.new_page()
+
+        try:
+            if progress_cb: progress_cb("🌐 Loading shop page...")
+            try:
+                page.goto(url, wait_until="networkidle", timeout=30_000)
+            except PWTimeout:
+                page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+
+            page.wait_for_timeout(2000)
+
+            # ── Extract products via JS evaluation ───────────────────────────
+            raw = page.evaluate("""() => {
+                const items = [];
+                const seen  = new Set();
+
+                function addItem(name, price, href, addSel) {
+                    const key = name + '|' + price;
+                    if (seen.has(key) || !name || name.length < 2) return;
+                    seen.add(key);
+                    items.push({ name, price: price || '', url: href || '', add_selector: addSel || '' });
+                }
+
+                // ── 1. Schema.org Product markup ────────────────────────────
+                document.querySelectorAll('[itemtype*="schema.org/Product"],[itemtype*="Product"]').forEach(el => {
+                    const name  = (el.querySelector('[itemprop="name"]') || {}).textContent || '';
+                    const price = (el.querySelector('[itemprop="price"]') || {}).getAttribute('content')
+                                || (el.querySelector('[itemprop="price"]') || {}).textContent || '';
+                    const link  = (el.querySelector('a') || {}).href || '';
+                    addItem(name.trim(), price.trim(), link, '');
+                });
+
+                // ── 2. WooCommerce ────────────────────────────────────────
+                document.querySelectorAll('.products .product, ul.products li.product').forEach(el => {
+                    const name  = (el.querySelector('.woocommerce-loop-product__title, h2, h3') || {}).textContent || '';
+                    const price = (el.querySelector('.price .amount, .price') || {}).textContent || '';
+                    const link  = (el.querySelector('a.woocommerce-LoopProduct-link, a') || {}).href || '';
+                    const btn   = el.querySelector('a.add_to_cart_button, button.add_to_cart_button');
+                    addItem(name.trim(), price.trim(), link, btn ? btn.className : '');
+                });
+
+                // ── 3. Shopify ─────────────────────────────────────────────
+                document.querySelectorAll('.product-item, .grid__item, [class*="product-card"]').forEach(el => {
+                    const name  = (el.querySelector('[class*="product-title"],[class*="card__heading"],h2,h3') || {}).textContent || '';
+                    const price = (el.querySelector('[class*="price__regular"],[class*="price"]') || {}).textContent || '';
+                    const link  = (el.querySelector('a') || {}).href || '';
+                    addItem(name.trim(), price.trim(), link, '');
+                });
+
+                // ── 4. Generic price + product name patterns ──────────────
+                document.querySelectorAll('[class*="product"],[class*="item-card"],[class*="plan"],[class*="pricing"]').forEach(el => {
+                    const name  = (el.querySelector('h2,h3,h4,[class*="title"],[class*="name"]') || {}).textContent || '';
+                    const priceEl = el.querySelector('[class*="price"],[class*="amount"],[class*="cost"],[data-price]');
+                    const price = priceEl ? (priceEl.getAttribute('data-price') || priceEl.textContent) : '';
+                    const link  = (el.querySelector('a') || {}).href || window.location.href;
+                    if (price && /[$€£¥₹\d]/.test(price)) {
+                        addItem(name.trim(), price.trim().replace(/\s+/g,' '), link, '');
+                    }
+                });
+
+                // ── 5. Pricing table rows ─────────────────────────────────
+                document.querySelectorAll('table tr').forEach(tr => {
+                    const cells = Array.from(tr.querySelectorAll('td,th'));
+                    if (cells.length < 2) return;
+                    const name  = cells[0].textContent.trim();
+                    const price = cells.find(c => /[$€£¥\d]/.test(c.textContent));
+                    if (price) addItem(name, price.textContent.trim(), window.location.href, '');
+                });
+
+                return items.slice(0, 30);
+            }""")
+
+            if raw:
+                for item in raw:
+                    if item.get("name"):
+                        products.append({
+                            "name":         item["name"][:60].strip(),
+                            "price":        item.get("price", "")[:20].strip(),
+                            "url":          item.get("url", url),
+                            "add_selector": item.get("add_selector", ""),
+                        })
+
+            # ── Fallback: find product page links ────────────────────────────
+            if not products:
+                if progress_cb: progress_cb("🔗 Fallback: discovering product page links...")
+                links = page.evaluate("""() => {
+                    const hrefs = [];
+                    const seen  = new Set();
+                    document.querySelectorAll('a[href]').forEach(a => {
+                        const h = a.href;
+                        if (!h || seen.has(h)) return;
+                        const low = h.toLowerCase();
+                        if (/[/](product|item|shop|store|buy|plan|pricing|donate)/.test(low)) {
+                            seen.add(h);
+                            const txt = a.textContent.trim().replace(/\s+/g,' ');
+                            if (txt.length > 1)
+                                hrefs.push({ name: txt[:60], price: '', url: h, add_selector: '' });
+                        }
+                    });
+                    return hrefs.slice(0, 20);
+                }""")
+                if links:
+                    products = links
+
+        except Exception as e:
+            if progress_cb: progress_cb(f"⚠️ Product discovery error: {e}")
+        finally:
+            try: browser.close()
+            except Exception: pass
+
+    return products
+
+
+def _cartscan_run_sync(product_url: str, product_name: str,
+                        progress_cb=None) -> dict:
+    """
+    Simulate selecting a product, adding to cart, reaching checkout,
+    then run full sitekey + paykeys scan on the checkout page.
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return {"error": "playwright not installed", "sitekeys": [], "paykeys": []}
+
+    sitekeys: list = []
+    paykeys:  list = []
+    scan_url  = product_url
+    sk_seen:  set = set()
+    pk_seen:  set = set()
+
+    _SK_PATTERNS = [
+        (re.compile(r'["\']([6L][A-Za-z0-9_\-]{38})["\']'), "reCAPTCHA v2/v3"),
+        (re.compile(r'["\']([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})["\']', re.I), "hCaptcha"),
+        (re.compile(r'["\']([01]x[A-Za-z0-9_\-]{20,60})["\']'), "Cloudflare Turnstile"),
+        (re.compile(r'data-sitekey=["\']([A-Za-z0-9_\-]{20,80})["\']', re.I), "Captcha (sitekey attr)"),
+        (re.compile(r'["\']sitekey["\']\s*:\s*["\']([A-Za-z0-9_\-]{20,80})["\']', re.I), "Captcha (JSON sitekey)"),
+    ]
+    _PK_PATTERNS = [
+        (re.compile(r'(pk_live_[A-Za-z0-9]{20,})'),   "Stripe PK Live"),
+        (re.compile(r'(pk_test_[A-Za-z0-9]{20,})'),   "Stripe PK Test"),
+        (re.compile(r'(sk_live_[A-Za-z0-9]{20,})'),   "Stripe SK Live"),
+        (re.compile(r'(rzp_live_[A-Za-z0-9]{14,})'),  "Razorpay Live"),
+        (re.compile(r'(rzp_test_[A-Za-z0-9]{14,})'),  "Razorpay Test"),
+        (re.compile(r'"client_id"\s*:\s*"([A-Za-z0-9_\-]{10,80})"', re.I), "PayPal Client ID"),
+        (re.compile(r'(EAAA[A-Za-z0-9]{20,})'),       "Square Access Token"),
+    ]
+
+    def _scan_text(text: str, source: str):
+        for pat, ktype in _SK_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1).strip()
+                if val and val not in sk_seen and len(val) >= 10:
+                    sk_seen.add(val)
+                    sitekeys.append({"type": ktype, "site_key": val,
+                                     "source": source, "page_url": scan_url})
+        for pat, ktype in _PK_PATTERNS:
+            for m in pat.finditer(text):
+                val = m.group(1).strip()
+                if val and val not in pk_seen:
+                    pk_seen.add(val)
+                    paykeys.append({"type": ktype, "value": val,
+                                    "source": source,
+                                    "env": "🔴 LIVE" if "live" in ktype.lower() else "🟡 TEST"})
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=[
+            "--no-sandbox", "--disable-blink-features=AutomationControlled"
+        ])
+        ctx  = browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ))
+        page = ctx.new_page()
+        network_bodies: list = []
+
+        def _on_response(resp):
+            try:
+                ct = resp.headers.get("content-type", "")
+                if any(x in ct for x in ("javascript", "json", "html")):
+                    try:
+                        body = resp.text()
+                        if body:
+                            network_bodies.append((body, f"network ← {resp.url[:80]}"))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        page.on("response", _on_response)
+
+        try:
+            # ── Step 1: Load product page ─────────────────────────────────────
+            if progress_cb: progress_cb(f"🌐 Loading product: {product_name[:40]}...")
+            try:
+                page.goto(product_url, wait_until="networkidle", timeout=30_000)
+            except PWTimeout:
+                page.goto(product_url, wait_until="domcontentloaded", timeout=15_000)
+
+            scan_url = page.url
+            page.wait_for_timeout(1500)
+
+            # Scan initial page HTML + JS
+            html = page.content()
+            _scan_text(html, f"Product page HTML: {scan_url[:80]}")
+
+            # ── Step 2: Add to cart ───────────────────────────────────────────
+            if progress_cb: progress_cb("🛒 Adding item to cart...")
+            add_selectors = [
+                'button[name="add"]', '.single_add_to_cart_button',
+                '.product-form__submit', 'button.add_to_cart_button',
+                '[class*="add-to-cart"]', '[class*="addToCart"]',
+                'button[data-product_id]', 'input[name="add-to-cart"]',
+                'button[type="submit"]', '.btn-add-to-cart',
+                '[id*="add-to-cart"]', '[id*="addToCart"]',
+            ]
+            added = False
+            for sel in add_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.scroll_into_view_if_needed()
+                        page.wait_for_timeout(400)
+                        el.click(timeout=3000)
+                        page.wait_for_timeout(1500)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=6_000)
+                        except Exception:
+                            pass
+                        added = True
+                        if progress_cb: progress_cb(f"✅ Added to cart via: {sel}")
+                        break
+                except Exception:
+                    pass
+
+            if not added and progress_cb:
+                progress_cb("⚠️ Add-to-cart button not found — proceeding to checkout directly")
+
+            # ── Step 3: Navigate to checkout ─────────────────────────────────
+            if progress_cb: progress_cb("🔀 Navigating to checkout...")
+            checkout_selectors = [
+                'a[href*="checkout"]', '.checkout-button',
+                '#proceed-to-checkout', 'button[name="checkout"]',
+                '[class*="checkout"]', '.wc-proceed-to-checkout a',
+                'a.cart_checkout', '.btn-checkout',
+            ]
+            for sel in checkout_selectors:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.click(timeout=3000)
+                        page.wait_for_timeout(2000)
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8_000)
+                        except Exception:
+                            pass
+                        break
+                except Exception:
+                    pass
+
+            # Try direct /checkout URL if no button found
+            parsed = urlparse(product_url)
+            base   = f"{parsed.scheme}://{parsed.netloc}"
+            for path in ["/checkout", "/cart", "/shop/checkout", "/order"]:
+                if "checkout" in page.url or "cart" in page.url:
+                    break
+                try:
+                    page.goto(base + path, wait_until="networkidle", timeout=10_000)
+                    if page.url != base + path:
+                        break
+                except Exception:
+                    pass
+
+            scan_url = page.url
+            if progress_cb: progress_cb(f"📍 Checkout URL: {scan_url[:60]}")
+
+            # ── Step 4: Fill checkout form fields ─────────────────────────────
+            if progress_cb: progress_cb("📝 Filling checkout form to trigger captcha...")
+            form_fills = [
+                ('input[name="email"]',           "test@example.com"),
+                ('input[type="email"]',            "test@example.com"),
+                ('input[name="billing_email"]',    "test@example.com"),
+                ('input[name="firstname"]',        "Test"),
+                ('input[name="lastname"]',         "User"),
+                ('input[name="first_name"]',       "Test"),
+                ('input[name="last_name"]',        "User"),
+                ('input[name="billing_first_name"]',"Test"),
+                ('input[name="billing_last_name"]', "User"),
+                ('input[name="phone"]',            "+10000000000"),
+                ('input[name="billing_phone"]',    "+10000000000"),
+            ]
+            for sel, val in form_fills:
+                try:
+                    el = page.query_selector(sel)
+                    if el and el.is_visible():
+                        el.fill(val)
+                        page.wait_for_timeout(200)
+                except Exception:
+                    pass
+
+            page.wait_for_timeout(2500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+
+            # ── Step 5: Scan checkout page ────────────────────────────────────
+            if progress_cb: progress_cb("🔍 Scanning checkout page for sitekeys + payment keys...")
+            checkout_html = page.content()
+            _scan_text(checkout_html, f"Checkout HTML: {scan_url[:80]}")
+
+            # Scan all collected network responses
+            for body, src in network_bodies:
+                _scan_text(body, src)
+
+            # Scan window globals at runtime
+            try:
+                win_str = page.evaluate("""() => {
+                    const keys = ['___grecaptcha_cfg','hcaptcha','Turnstile','Stripe',
+                                  'Square','Razorpay','PayPal','wc_stripe_params',
+                                  'wc_checkout_params','wc_razorpay_params'];
+                    const out = {};
+                    keys.forEach(k => { try { if(window[k]) out[k] = JSON.stringify(window[k]).slice(0,5000); } catch(e){} });
+                    return JSON.stringify(out);
+                }""")
+                if win_str:
+                    _scan_text(win_str, "window globals (runtime)")
+            except Exception:
+                pass
+
+            # Scan data-sitekey DOM elements
+            try:
+                dom_keys = page.evaluate("""() =>
+                    Array.from(document.querySelectorAll('[data-sitekey]'))
+                         .map(el => ({
+                             key: el.getAttribute('data-sitekey'),
+                             cls: el.className || el.tagName,
+                         }))
+                """)
+                for dk in (dom_keys or []):
+                    sk = dk.get("key", "")
+                    if sk and sk not in sk_seen:
+                        sk_seen.add(sk)
+                        ktype = ("Cloudflare Turnstile" if "cf-turnstile" in dk.get("cls","")
+                                 else "hCaptcha" if "h-captcha" in dk.get("cls","")
+                                 else "reCAPTCHA")
+                        sitekeys.append({"type": ktype, "site_key": sk,
+                                         "source": f"DOM [data-sitekey] checkout ({dk.get('cls','')[:40]})",
+                                         "page_url": scan_url})
+            except Exception:
+                pass
+
+            # ── Step 6: __NEXT_DATA__ / Nuxt deep scan ────────────────────────
+            try:
+                next_data = page.evaluate("() => JSON.stringify(window.__NEXT_DATA__ || window.__NUXT__ || {})")
+                if next_data and len(next_data) > 10:
+                    _scan_text(next_data, "Next.js/__NEXT_DATA__ (checkout)")
+            except Exception:
+                pass
+
+        except Exception as e:
+            if progress_cb: progress_cb(f"⚠️ Scan error: {e}")
+        finally:
+            try: browser.close()
+            except Exception: pass
+
+    return {
+        "error":    None,
+        "sitekeys": sitekeys,
+        "paykeys":  paykeys,
+        "scan_url": scan_url,
+    }
+
+
+@user_guard
+async def cmd_cartscan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cartscan <url> — Discover products, pick one, scan checkout for sitekeys + payment keys"""
+    uid = update.effective_user.id
+
+    if not context.args:
+        await update.effective_message.reply_text(
+            "🛒 *CartScan — Product Picker + Checkout Scanner*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "*Usage:*\n"
+            "  `/cartscan https://example.com/shop`\n"
+            "  `/cartscan https://example.com/product/item-a`\n\n"
+            "*What it does:*\n"
+            "  1️⃣ Shop page မှ product list ထုတ်သည်\n"
+            "  2️⃣ Inline keyboard နဲ့ item ရွေးခိုင်းသည်\n"
+            "  3️⃣ Add to cart → checkout flow simulate\n"
+            "  4️⃣ Checkout page မှ sitekey + payment key scan\n\n"
+            "⚠️ _Authorized testing only_",
+            parse_mode="Markdown"
+        )
+        return
+
+    allowed, wait = check_rate_limit(uid)
+    if not allowed:
+        await update.effective_message.reply_text(
+            f"⏳ `{wait}s` စောင့်ပါ", parse_mode="Markdown")
+        return
+
+    raw = context.args[0].strip()
+    url = raw if raw.startswith("http") else "https://" + raw
+
+    ok, reason = is_safe_url(url)
+    if not ok:
+        await update.effective_message.reply_text(
+            f"🚫 `{escape_md(reason)}`", parse_mode="Markdown")
+        return
+
+    domain = urlparse(url).netloc
+    msg = await update.effective_message.reply_text(
+        f"🛒 *CartScan — `{escape_md(domain)}`*\n\n"
+        f"⏳ Product list ရှာနေသည်...",
+        parse_mode="Markdown"
+    )
+
+    # ── Discover products ─────────────────────────────────────────────────────
+    progress_q = []
+    async def _prog():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q:
+                t = progress_q[-1]; progress_q.clear()
+                try:
+                    await msg.edit_text(
+                        f"🛒 *CartScan — `{escape_md(domain)}`*\n\n{escape_md(t)}",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+    prog = asyncio.create_task(_prog())
+    try:
+        products = await asyncio.to_thread(
+            _discover_products_playwright, url,
+            lambda t: progress_q.append(t)
+        )
+    finally:
+        prog.cancel()
+
+    if not products:
+        await safe_markdown_reply(msg,
+            f"🛒 *CartScan — `{escape_md(domain)}`*\n\n"
+            f"📭 Product မတွေ့ပါ\n"
+            f"_Product page URL ကို တိကျစွာ ထည့်ကြည့်ပါ_\n"
+            f"_ဥပမာ: /cartscan https://example.com/shop_"
+        )
+        return
+
+    # ── Cache products ────────────────────────────────────────────────────────
+    _cartscan_cache[uid] = {
+        "url":      url,
+        "domain":   domain,
+        "products": products,
+        "ts":       time.time(),
+    }
+
+    # ── Build inline keyboard ─────────────────────────────────────────────────
+    kb_rows = []
+    for idx, p in enumerate(products[:20]):
+        name  = p["name"][:25]
+        price = p["price"]
+        label = f"{'💲' if price else '📦'} {name}" + (f" ({price})" if price else "")
+        kb_rows.append([
+            InlineKeyboardButton(label[:50], callback_data=f"cs_pick_{uid}_{idx}")
+        ])
+
+    await safe_markdown_reply(msg,
+        f"🛒 *CartScan — `{escape_md(domain)}`*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📦 Products found: `{len(products)}`\n\n"
+        f"_Item တစ်ခုကို ရွေးပါ — checkout scan လုပ်ပေးမည်_\n"
+        f"⚠️ _Authorized testing only_"
+    )
+    await update.effective_message.reply_text(
+        "👇 *Item ရွေးပါ:*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb_rows)
+    )
+
+
+async def cartscan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handle CartScan item selection.
+    Pattern: cs_pick_<uid>_<idx>
+    """
+    query = update.callback_query
+    try:
+        await query.answer("⏳ Checkout scan စတင်နေသည်...")
+    except Exception:
+        pass
+
+    try:
+        parts = query.data.split("_")
+        uid   = int(parts[2])
+        idx   = int(parts[3])
+    except Exception:
+        await query.answer("❌ Parse error", show_alert=True)
+        return
+
+    if query.from_user.id != uid:
+        await query.answer("🚫 သင်မဟုတ်ပါ", show_alert=True)
+        return
+
+    cached = _cartscan_cache.get(uid)
+    if not cached or (time.time() - cached.get("ts", 0)) > _CARTSCAN_TTL:
+        await query.answer("⚠️ Cache expired — /cartscan ထပ်လုပ်ပါ", show_alert=True)
+        return
+
+    products = cached.get("products", [])
+    if idx >= len(products):
+        await query.answer("⚠️ Index error", show_alert=True)
+        return
+
+    product     = products[idx]
+    p_name      = product["name"]
+    p_url       = product["url"] or cached["url"]
+    p_price     = product.get("price", "")
+    domain      = cached["domain"]
+
+    # ── Progress message ──────────────────────────────────────────────────────
+    prog_msg = await context.bot.send_message(
+        chat_id=query.from_user.id,
+        text=(
+            f"🛒 *CartScan — `{escape_md(domain)}`*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 Selected: *{escape_md(p_name)}*"
+            + (f" `({escape_md(p_price)})`" if p_price else "") + "\n"
+            f"🌐 `{p_url[:70]}`\n\n"
+            f"⏳ Add to cart → checkout → scan..."
+        ),
+        parse_mode="Markdown"
+    )
+
+    progress_q2 = []
+    async def _prog2():
+        while True:
+            await asyncio.sleep(2)
+            if progress_q2:
+                t = progress_q2[-1]; progress_q2.clear()
+                try:
+                    await prog_msg.edit_text(
+                        f"🛒 *CartScan — `{escape_md(domain)}`*\n"
+                        f"📦 *{escape_md(p_name)}*\n\n"
+                        f"{escape_md(t)}",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+    prog2 = asyncio.create_task(_prog2())
+    try:
+        result = await asyncio.to_thread(
+            _cartscan_run_sync,
+            p_url, p_name,
+            lambda t: progress_q2.append(t)
+        )
+    finally:
+        prog2.cancel()
+
+    sitekeys  = result.get("sitekeys", [])
+    paykeys   = result.get("paykeys",  [])
+    scan_url  = result.get("scan_url", p_url)
+    error     = result.get("error")
+
+    if error:
+        await prog_msg.edit_text(
+            f"❌ *CartScan Error*\n`{escape_md(str(error))}`",
+            parse_mode="Markdown"
+        )
+        return
+
+    # ── Build result report ───────────────────────────────────────────────────
+    lines = [
+        f"🛒 *CartScan Result — `{escape_md(domain)}`*",
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"📦 Item: *{escape_md(p_name)}*" + (f" `({escape_md(p_price)})`" if p_price else ""),
+        f"🌐 Checkout: `{scan_url[:80]}`",
+        f"🔑 Sitekeys: `{len(sitekeys)}` | 💳 Payment Keys: `{len(paykeys)}`",
+        "",
+    ]
+
+    # ── Sitekeys ──────────────────────────────────────────────────────────────
+    if sitekeys:
+        lines.append("🔑 *Captcha Sitekeys:*")
+        for i, f in enumerate(sitekeys, 1):
+            sk  = (f.get("site_key") or "")[:60]
+            src = f.get("source", "")[:100]
+            lines.append(f"  *[{i}]* `{escape_md(f.get('type',''))}` ✅")
+            lines.append(f"  🔑 `{sk}`")
+            lines.append(f"  📂 _{escape_md(src)}_")
+            # Solver-ready params
+            sp = json.dumps({
+                "type":    f.get("type",""),
+                "sitekey": sk,
+                "pageurl": f.get("page_url", scan_url),
+            }, indent=2)
+            lines.append(f"```\n{sp}\n```")
+        lines.append("")
+    else:
+        lines.append("🔑 Sitekeys: _မတွေ့ပါ_\n")
+
+    # ── Payment Keys ──────────────────────────────────────────────────────────
+    if paykeys:
+        lines.append("💳 *Payment Keys:*")
+        for i, pk in enumerate(paykeys, 1):
+            val = pk.get("value","")[:80]
+            src = pk.get("source","")[:80]
+            env = pk.get("env","")
+            lines.append(f"  *[{i}]* `{escape_md(pk.get('type',''))}` {env}")
+            lines.append(f"  🔑 `{val}`")
+            lines.append(f"  📂 _{escape_md(src)}_")
+        lines.append("")
+    else:
+        lines.append("💳 Payment Keys: _မတွေ့ပါ_\n")
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("⚠️ _Authorized testing only_")
+
+    try:
+        await prog_msg.edit_text(
+            _truncate_safe_md("\n".join(lines)),
+            parse_mode="Markdown"
+        )
+    except Exception:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text=_truncate_safe_md("\n".join(lines)),
+            parse_mode="Markdown"
+        )
+
 
 def _verify_stripe(key: str) -> dict:
     """Stripe sk_live_ / sk_test_ → GET /v1/account + /v1/balance (read-only, full info)"""
@@ -24529,52 +25527,15 @@ _KD_PATTERNS = {
     "IPInfo Token":             (r"ipinfo\.io[^'\"]*[?/]([a-f0-9]{14})", "🌐"),
     "Abstract API Key":         (r"(?:abstract.{0,20}key)\s*[=:]\s*['\"]([a-f0-9]{32})['\"]", "🌐"),
     "API Key (generic env)":    (r"(?:API_KEY|APIKEY)\s*[=:]\s*['\"]([A-Za-z0-9_\-]{20,80})['\"]", "🌐"),
-
-    # ── NEW: Vector DB / AI Infra ─────────────────────────────────────────────
-    "Pinecone API Key":         (r"\b(pcsk_[A-Za-z0-9]{60,}|pc-[A-Za-z0-9_\-]{30,})\b|(?:PINECONE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🤖"),
-    "LangSmith API Key":        (r"(?:LANGCHAIN_API_KEY|LANGSMITH_API_KEY)\s*[=:]\s*['\"]?(ls__[A-Za-z0-9_]{30,}|[A-Za-z0-9_\-]{40,})", "🤖"),
-    "Weaviate API Key":         (r"(?:WEAVIATE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🤖"),
-    "Voyage AI Key":            (r"\b(pa-[A-Za-z0-9_\-]{40,})\b|(?:VOYAGE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🤖"),
-
-    # ── NEW: Productivity / PM ─────────────────────────────────────────────────
-    "Airtable Personal Token":  (r"\b(pat[A-Za-z0-9]{14,18}\.[a-f0-9]{64})\b", "📦"),
-    "Airtable API Key (legacy)":(r"(?:AIRTABLE_API_KEY)\s*[=:]\s*['\"]?(key[A-Za-z0-9]{14,18})['\"]?", "📦"),
-    "Linear API Key":           (r"\b(lin_api_[A-Za-z0-9]{40,})\b|(?:LINEAR_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{40,})", "📦"),
-    "Atlassian API Token":      (r"(?:ATLASSIAN_TOKEN|JIRA_API_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9+/=]{40,})", "📦"),
-    "Notion Integration Token":  (r"\b(secret_[A-Za-z0-9]{43})\b|(?:NOTION_TOKEN)\s*[=:]\s*['\"]?(ntn_[A-Za-z0-9]{40,}|secret_[A-Za-z0-9]{40,})", "📦"),
-    "Trello API Key":           (r"(?:TRELLO_API_KEY|trello.{0,10}key)\s*[=:]\s*['\"]?([a-f0-9]{32})", "📦"),
-
-    # ── NEW: Secrets Mgmt / DevOps ────────────────────────────────────────────
-    "Doppler Service Token":    (r"\b(dp\.st\.[a-z0-9_\-]+\.[A-Za-z0-9]{30,})\b|(?:DOPPLER_TOKEN)\s*[=:]\s*['\"]?(dp\.[A-Za-z0-9_.\-]{30,})", "📦"),
-    "Pulumi Access Token":      (r"\b(pul-[A-Za-z0-9]{40,})\b|(?:PULUMI_ACCESS_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{40,})", "📦"),
-    "Terraform Cloud Token":    (r"(?:TFE_TOKEN|TERRAFORM_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-\.]{30,})", "📦"),
-    "Infisical Token":          (r"\b(inf\.[A-Za-z0-9_\-\.]{40,})\b|(?:INFISICAL_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "📦"),
-    "Vault Token":              (r"\b(hvs\.[A-Za-z0-9_\-]{24,}|s\.[A-Za-z0-9]{24,})\b|(?:VAULT_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_.\-]{20,})", "🔒"),
-
-    # ── NEW: CDN / Edge ───────────────────────────────────────────────────────
-    "Fastly API Token":         (r"(?:FASTLY_API_TOKEN|FASTLY_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "☁️"),
-    "Bunny CDN API Key":        (r"(?:BUNNY_API_KEY|bunnycdn.{0,10}key)\s*[=:]\s*['\"]?([A-Za-z0-9\-]{30,80})", "☁️"),
-
-    # ── NEW: Media / Storage ──────────────────────────────────────────────────
-    "Cloudinary API Key":       (r"(?:CLOUDINARY_API_KEY)\s*[=:]\s*['\"]?(\d{15,20})", "☁️"),
-    "Cloudinary API Secret":    (r"(?:CLOUDINARY_API_SECRET)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{27,})", "🔒"),
-    "Cloudinary URL":           (r"\b(cloudinary://\d+:[A-Za-z0-9_\-]{20,}@[a-z0-9_\-]+)\b", "☁️"),
-    "ImageKit Private Key":     (r"(?:IMAGEKIT_PRIVATE_KEY)\s*[=:]\s*['\"]?(private_[A-Za-z0-9_+/=]{20,})", "☁️"),
-    "Uploadthing Secret":       (r"\b(sk_live_[A-Za-z0-9]{48,64})\b(?=.*uploadthing)|(?:UPLOADTHING_SECRET)\s*[=:]\s*['\"]?(sk_live_[A-Za-z0-9]{48,64})", "☁️"),
-
-    # ── NEW: Automation / Scraping ─────────────────────────────────────────────
-    "Apify API Token":          (r"\b(apify_api_[A-Za-z0-9_]{30,})\b|(?:APIFY_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🌐"),
-    "ScrapingBee API Key":      (r"(?:SCRAPINGBEE_API_KEY)\s*[=:]\s*['\"]?([A-Za-z0-9_]{30,})", "🌐"),
-    "Browserless Token":        (r"(?:BROWSERLESS_TOKEN)\s*[=:]\s*['\"]?([A-Za-z0-9_\-]{30,})", "🌐"),
 }
 
 # ── Category map (same as before + new ones) ─────────────────────────────────
 _KD_CATEGORIES = {
     "☁️": "Cloud & Infra",
-    "🤖": "AI / ML & Vector DB",
+    "🤖": "AI / ML",
     "🗄️": "Database",
     "🔐": "Auth & Identity",
-    "📦": "Version Control / DevOps / PM",
+    "📦": "Version Control / DevOps",
     "📨": "Email & Messaging",
     "📡": "Observability",
     "🔥": "Firebase / Google",
@@ -28046,6 +29007,8 @@ def main():
     app.add_handler(CommandHandler("kdexport",       cmd_kdexport))
     app.add_handler(CommandHandler("sitekey",        cmd_sitekey))
     app.add_handler(CommandHandler("setapikey",      cmd_setapikey))
+    app.add_handler(CommandHandler("autosolve",      cmd_autosolve))
+    app.add_handler(CommandHandler("cartscan",       cmd_cartscan))
     # ── Key Extractor commands ────────────────────────
     app.add_handler(CommandHandler("apikeys",         cmd_apikeys))
     app.add_handler(CommandHandler("firebase",        cmd_firebase))
@@ -28087,6 +29050,7 @@ def main():
     app.add_handler(CallbackQueryHandler(keydump_callback,        pattern="^kd_"))
     app.add_handler(CallbackQueryHandler(verifykeys_callback,     pattern="^vk_"))
     app.add_handler(CallbackQueryHandler(sitekey_verify_callback, pattern="^sv_"))
+    app.add_handler(CallbackQueryHandler(cartscan_callback,       pattern="^cs_pick_"))
     app.add_handler(CallbackQueryHandler(force_join_callback,     pattern="^fj_check$"))
     app.add_handler(CallbackQueryHandler(appassets_cat_callback,  pattern="^apa_"))
     app.add_handler(CallbackQueryHandler(admin_callback,          pattern="^adm_"))
@@ -28145,6 +29109,8 @@ def main():
                     BotCommand("extract",     "Secret & key scanner"),
                     BotCommand("sitekey",     "Captcha key extractor"),
                     BotCommand("setapikey",   "Set 2captcha / CapSolver API key"),
+                    BotCommand("autosolve",   "Direct captcha token solver"),
+                    BotCommand("cartscan",    "Product picker + checkout scanner"),
                     BotCommand("antibot",     "Anti-bot bypass tester"),
                     BotCommand("jwtattack",   "JWT decode & attack"),
                     BotCommand("keydump",     "All-in-one key dump"),
