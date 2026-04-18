@@ -15117,16 +15117,20 @@ async def cmd_setapikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
 
     if not context.args or len(context.args) < 2:
+        # Show current key status
+        db       = await db_read()
+        keys     = db.get("users", {}).get(str(uid), {}).get("api_keys", {})
+        cap_st   = "✅ Set" if keys.get("capsolver") else "❌ Not set"
+        two_st   = "✅ Set" if keys.get("2captcha")  else "❌ Not set"
         await update.effective_message.reply_text(
-            "🔑 *API Key Setup*\n"
+            "🔑 *Captcha Solver API Keys*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "*Usage:*\n"
-            "  `/setapikey 2captcha YOUR_KEY`\n"
-            "  `/setapikey capsolver YOUR_KEY`\n\n"
-            "*Services:*\n"
-            "  🔵 `2captcha` — 2captcha.com\n"
-            "  🟢 `capsolver` — capsolver.com\n\n"
-            "_Key ကို DB ထဲ သိမ်းသည် — private chat မှသာ သုံးပါ_",
+            f"🟢 CapSolver:  {cap_st}\n"
+            f"🔵 2captcha:   {two_st}\n\n"
+            "*Set key:*\n"
+            "`/setapikey capsolver YOUR_KEY`\n"
+            "`/setapikey 2captcha YOUR_KEY`\n\n"
+            "_Key ကို bot DB ထဲ သိမ်းသည် — private chat မှာသာ သုံးပါ_",
             parse_mode="Markdown"
         )
         return
@@ -15136,16 +15140,14 @@ async def cmd_setapikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if service not in ("2captcha", "capsolver"):
         await update.effective_message.reply_text(
-            "❌ Service `2captcha` သို့မဟုတ် `capsolver` သာ ခွင့်ပြုသည်",
+            "❌ `2captcha` သို့မဟုတ် `capsolver` သာ ခွင့်ပြုသည်",
             parse_mode="Markdown"
         )
         return
 
-    if len(apikey) < 20:
+    if len(apikey) < 10:
         await update.effective_message.reply_text(
-            "❌ API key တို လွန်းသည် — စစ်ဆေးပြီး ထပ်ထည့်ပါ",
-            parse_mode="Markdown"
-        )
+            "❌ API key တို လွန်းသည်", parse_mode="Markdown")
         return
 
     db = await db_read()
@@ -15153,16 +15155,16 @@ async def cmd_setapikey(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db_write(db)
 
     masked = apikey[:6] + "..." + apikey[-4:]
+    svc_icon = "🟢" if service == "capsolver" else "🔵"
     await update.effective_message.reply_text(
-        f"✅ *{service}* API key သိမ်းပြီး\n"
-        f"🔑 `{masked}`\n\n"
-        f"_/sitekey scan ပြီး verify button နှိပ်ပြီး သုံးနိုင်ပါပြီ_",
+        f"{svc_icon} *{service}* key သိမ်းပြီး — `{masked}`\n\n"
+        f"_/autosolve နဲ့ /sitekey verify button မှာ သုံးနိုင်ပါပြီ_",
         parse_mode="Markdown"
     )
 
 
 async def _get_user_apikey(uid: int, service: str) -> str:
-    """Retrieve stored API key for a service from DB."""
+    """Retrieve API key for a captcha service from DB (set via /setapikey)."""
     db = await db_read()
     return db.get("users", {}).get(str(uid), {}).get("api_keys", {}).get(service, "")
 
@@ -15457,12 +15459,62 @@ _AUTOSOLVE_TYPE_MAP = {
 def _parse_autosolve_args(args: list) -> list:
     """
     Parse /autosolve args into list of tasks.
-    Format: type sitekey pageurl [type sitekey pageurl ...]
-    Returns: [{"type": str, "sitekey": str, "pageurl": str}, ...]
+
+    Accepts 3 formats:
+    1. Positional:  type sitekey pageurl [type sitekey pageurl ...]
+    2. JSON object: {"type":"reCAPTCHA v2","sitekey":"6Lc...","pageurl":"https://..."}
+    3. JSON array:  [{"type":...}, {"type":...}]
+
+    Returns: [{"type": str, "sitekey": str, "pageurl": str, ...}, ...]
     """
+    import json as _json
+
     tasks  = []
+
+    # ── Try JSON parse first (single object or array) ─────────────────────────
+    raw_str = " ".join(args).strip()
+
+    # Handle JSON object or array
+    if raw_str.startswith("{") or raw_str.startswith("["):
+        try:
+            parsed = _json.loads(raw_str)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+            for item in parsed:
+                sitekey = (item.get("sitekey") or item.get("site_key") or
+                           item.get("key") or "").strip()
+                pageurl = (item.get("pageurl") or item.get("page_url") or
+                           item.get("url") or "").strip()
+                raw_type = (item.get("type") or "").strip()
+                cap_type = _AUTOSOLVE_TYPE_MAP.get(raw_type.lower().replace(" ", ""))
+                if not cap_type:
+                    # Try partial match
+                    for alias, full in _AUTOSOLVE_TYPE_MAP.items():
+                        if alias in raw_type.lower():
+                            cap_type = full
+                            break
+                if not cap_type:
+                    cap_type = raw_type or "reCAPTCHA v2"
+                if not pageurl.startswith("http"):
+                    pageurl = "https://" + pageurl if pageurl else ""
+                if sitekey and pageurl:
+                    tasks.append({
+                        "type":       cap_type,
+                        "sitekey":    sitekey,
+                        "pageurl":    pageurl,
+                        "action":     item.get("action", ""),
+                        "enterprise": int(item.get("enterprise", 0)),
+                        "min_score":  float(item.get("min_score", 0) or 0),
+                        "invisible":  int(item.get("invisible", 0)),
+                        "data_s":     item.get("data-s", ""),
+                    })
+            return tasks
+        except (_json.JSONDecodeError, Exception):
+            pass  # Fall through to positional parse
+
+    # ── Positional parse: type sitekey pageurl [type sitekey pageurl ...] ─────
     tokens = list(args)
-    i      = 0
+    i = 0
     while i + 2 < len(tokens):
         raw_type = tokens[i].lower().strip()
         sitekey  = tokens[i + 1].strip()
@@ -15474,9 +15526,14 @@ def _parse_autosolve_args(args: list) -> list:
         if not pageurl.startswith("http"):
             pageurl = "https://" + pageurl
         tasks.append({
-            "type":    cap_type,
-            "sitekey": sitekey,
-            "pageurl": pageurl,
+            "type":       cap_type,
+            "sitekey":    sitekey,
+            "pageurl":    pageurl,
+            "action":     "",
+            "enterprise": 0,
+            "min_score":  0.0,
+            "invisible":  0,
+            "data_s":     "",
         })
         i += 3
     return tasks
@@ -15484,81 +15541,86 @@ def _parse_autosolve_args(args: list) -> list:
 
 @user_guard
 async def cmd_autosolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/autosolve <type> <sitekey> <pageurl> [type sitekey pageurl ...] — Solve captcha and return token"""
+    """/autosolve <type> <sitekey> <pageurl> — Solve captcha directly"""
     uid = update.effective_user.id
 
     if not context.args:
+        db     = await db_read()
+        keys   = db.get("users", {}).get(str(uid), {}).get("api_keys", {})
+        cap_st = "✅ Set" if keys.get("capsolver") else "❌ Not set"
+        two_st = "✅ Set" if keys.get("2captcha")  else "❌ Not set"
         await update.effective_message.reply_text(
-            "🤖 *AutoSolve — Direct Captcha Token Solver*\n"
+            "🤖 *AutoSolve — Captcha Token Solver*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "*Usage:*\n"
+            "📌 *အသုံးပြုနည်း:*\n"
             "`/autosolve <type> <sitekey> <pageurl>`\n\n"
-            "*Multiple at once:*\n"
-            "`/autosolve v2 6Lc4... https://a.com v3 6Le9... https://b.com`\n\n"
-            "*Supported types:*\n"
-            "  `v2` / `recaptchav2` — reCAPTCHA v2\n"
-            "  `v3` / `recaptchav3` — reCAPTCHA v3\n"
-            "  `enterprise`         — reCAPTCHA Enterprise\n"
-            "  `hcaptcha` / `hcap`  — hCaptcha\n"
-            "  `turnstile` / `cf`   — Cloudflare Turnstile\n\n"
-            "*API key required:*\n"
-            "  `/setapikey 2captcha YOUR_KEY`\n"
-            "  `/setapikey capsolver YOUR_KEY`\n\n"
-            "⚠️ _Authorized testing only_",
+            "📋 *ဥပမာ:*\n"
+            "`/autosolve v2 6Lc4xxxx https://example.com`\n"
+            "`/autosolve hcaptcha abc-123 https://example.com`\n"
+            "`/autosolve turnstile 0x4A... https://example.com`\n\n"
+            "🏷 *Captcha Types:*\n"
+            "  `v2`         — reCAPTCHA v2\n"
+            "  `v3`         — reCAPTCHA v3\n"
+            "  `enterprise` — reCAPTCHA Enterprise\n"
+            "  `hcaptcha`   — hCaptcha\n"
+            "  `turnstile`  — Cloudflare Turnstile\n\n"
+            "💡 _/sitekey ရဲ့ result ထဲက sitekey + pageurl ကို copy ယူပြီး သုံးပါ_\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 CapSolver:  {cap_st}\n"
+            f"🔵 2captcha:   {two_st}\n\n"
+            "🔑 _Key မရှိသေးရင်: `/setapikey capsolver YOUR\\_KEY`_",
             parse_mode="Markdown"
         )
         return
 
-    # ── Rate limit ────────────────────────────────────────────────────────────
     allowed, wait = check_rate_limit(uid)
     if not allowed:
         await update.effective_message.reply_text(
             f"⏳ `{wait}s` စောင့်ပါ", parse_mode="Markdown")
         return
 
-    # ── Parse tasks ───────────────────────────────────────────────────────────
     tasks = _parse_autosolve_args(context.args)
     if not tasks:
         await update.effective_message.reply_text(
-            "❌ Format မမှန်ပါ\n"
-            "Example: `/autosolve v2 6Lc4xxx https://example.com`",
+            "❌ Format: `/autosolve v2 6Lc4xxx https://example.com`",
             parse_mode="Markdown"
         )
         return
 
-    # ── Check API keys ────────────────────────────────────────────────────────
-    key_2cap  = await _get_user_apikey(uid, "2captcha")
-    key_caps  = await _get_user_apikey(uid, "capsolver")
+    # ── Get API keys (DB first → .env fallback) ───────────────────────────────
+    key_2cap = await _get_user_apikey(uid, "2captcha")
+    key_caps = await _get_user_apikey(uid, "capsolver")
 
     if not key_2cap and not key_caps:
         await update.effective_message.reply_text(
-            "❌ API key မရှိပါ\n"
-            "`/setapikey 2captcha YOUR_KEY`\n"
-            "`/setapikey capsolver YOUR_KEY`",
+            "❌ *API key မရှိပါ*\n\n"
+            "တစ်ကြိမ်တည်း set လုပ်ပါ —\n"
+            "`/setapikey capsolver YOUR_KEY`\n"
+            "`/setapikey 2captcha YOUR_KEY`\n\n"
+            "_CapSolver: capsolver.com_\n"
+            "_2captcha: 2captcha.com_",
             parse_mode="Markdown"
         )
         return
 
-    # Prefer capsolver if both exist, else whichever is set
+    # Prefer capsolver → 2captcha
     if key_caps:
-        service, apikey, svc_icon = "capsolver",  key_caps,  "🟢"
+        service, apikey, svc_icon = "capsolver", key_caps, "🟢"
     else:
-        service, apikey, svc_icon = "2captcha",   key_2cap,  "🔵"
+        service, apikey, svc_icon = "2captcha",  key_2cap, "🔵"
 
-    # ── Progress message ──────────────────────────────────────────────────────
     task_lines = "\n".join(
-        f"  [{i+1}] `{t['type']}` — `{t['sitekey'][:20]}...`"
+        f"  [{i+1}] `{t['type']}` `{t['sitekey'][:24]}...`"
         for i, t in enumerate(tasks)
     )
     msg = await update.effective_message.reply_text(
         f"🤖 *AutoSolve* {svc_icon} `{service}`\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 Tasks: `{len(tasks)}`\n{task_lines}\n\n"
+        f"{task_lines}\n\n"
         f"⏳ Solving... (max 120s each)",
         parse_mode="Markdown"
     )
 
-    # ── Solve each task ───────────────────────────────────────────────────────
     results = []
     for i, task in enumerate(tasks):
         cap_type = task["type"]
@@ -15569,8 +15631,7 @@ async def cmd_autosolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(
                 f"🤖 *AutoSolve* {svc_icon} `{service}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏳ Solving `[{i+1}/{len(tasks)}]`\n"
-                f"🏷️ `{escape_md(cap_type)}`\n"
+                f"⏳ `[{i+1}/{len(tasks)}]` {escape_md(cap_type)}\n"
                 f"🔑 `{sitekey[:30]}...`\n"
                 f"🌐 `{pageurl[:60]}`",
                 parse_mode="Markdown"
@@ -15583,63 +15644,65 @@ async def cmd_autosolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 res = await asyncio.to_thread(
                     _2captcha_solve_sync,
                     apikey, cap_type, sitekey, pageurl,
-                    "", 0, 0.0, 0, ""
+                    task.get("action",""), task.get("enterprise",0),
+                    task.get("min_score",0.0), task.get("invisible",0),
+                    task.get("data_s","")
                 )
             else:
                 res = await asyncio.to_thread(
                     _capsolver_solve_sync,
                     apikey, cap_type, sitekey, pageurl,
-                    "", 0, 0.0, 0
+                    task.get("action",""), task.get("enterprise",0),
+                    task.get("min_score",0.0), task.get("invisible",0)
                 )
         except Exception as e:
             res = {"token": "", "cost": "", "error": str(e)}
 
         results.append({
-            "idx":      i + 1,
-            "type":     cap_type,
-            "sitekey":  sitekey,
-            "pageurl":  pageurl,
-            "token":    res.get("token", ""),
-            "cost":     res.get("cost", ""),
-            "error":    res.get("error"),
+            "idx":     i + 1,
+            "type":    cap_type,
+            "sitekey": sitekey,
+            "pageurl": pageurl,
+            "token":   res.get("token", ""),
+            "cost":    res.get("cost", ""),
+            "error":   res.get("error"),
         })
 
-    # ── Build final report ────────────────────────────────────────────────────
-    solved  = [r for r in results if r["token"]]
-    failed  = [r for r in results if not r["token"]]
+    # ── Build result ──────────────────────────────────────────────────────────
+    solved = [r for r in results if r["token"]]
+    failed = [r for r in results if not r["token"]]
 
     lines = [
-        f"🤖 *AutoSolve Result* {svc_icon} `{service}`",
+        f"🤖 *AutoSolve* {svc_icon} `{service}`",
         "━━━━━━━━━━━━━━━━━━━━",
-        f"✅ Solved: `{len(solved)}` | ❌ Failed: `{len(failed)}` | Total: `{len(results)}`",
+        f"✅ `{len(solved)}` solved | ❌ `{len(failed)}` failed",
         "",
     ]
 
     for r in results:
-        token   = r["token"]
-        error   = r["error"]
-        sitekey = r["sitekey"]
-        pageurl = r["pageurl"]
-        cap_type = r["type"]
-        cost    = r["cost"]
-
-        if token:
-            token_preview = token[:80] + ("..." if len(token) > 80 else "")
-            lines.append(f"*[{r['idx']}] ✅ SOLVED*")
-            lines.append(f"  🏷️ `{escape_md(cap_type)}`")
-            lines.append(f"  🔑 `{sitekey}`")
-            lines.append(f"  🌐 `{pageurl[:80]}`")
-            if cost:
-                lines.append(f"  💰 Cost: `{cost}`")
-            lines.append(f"  📋 *Token:*")
-            lines.append(f"```\n{token_preview}\n```")
+        if r["token"]:
+            tp = r["token"][:80] + ("..." if len(r["token"]) > 80 else "")
+            lines.append(f"*[{r['idx']}] ✅ {escape_md(r['type'])}*")
+            lines.append(f"  🔑 `{r['sitekey']}`")
+            lines.append(f"  🌐 `{r['pageurl'][:70]}`")
+            if r["cost"]: lines.append(f"  💰 `{r['cost']}`")
+            lines.append(f"  📋 *Token:*\n```\n{tp}\n```")
         else:
-            lines.append(f"*[{r['idx']}] ❌ FAILED*")
-            lines.append(f"  🏷️ `{escape_md(cap_type)}`")
-            lines.append(f"  🔑 `{sitekey[:40]}`")
-            lines.append(f"  🌐 `{pageurl[:60]}`")
-            lines.append(f"  ❌ `{escape_md(str(error or 'No token returned'))}`")
-
+            # ── User-friendly error message ───────────────────────────────────
+            err = str(r["error"] or "No token returned")
+            if "WRONG_USER_KEY" in err or "wrong_user_key" in err.lower():
+                err_msg = "❌ API key မှားနေသည် — key စစ်ဆေးပါ"
+            elif "ZERO_BALANCE" in err or "zero_balance" in err.lower():
+                err_msg = "❌ Account balance မရှိ — 2captcha/CapSolver ငွေဖြည့်ပါ"
+            elif "ERROR_CAPTCHA_UNSOLVABLE" in err:
+                err_msg = "❌ Captcha ဖြေမရပါ — sitekey / pageurl စစ်ဆေးပါ"
+            elif "Timeout" in err:
+                err_msg = "❌ Timeout — service ကြည့်ပါ"
+            else:
+                err_msg = f"❌ `{escape_md(err[:80])}`"
+            lines.append(f"*[{r['idx']}] ❌ {escape_md(r['type'])}*")
+            lines.append(f"  🔑 `{r['sitekey'][:40]}`")
+            lines.append(f"  {err_msg}")
         lines.append("")
 
     lines.append("━━━━━━━━━━━━━━━━━━")
@@ -15647,14 +15710,10 @@ async def cmd_autosolve(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         await msg.edit_text(
-            _truncate_safe_md("\n".join(lines)),
-            parse_mode="Markdown"
-        )
+            _truncate_safe_md("\n".join(lines)), parse_mode="Markdown")
     except Exception:
         await update.effective_message.reply_text(
-            _truncate_safe_md("\n".join(lines)),
-            parse_mode="Markdown"
-        )
+            _truncate_safe_md("\n".join(lines)), parse_mode="Markdown")
 
 
         await update.effective_message.reply_text(
@@ -15704,62 +15763,100 @@ def _discover_products_playwright(url: str, progress_cb=None) -> list:
 
             page.wait_for_timeout(2000)
 
+            # ── Extra scroll to trigger lazy-loaded product grids ────────────
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                page.wait_for_timeout(800)
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+
             # ── Extract products via JS evaluation ───────────────────────────
             raw = page.evaluate("""() => {
                 const items = [];
                 const seen  = new Set();
 
-                function addItem(name, price, href, addSel) {
-                    const key = name + '|' + price;
-                    if (seen.has(key) || !name || name.length < 2) return;
-                    seen.add(key);
-                    items.push({ name, price: price || '', url: href || '', add_selector: addSel || '' });
+                function cleanText(t) {
+                    return (t || '').replace(/\\s+/g, ' ').trim();
                 }
 
-                // ── 1. Schema.org Product markup ────────────────────────────
+                function addItem(name, price, href, addSel) {
+                    name = cleanText(name);
+                    price = cleanText(price);
+                    const key = name.toLowerCase() + '|' + price;
+                    if (seen.has(key) || !name || name.length < 2) return;
+                    seen.add(key);
+                    items.push({ name: name.slice(0, 60), price: price.slice(0, 30), url: href || window.location.href, add_selector: addSel || '' });
+                }
+
+                // ── 1. Schema.org Product markup ──────────────────────────
                 document.querySelectorAll('[itemtype*="schema.org/Product"],[itemtype*="Product"]').forEach(el => {
-                    const name  = (el.querySelector('[itemprop="name"]') || {}).textContent || '';
-                    const price = (el.querySelector('[itemprop="price"]') || {}).getAttribute('content')
-                                || (el.querySelector('[itemprop="price"]') || {}).textContent || '';
-                    const link  = (el.querySelector('a') || {}).href || '';
-                    addItem(name.trim(), price.trim(), link, '');
+                    const name  = cleanText((el.querySelector('[itemprop="name"]') || {}).textContent);
+                    const priceEl = el.querySelector('[itemprop="price"]');
+                    const price = priceEl ? (priceEl.getAttribute('content') || priceEl.textContent) : '';
+                    const link  = (el.querySelector('a[href]') || {}).href || '';
+                    addItem(name, price, link, '');
                 });
 
-                // ── 2. WooCommerce ────────────────────────────────────────
-                document.querySelectorAll('.products .product, ul.products li.product').forEach(el => {
-                    const name  = (el.querySelector('.woocommerce-loop-product__title, h2, h3') || {}).textContent || '';
-                    const price = (el.querySelector('.price .amount, .price') || {}).textContent || '';
+                // ── 2. WooCommerce ─────────────────────────────────────────
+                document.querySelectorAll('.products .product, ul.products li.product, .wc-block-grid__product').forEach(el => {
+                    const name  = cleanText((el.querySelector('.woocommerce-loop-product__title, .wc-block-grid__product-title, h2, h3') || {}).textContent);
+                    const price = cleanText((el.querySelector('.price .woocommerce-Price-amount, .price .amount, .woocommerce-Price-amount') || {}).textContent);
                     const link  = (el.querySelector('a.woocommerce-LoopProduct-link, a') || {}).href || '';
                     const btn   = el.querySelector('a.add_to_cart_button, button.add_to_cart_button');
-                    addItem(name.trim(), price.trim(), link, btn ? btn.className : '');
+                    addItem(name, price, link, btn ? (btn.getAttribute('data-product_id') || '') : '');
                 });
 
-                // ── 3. Shopify ─────────────────────────────────────────────
-                document.querySelectorAll('.product-item, .grid__item, [class*="product-card"]').forEach(el => {
-                    const name  = (el.querySelector('[class*="product-title"],[class*="card__heading"],h2,h3') || {}).textContent || '';
-                    const price = (el.querySelector('[class*="price__regular"],[class*="price"]') || {}).textContent || '';
-                    const link  = (el.querySelector('a') || {}).href || '';
-                    addItem(name.trim(), price.trim(), link, '');
+                // ── 3. Shopify ────────────────────────────────────────────
+                document.querySelectorAll('.product-item, .grid__item, [class*="product-card"], [class*="ProductCard"]').forEach(el => {
+                    const name  = cleanText((el.querySelector('[class*="product-title"],[class*="card__heading"],[class*="ProductCard__Name"],h2,h3') || {}).textContent);
+                    const priceEl = el.querySelector('[class*="price__regular"],[class*="ProductCard__Price"],[class*="price"]:not([class*="compare"])');
+                    const price = priceEl ? cleanText(priceEl.textContent) : '';
+                    const link  = (el.querySelector('a[href]') || {}).href || '';
+                    addItem(name, price, link, '');
                 });
 
-                // ── 4. Generic price + product name patterns ──────────────
-                document.querySelectorAll('[class*="product"],[class*="item-card"],[class*="plan"],[class*="pricing"]').forEach(el => {
-                    const name  = (el.querySelector('h2,h3,h4,[class*="title"],[class*="name"]') || {}).textContent || '';
+                // ── 4. GiveWP / Donation plugins ──────────────────────────
+                document.querySelectorAll('.give-wrap, [class*="give-"], [id*="give-"], .charitable-campaign, [class*="donation"]').forEach(el => {
+                    const name  = cleanText((el.querySelector('h1,h2,h3,[class*="title"],[class*="name"]') || {}).textContent);
+                    const amounts = Array.from(el.querySelectorAll('[data-amount],[value][type="radio"],[class*="amount"] label, .give-btn-level'));
+                    amounts.forEach(a => {
+                        const amt = a.getAttribute('data-amount') || a.getAttribute('value') || cleanText(a.textContent);
+                        if (amt && /[0-9]/.test(amt)) {
+                            addItem(name || 'Donation', '$' + amt, window.location.href, a.tagName.toLowerCase() + (a.className ? '.' + a.className.split(' ')[0] : ''));
+                        }
+                    });
+                    if (!amounts.length && name) addItem(name, '', window.location.href, '');
+                });
+
+                // ── 5. Generic price + product name ───────────────────────
+                document.querySelectorAll('[class*="product"],[class*="item-card"],[class*="plan"],[class*="tier"],[class*="pricing"],[class*="package"]').forEach(el => {
+                    const name = cleanText((el.querySelector('h2,h3,h4,[class*="title"],[class*="name"],[class*="plan-name"]') || {}).textContent);
                     const priceEl = el.querySelector('[class*="price"],[class*="amount"],[class*="cost"],[data-price]');
-                    const price = priceEl ? (priceEl.getAttribute('data-price') || priceEl.textContent) : '';
-                    const link  = (el.querySelector('a') || {}).href || window.location.href;
-                    if (price && /[$€£¥₹\d]/.test(price)) {
-                        addItem(name.trim(), price.trim().replace(/\s+/g,' '), link, '');
+                    const price = priceEl ? cleanText(priceEl.getAttribute('data-price') || priceEl.textContent) : '';
+                    const link  = (el.querySelector('a[href]') || {}).href || window.location.href;
+                    if (price && /[0-9]/.test(price) && price.length < 30) {
+                        addItem(name, price, link, '');
                     }
                 });
 
-                // ── 5. Pricing table rows ─────────────────────────────────
+                // ── 6. Pricing table rows ─────────────────────────────────
                 document.querySelectorAll('table tr').forEach(tr => {
                     const cells = Array.from(tr.querySelectorAll('td,th'));
                     if (cells.length < 2) return;
-                    const name  = cells[0].textContent.trim();
-                    const price = cells.find(c => /[$€£¥\d]/.test(c.textContent));
-                    if (price) addItem(name, price.textContent.trim(), window.location.href, '');
+                    const name  = cleanText(cells[0].textContent);
+                    const priceCell = cells.find(c => /[0-9]/.test(c.textContent) && c.textContent.length < 20);
+                    if (priceCell && name) addItem(name, cleanText(priceCell.textContent), window.location.href, '');
+                });
+
+                // ── 7. Amount input fields (donation forms) ────────────────
+                document.querySelectorAll('input[name*="amount"],input[name*="price"],input[id*="amount"]').forEach(inp => {
+                    const val = inp.getAttribute('value') || inp.getAttribute('placeholder') || '';
+                    if (val && /[0-9]/.test(val)) {
+                        const label = cleanText((document.querySelector('label[for="' + inp.id + '"]') || {}).textContent) || 'Custom Amount';
+                        addItem(label, val, window.location.href, inp.name || inp.id || 'input');
+                    }
                 });
 
                 return items.slice(0, 30);
@@ -15769,33 +15866,44 @@ def _discover_products_playwright(url: str, progress_cb=None) -> list:
                 for item in raw:
                     if item.get("name"):
                         products.append({
-                            "name":         item["name"][:60].strip(),
-                            "price":        item.get("price", "")[:20].strip(),
-                            "url":          item.get("url", url),
+                            "name":         (item["name"] or "")[:60].strip(),
+                            "price":        (item.get("price") or "")[:30].strip(),
+                            "url":          item.get("url") or url,
                             "add_selector": item.get("add_selector", ""),
                         })
 
-            # ── Fallback: find product page links ────────────────────────────
+            # ── Fallback 1: any link with price-like text ─────────────────────
             if not products:
-                if progress_cb: progress_cb("🔗 Fallback: discovering product page links...")
-                links = page.evaluate("""() => {
-                    const hrefs = [];
-                    const seen  = new Set();
-                    document.querySelectorAll('a[href]').forEach(a => {
-                        const h = a.href;
-                        if (!h || seen.has(h)) return;
-                        const low = h.toLowerCase();
-                        if (/[/](product|item|shop|store|buy|plan|pricing|donate)/.test(low)) {
-                            seen.add(h);
-                            const txt = a.textContent.trim().replace(/\s+/g,' ');
-                            if (txt.length > 1)
-                                hrefs.push({ name: txt[:60], price: '', url: h, add_selector: '' });
-                        }
-                    });
-                    return hrefs.slice(0, 20);
-                }""")
-                if links:
-                    products = links
+                if progress_cb: progress_cb("🔗 Fallback: scanning links with price text...")
+                try:
+                    links = page.evaluate("""() => {
+                        const hrefs = [];
+                        const seen  = new Set();
+                        document.querySelectorAll('a[href]').forEach(a => {
+                            const h   = a.href || '';
+                            const txt = (a.textContent || '').replace(/\\s+/g,' ').trim();
+                            if (!h || seen.has(h) || txt.length < 2 || txt.length > 80) return;
+                            const low = h.toLowerCase();
+                            if (/(product|item|shop|store|buy|plan|pricing|donate|give|donation|checkout|pay)/.test(low)) {
+                                seen.add(h);
+                                hrefs.push({ name: txt.slice(0,60), price: '', url: h, add_selector: '' });
+                            }
+                        });
+                        return hrefs.slice(0, 20);
+                    }""")
+                    if links:
+                        products = [p for p in links if p.get("name")]
+                except Exception:
+                    pass
+
+            # ── Fallback 2: page title as single item if no products found ────
+            if not products:
+                if progress_cb: progress_cb("📄 Fallback: using page as single item...")
+                try:
+                    title = page.title() or urlparse(url).netloc
+                    products = [{"name": title[:60], "price": "", "url": url, "add_selector": ""}]
+                except Exception:
+                    products = [{"name": urlparse(url).netloc, "price": "", "url": url, "add_selector": ""}]
 
         except Exception as e:
             if progress_cb: progress_cb(f"⚠️ Product discovery error: {e}")
@@ -29108,7 +29216,6 @@ def main():
                     BotCommand("tech",        "Tech stack fingerprint"),
                     BotCommand("extract",     "Secret & key scanner"),
                     BotCommand("sitekey",     "Captcha key extractor"),
-                    BotCommand("setapikey",   "Set 2captcha / CapSolver API key"),
                     BotCommand("autosolve",   "Direct captcha token solver"),
                     BotCommand("cartscan",    "Product picker + checkout scanner"),
                     BotCommand("antibot",     "Anti-bot bypass tester"),
